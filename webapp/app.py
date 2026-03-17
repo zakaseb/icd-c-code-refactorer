@@ -6,13 +6,18 @@ The tool analyzes both ICDs, understands the differences, and transforms
 the code to conform to the target ICD.
 """
 import json
+import logging
 import os
+import re
 import uuid
 import shutil
 import zipfile
 import io
 
 import httpx
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 import fitz  # PyMuPDF
 from pathlib import Path
 from typing import List
@@ -44,12 +49,61 @@ HF_MODEL = os.environ.get(
 MODEL_NAME = HF_MODEL.replace(".gguf", "") if HF_MODEL.endswith(".gguf") else HF_MODEL
 MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
 
-HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=None, connect=300.0)
+HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
+
+# Keep prompts small enough to complete on CPU fallback if GPU offload is unavailable.
+MAX_ICD_CHARS = 4_000
+MAX_CODE_CONTEXT_CHARS = 8_000
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _truncate_icd(text: str, label: str) -> str:
+    """Truncate ICD text to fit model context; warn if truncated."""
+    if len(text) <= MAX_ICD_CHARS:
+        return text
+    truncated = text[:MAX_ICD_CHARS] + "\n\n[... TRUNCATED - document too long for model context ...]"
+    log.warning("%s truncated from %d to %d chars", label, len(text), MAX_ICD_CHARS)
+    return truncated
+
+
+def _truncate_text(text: str, max_chars: int, label: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    log.warning("%s truncated from %d to %d chars", label, len(text), max_chars)
+    return text[:max_chars] + f"\n\n[... TRUNCATED {label} ...]"
+
+
+def _looks_complete_c_file(generated: str, original: str, filename: str) -> bool:
+    text = generated.strip()
+    if not text:
+        return False
+    if "[... TRUNCATED" in text or text.endswith("..."):
+        return False
+    if text.count("{") != text.count("}"):
+        return False
+    if text.count("/*") > text.count("*/"):
+        return False
+    if filename.endswith(".h"):
+        has_ifndef = re.search(r"^\s*#\s*ifn?def\b", text, flags=re.MULTILINE)
+        has_endif = re.search(r"^\s*#\s*endif\b", text, flags=re.MULTILINE)
+        if has_ifndef and not has_endif:
+            return False
+    min_len = max(120, int(len(original.strip()) * 0.35))
+    if len(text) < min_len:
+        return False
+    last = text.splitlines()[-1].strip()
+    if not (
+        last.endswith("}")
+        or last.endswith(";")
+        or last.endswith("*/")
+        or last.startswith("#endif")
+    ):
+        return False
+    return True
+
 
 def extract_pdf_text(pdf_path: Path) -> str:
     """Extract all text from a PDF using PyMuPDF."""
@@ -68,56 +122,43 @@ def _call_llm_stream(
 ):
     """Yield text chunks via SSE streaming from LLM.
 
-    Tries LiteLLM proxy first, then falls back to the direct llama-server.
+    Uses direct llama-server to avoid proxy-side stalls.
     """
-    for base_url, model in [
-        (LLM_BASE_URL_LITELLM, MODEL_NAME_LITELLM),
-        (LLM_BASE_URL, MODEL_NAME),
-    ]:
-        url = f"{base_url.rstrip('/')}/v1/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.2,
-            "stream": True,
-        }
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        try:
-            yielded = False
-            with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
-                with client.stream(
-                    "POST", url, json=payload, headers=headers
-                ) as resp:
-                    resp.raise_for_status()
-                    for line in resp.iter_lines():
-                        if not line or line == "data: [DONE]":
-                            continue
-                        if line.startswith("data: "):
-                            try:
-                                data = json.loads(line[6:])
-                                delta = (
-                                    data.get("choices", [{}])[0].get("delta", {})
-                                )
-                                part = delta.get("content", "")
-                                if part:
-                                    yielded = True
-                                    yield part
-                            except (json.JSONDecodeError, KeyError):
-                                pass
-            if yielded:
-                return
-        except Exception:
-            if base_url == LLM_BASE_URL:
-                raise
-            continue
-    raise RuntimeError("All LLM backends returned empty responses")
+    url = f"{LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    yielded = False
+    with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
+        with client.stream("POST", url, json=payload, headers=headers) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line or line == "data: [DONE]":
+                    continue
+                if line.startswith("data: "):
+                    try:
+                        data = json.loads(line[6:])
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        part = delta.get("content", "")
+                        if part:
+                            yielded = True
+                            yield part
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+    if not yielded:
+        raise RuntimeError("LLM returned empty response from direct llama-server")
 
 
 def _extract_fenced(text: str, lang_hint: str = "") -> str:
@@ -273,9 +314,15 @@ async def process(session_id: str):
 
     code_dir = session_dir / "original_code"
     gen_dir = session_dir / "generated_code"
-    source_icd = (session_dir / "source_icd.txt").read_text()
-    target_icd = (session_dir / "target_icd.txt").read_text()
+    source_icd = _truncate_icd(
+        (session_dir / "source_icd.txt").read_text(), "source_icd"
+    )
+    target_icd = _truncate_icd(
+        (session_dir / "target_icd.txt").read_text(), "target_icd"
+    )
     code_files = sorted(p for p in code_dir.iterdir() if p.is_file())
+    log.info("Process %s: %d code files, source_icd=%d chars, target_icd=%d chars",
+             session_id[:8], len(code_files), len(source_icd), len(target_icd))
 
     def event_stream():
         # ---- Step 1: Analyse ICD delta --------------------------------
@@ -310,8 +357,9 @@ async def process(session_id: str):
 
         analysis_parts: list[str] = []
         try:
+            log.info("Calling LLM for ICD analysis (prompt=%d chars)...", len(analysis_prompt))
             for chunk in _call_llm_stream(
-                analysis_system, analysis_prompt, max_tokens=8192
+                analysis_system, analysis_prompt, max_tokens=512
             ):
                 analysis_parts.append(chunk)
                 yield _sse({
@@ -319,7 +367,9 @@ async def process(session_id: str):
                     "stage": "analysis",
                     "token": chunk,
                 })
+            log.info("ICD analysis complete (%d chars)", len("".join(analysis_parts)))
         except Exception as e:
+            log.exception("LLM analysis failed: %s", e)
             yield _sse({"type": "error", "message": str(e)})
             return
 
@@ -331,6 +381,7 @@ async def process(session_id: str):
         all_code_ctx = ""
         for cf in code_files:
             all_code_ctx += f"\n### File: {cf.name}\n```c\n{cf.read_text()}\n```\n"
+        all_code_ctx = _truncate_text(all_code_ctx, MAX_CODE_CONTEXT_CHARS, "all_code_ctx")
 
         # ---- Step 2: Transform each file ------------------------------
         for i, code_file in enumerate(code_files):
@@ -372,29 +423,68 @@ async def process(session_id: str):
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
                 "Transform this file so it fully conforms to the Target ICD. "
                 "Apply every relevant change from the change specification. "
-                "Output the complete file — do not omit any sections."
+                "Output the complete file — do not omit any sections. "
+                "Do not summarize. Do not truncate. Include the full ending of the file."
             )
-
-            file_parts: list[str] = []
-            try:
-                for chunk in _call_llm_stream(
-                    transform_system, transform_prompt, max_tokens=32768
-                ):
-                    file_parts.append(chunk)
+            clean = ""
+            last_chunk = ""
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                file_parts: list[str] = []
+                attempt_prompt = transform_prompt
+                if attempt > 1:
                     yield _sse({
-                        "type": "token",
+                        "type": "info",
                         "stage": "transform",
                         "file": fname,
-                        "token": chunk,
+                        "message": f"Detected incomplete output; requesting continuation (pass {attempt}/{max_attempts}).",
                     })
-            except Exception as e:
+                    attempt_prompt = (
+                        f"{transform_prompt}\n\n"
+                        "The previous output was incomplete/truncated. "
+                        "Continue from the exact point where it stopped, output ONLY the missing remainder, "
+                        "and ensure braces/comments/preprocessor blocks are closed.\n\n"
+                        f"Previous partial output:\n```c\n{clean}\n```"
+                    )
+                try:
+                    for chunk in _call_llm_stream(
+                        transform_system, attempt_prompt, max_tokens=4096
+                    ):
+                        file_parts.append(chunk)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "transform",
+                            "file": fname,
+                            "token": chunk,
+                        })
+                except Exception as e:
+                    yield _sse({
+                        "type": "error",
+                        "message": f"Error transforming {fname}: {e}",
+                        "file": fname,
+                    })
+                    break
+
+                last_chunk = _extract_fenced("".join(file_parts), "c").strip()
+                if attempt == 1:
+                    clean = last_chunk
+                else:
+                    clean = (clean.rstrip() + "\n" + last_chunk.lstrip()).strip()
+
+                if _looks_complete_c_file(clean, original, fname):
+                    break
+
+            if not _looks_complete_c_file(clean, original, fname):
                 yield _sse({
                     "type": "error",
-                    "message": f"Error transforming {fname}: {e}",
+                    "message": (
+                        f"{fname} still appears incomplete after retries. "
+                        "Try with smaller ICD PDFs or a GPU-enabled llama runtime."
+                    ),
+                    "file": fname,
                 })
                 continue
 
-            clean = _extract_fenced("".join(file_parts), "c")
             (gen_dir / fname).write_text(clean)
             yield _sse({
                 "type": "file_complete",

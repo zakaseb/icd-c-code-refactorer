@@ -31,8 +31,8 @@
             <h3>Source Code Files</h3>
             <p class="card-desc">Upload your original .c and .h files</p>
           </div>
-          <div class="drop-zone" id="drop-code">
-            <input type="file" id="input-code" multiple accept=".c,.h" hidden>
+          <label class="drop-zone" id="drop-code" for="input-code">
+            <input type="file" id="input-code" multiple accept=".c,.h">
             <div class="drop-content">
               <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.45">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -42,7 +42,7 @@
               <p>Drag &amp; drop .c / .h files here</p>
               <span class="drop-hint">or click to browse</span>
             </div>
-          </div>
+          </label>
           <div class="file-list" id="code-file-list"></div>
         </div>
 
@@ -60,8 +60,8 @@
             <h3>Source ICD</h3>
             <p class="card-desc">PDF of the current / original ICD version</p>
           </div>
-          <div class="drop-zone" id="drop-source-icd">
-            <input type="file" id="input-source-icd" accept=".pdf" hidden>
+          <label class="drop-zone" id="drop-source-icd" for="input-source-icd">
+            <input type="file" id="input-source-icd" accept=".pdf">
             <div class="drop-content">
               <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.45">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -71,7 +71,7 @@
               <p>Drag &amp; drop source ICD PDF</p>
               <span class="drop-hint">or click to browse</span>
             </div>
-          </div>
+          </label>
           <div class="file-list" id="source-icd-file-list"></div>
         </div>
 
@@ -88,8 +88,8 @@
             <h3>Target ICD</h3>
             <p class="card-desc">PDF of the target ICD version to generate code for</p>
           </div>
-          <div class="drop-zone" id="drop-target-icd">
-            <input type="file" id="input-target-icd" accept=".pdf" hidden>
+          <label class="drop-zone" id="drop-target-icd" for="input-target-icd">
+            <input type="file" id="input-target-icd" accept=".pdf">
             <div class="drop-content">
               <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.45">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -99,7 +99,7 @@
               <p>Drag &amp; drop target ICD PDF</p>
               <span class="drop-hint">or click to browse</span>
             </div>
-          </div>
+          </label>
           <div class="file-list" id="target-icd-file-list"></div>
         </div>
 

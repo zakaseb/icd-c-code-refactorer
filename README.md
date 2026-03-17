@@ -39,7 +39,7 @@ chmod +x build.sh run.sh run_web.sh entrypoint.sh
 ./run_web.sh
 ```
 
-Then open [http://localhost:8080](http://localhost:8080) in your browser.
+Then open [http://localhost:8081](http://localhost:8081) in your browser.
 
 ## How to Use
 
