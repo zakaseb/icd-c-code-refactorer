@@ -121,6 +121,7 @@ main {
 
 /* Drop zones */
 .drop-zone {
+  display: block;
   margin: .75rem 1rem 1rem;
   border: 2px dashed var(--border);
   border-radius: var(--radius);
@@ -129,6 +130,17 @@ main {
   cursor: pointer;
   transition: all .2s;
   background: var(--bg-primary);
+  user-select: none;
+}
+.drop-zone input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  border: 0;
 }
 .drop-zone:hover,
 .drop-zone.drag-over {

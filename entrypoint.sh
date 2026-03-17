@@ -13,7 +13,7 @@ tmux send-keys -t llama-server 'cd /app; ./llama-server --prio 3 --temp $LLAMA_S
 tmux split-window -h -t llama-server
 tmux send-keys -t llama-server 'litellm --model $ANTHROPIC_MODEL --temperature $LLAMA_SAMPLING_TEMPERATURE --drop_params' C-m
 tmux split-window -v -t llama-server
-tmux send-keys -t llama-server 'cd /home/developer/webapp && python3 -m uvicorn app:app --host 0.0.0.0 --port 8080' C-m
+tmux send-keys -t llama-server 'cd /home/developer/webapp && python3 -m uvicorn app:app --host 0.0.0.0 --port 8081' C-m
 tmux select-layout tiled
 echo 'Loading model (wait 15s for llama-server to be ready)...'
 sleep 15

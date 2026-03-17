@@ -40,14 +40,20 @@
   }
 
   function setupDropZone(zone, input, onFiles) {
-    zone.addEventListener('click', () => input.click());
     input.addEventListener('change', () => {
-      if (input.files.length) onFiles(Array.from(input.files));
+      if (input.files.length) {
+        onFiles(Array.from(input.files));
+        input.value = '';
+      }
     });
+    zone.addEventListener('dragenter', e => e.preventDefault());
     zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
-    zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    zone.addEventListener('dragleave', e => {
+      if (!zone.contains(e.relatedTarget)) zone.classList.remove('drag-over');
+    });
     zone.addEventListener('drop', e => {
       e.preventDefault();
+      e.stopPropagation();
       zone.classList.remove('drag-over');
       if (e.dataTransfer.files.length) onFiles(Array.from(e.dataTransfer.files));
     });
@@ -184,7 +190,9 @@
     const analysisStep = createStep('analysis', 'Analyzing ICD differences\u2026');
     pipelineSteps.appendChild(analysisStep);
     setStepStatus(analysisStep, 'running');
-    analysisStep.querySelector('.step-output').classList.add('visible');
+    const analysisOutput = analysisStep.querySelector('.step-output');
+    analysisOutput.classList.add('visible');
+    analysisOutput.textContent = 'Connecting to LLM... Large documents may take 5-10 minutes for the first response.';
 
     const fileSteps = {};
     let generatedFiles = [];
@@ -201,6 +209,7 @@
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
             const o = step.querySelector('.step-output');
+            if (o.textContent.startsWith('Connecting to LLM')) o.textContent = '';
             o.textContent += msg.token;
             o.scrollTop = o.scrollHeight;
           }
@@ -232,10 +241,32 @@
           }
           break;
 
+        case 'info': {
+          if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
+            const out = fileSteps[msg.file].querySelector('.step-output');
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+          }
+          break;
+        }
+
         case 'error': {
-          const errStep = createStep('err-' + Date.now(), 'Error: ' + msg.message);
-          pipelineSteps.appendChild(errStep);
-          setStepStatus(errStep, 'error');
+          es.close();
+          if (msg.file && fileSteps[msg.file]) {
+            setStepStatus(fileSteps[msg.file], 'error');
+            fileSteps[msg.file].querySelector('.step-label').textContent = msg.file + ' failed';
+            const out = fileSteps[msg.file].querySelector('.step-output');
+            out.textContent += '\nError: ' + msg.message + '\n';
+            out.classList.add('visible');
+          } else {
+            setStepStatus(analysisStep, 'error');
+            analysisStep.querySelector('.step-label').textContent = 'Analysis failed';
+            const out = analysisStep.querySelector('.step-output');
+            if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';
+            out.textContent += 'Error: ' + msg.message;
+            out.classList.add('visible');
+          }
+          processBtn.disabled = false;
           break;
         }
         case 'complete':
@@ -318,6 +349,9 @@
     const pdf = files.find(f => f.name.toLowerCase().endsWith('.pdf'));
     if (pdf) { targetIcdFile = pdf; renderIcdFile(pdf, tgtIcdList, dropTargetIcd, 'card-target-icd'); updateBtn(); }
   });
+
+  document.addEventListener('dragover', e => e.preventDefault());
+  document.addEventListener('drop', e => e.preventDefault());
 
   processBtn.addEventListener('click', runProcess);
   resetBtn.addEventListener('click', resetAll);
