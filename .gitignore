@@ -1,0 +1,9 @@
+models/
+workspace/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.idea/
+.vscode/
+.cursor/

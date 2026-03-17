@@ -1,0 +1,1 @@
+docker build --build-arg USER_ID=$(id -u) --build-arg GROUP_ID=$(id -g) -t icd-c-code-refactorer:llama.cpp -f Dockerfile .
