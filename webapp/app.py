@@ -51,29 +51,52 @@ MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
 
 HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
 
-# Keep prompts small enough to complete on CPU fallback if GPU offload is unavailable.
-MAX_ICD_CHARS = 4_000
+# Keep prompts bounded while still analyzing full ICDs via chunked map-reduce.
+ICD_CHUNK_CHARS = 10_000
 MAX_CODE_CONTEXT_CHARS = 8_000
+ANALYSIS_END_MARKER = "<<END_ANALYSIS>>"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _truncate_icd(text: str, label: str) -> str:
-    """Truncate ICD text to fit model context; warn if truncated."""
-    if len(text) <= MAX_ICD_CHARS:
-        return text
-    truncated = text[:MAX_ICD_CHARS] + "\n\n[... TRUNCATED - document too long for model context ...]"
-    log.warning("%s truncated from %d to %d chars", label, len(text), MAX_ICD_CHARS)
-    return truncated
-
-
 def _truncate_text(text: str, max_chars: int, label: str) -> str:
     if len(text) <= max_chars:
         return text
     log.warning("%s truncated from %d to %d chars", label, len(text), max_chars)
     return text[:max_chars] + f"\n\n[... TRUNCATED {label} ...]"
+
+
+def _split_text_chunks(text: str, max_chars: int) -> list[str]:
+    """Split large ICD text into bounded chunks, preserving paragraph boundaries."""
+    blocks = text.split("\n\n")
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = (current + "\n\n" + block).strip() if current else block
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(block) <= max_chars:
+            current = block
+        else:
+            # Hard split exceptionally large block.
+            for i in range(0, len(block), max_chars):
+                chunks.append(block[i:i + max_chars])
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+def _call_llm_text(system_prompt: str, user_prompt: str, max_tokens: int = 1024) -> str:
+    parts: list[str] = []
+    for piece in _call_llm_stream(system_prompt, user_prompt, max_tokens=max_tokens):
+        parts.append(piece)
+    return "".join(parts).strip()
 
 
 def _looks_complete_c_file(generated: str, original: str, filename: str) -> bool:
@@ -314,12 +337,8 @@ async def process(session_id: str):
 
     code_dir = session_dir / "original_code"
     gen_dir = session_dir / "generated_code"
-    source_icd = _truncate_icd(
-        (session_dir / "source_icd.txt").read_text(), "source_icd"
-    )
-    target_icd = _truncate_icd(
-        (session_dir / "target_icd.txt").read_text(), "target_icd"
-    )
+    source_icd = (session_dir / "source_icd.txt").read_text()
+    target_icd = (session_dir / "target_icd.txt").read_text()
     code_files = sorted(p for p in code_dir.iterdir() if p.is_file())
     log.info("Process %s: %d code files, source_icd=%d chars, target_icd=%d chars",
              session_id[:8], len(code_files), len(source_icd), len(target_icd))
@@ -332,49 +351,152 @@ async def process(session_id: str):
             "message": "Analyzing ICD differences\u2026",
         })
 
-        analysis_system = (
-            "You are an expert systems engineer and C programmer specializing in "
-            "Interface Control Documents (ICDs) and embedded systems.\n"
-            "Analyze the differences between the Source ICD and Target ICD.\n"
-            "Focus on:\n"
-            "- Data structure changes (added/removed/modified fields, types, sizes)\n"
-            "- Message format changes (new/removed/modified messages)\n"
-            "- Protocol and behavioral changes\n"
-            "- Interface parameter changes (function signatures, callbacks)\n"
-            "- Enumeration and constant value changes\n"
-            "- Timing or sequencing requirement changes\n\n"
-            "Produce a precise, actionable change specification that a C programmer "
-            "can use to update source code."
+        map_system = (
+            "You are an ICD analyst. Extract exhaustive technical facts from this ICD chunk.\n"
+            "Capture structs, enums, constants, message IDs, payload layouts, field sizes/types,\n"
+            "function/interface signatures, protocol/state/timing requirements, and constraints.\n"
+            "Return concise bullet points with concrete values; no filler text."
         )
-        analysis_prompt = (
-            f"## Source ICD (Original Version)\n\n{source_icd}\n\n"
-            f"## Target ICD (New Version)\n\n{target_icd}\n\n"
-            "Produce a detailed change specification listing ALL differences "
-            "between these two ICD versions that would affect C code. "
-            "Be specific about struct fields, enum values, function signatures, "
-            "message IDs, sizes, and any other concrete code-level changes."
+        merge_system = (
+            "You are consolidating multiple ICD chunk notes from the SAME ICD document.\n"
+            "Merge them into one complete, deduplicated technical summary while preserving concrete details."
+        )
+        compare_system = (
+            "You are an expert systems engineer and C programmer specializing in ICD-driven changes.\n"
+            "Compare the full Source ICD summary vs full Target ICD summary and produce a COMPLETE\n"
+            "code-impact change specification. Cover:\n"
+            "- structs/fields/types/sizes/alignment\n"
+            "- enums/constants/message IDs and payload formats\n"
+            "- function signatures/APIs/callbacks\n"
+            "- behavior/protocol/state/timing constraints\n"
+            "- header/source synchronization requirements\n\n"
+            f"End your final answer with exact marker: {ANALYSIS_END_MARKER}"
         )
 
-        analysis_parts: list[str] = []
         try:
-            log.info("Calling LLM for ICD analysis (prompt=%d chars)...", len(analysis_prompt))
-            for chunk in _call_llm_stream(
-                analysis_system, analysis_prompt, max_tokens=512
-            ):
-                analysis_parts.append(chunk)
+            source_chunks = _split_text_chunks(source_icd, ICD_CHUNK_CHARS)
+            target_chunks = _split_text_chunks(target_icd, ICD_CHUNK_CHARS)
+            yield _sse({
+                "type": "info",
+                "stage": "analysis",
+                "message": (
+                    f"Analyzing entire ICDs in chunks: source={len(source_chunks)}, "
+                    f"target={len(target_chunks)}."
+                ),
+            })
+
+            source_notes: list[str] = []
+            for idx, chunk_text in enumerate(source_chunks, start=1):
                 yield _sse({
-                    "type": "token",
+                    "type": "info",
                     "stage": "analysis",
-                    "token": chunk,
+                    "message": f"Source ICD chunk {idx}/{len(source_chunks)}...",
                 })
-            log.info("ICD analysis complete (%d chars)", len("".join(analysis_parts)))
+                note = _call_llm_text(
+                    map_system,
+                    (
+                        f"Source ICD chunk {idx}/{len(source_chunks)}:\n\n"
+                        f"{chunk_text}\n\n"
+                        "Extract all code-relevant facts from this chunk."
+                    ),
+                    max_tokens=1024,
+                )
+                source_notes.append(note)
+
+            target_notes: list[str] = []
+            for idx, chunk_text in enumerate(target_chunks, start=1):
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": f"Target ICD chunk {idx}/{len(target_chunks)}...",
+                })
+                note = _call_llm_text(
+                    map_system,
+                    (
+                        f"Target ICD chunk {idx}/{len(target_chunks)}:\n\n"
+                        f"{chunk_text}\n\n"
+                        "Extract all code-relevant facts from this chunk."
+                    ),
+                    max_tokens=1024,
+                )
+                target_notes.append(note)
+
+            source_summary = _call_llm_text(
+                merge_system,
+                "Merge these Source ICD notes into one complete technical summary:\n\n"
+                + "\n\n".join(
+                    f"## Source chunk note {i}\n{n}" for i, n in enumerate(source_notes, 1)
+                ),
+                max_tokens=2048,
+            )
+            target_summary = _call_llm_text(
+                merge_system,
+                "Merge these Target ICD notes into one complete technical summary:\n\n"
+                + "\n\n".join(
+                    f"## Target chunk note {i}\n{n}" for i, n in enumerate(target_notes, 1)
+                ),
+                max_tokens=2048,
+            )
+
+            base_compare_prompt = (
+                "Compare the COMPLETE Source vs Target ICD summaries and produce a complete\n"
+                "code-impact change specification that can drive full .h/.c refactoring.\n\n"
+                f"## Source ICD full summary\n{source_summary}\n\n"
+                f"## Target ICD full summary\n{target_summary}\n\n"
+                f"Finish with marker: {ANALYSIS_END_MARKER}"
+            )
+
+            analysis_parts: list[str] = []
+            complete_analysis = ""
+            max_analysis_passes = 4
+            for attempt in range(1, max_analysis_passes + 1):
+                if attempt == 1:
+                    prompt = base_compare_prompt
+                else:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": (
+                            f"Extending ICD analysis to complete output (pass {attempt}/{max_analysis_passes})..."
+                        ),
+                    })
+                    prompt = (
+                        f"{base_compare_prompt}\n\n"
+                        "Previous output was incomplete. Continue from where it stopped and include\n"
+                        f"the exact end marker {ANALYSIS_END_MARKER}.\n\n"
+                        f"Current partial analysis:\n{complete_analysis}"
+                    )
+
+                pass_parts: list[str] = []
+                for piece in _call_llm_stream(compare_system, prompt, max_tokens=2048):
+                    pass_parts.append(piece)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "analysis",
+                        "token": piece,
+                    })
+
+                pass_text = "".join(pass_parts)
+                analysis_parts.append(pass_text)
+                complete_analysis = "".join(analysis_parts)
+                if ANALYSIS_END_MARKER in complete_analysis:
+                    break
+
+            if ANALYSIS_END_MARKER not in complete_analysis:
+                raise RuntimeError(
+                    "ICD analysis did not complete within continuation passes. "
+                    "Please retry with smaller ICD PDFs or GPU-enabled runtime."
+                )
+
+            change_spec = complete_analysis.split(ANALYSIS_END_MARKER, 1)[0].strip()
+            log.info("ICD analysis complete (%d chars)", len(change_spec))
         except Exception as e:
             log.exception("LLM analysis failed: %s", e)
             yield _sse({"type": "error", "message": str(e)})
             return
 
-        change_spec = "".join(analysis_parts)
         (session_dir / "change_spec.txt").write_text(change_spec)
+        (session_dir / "icd_analysis.txt").write_text(change_spec)
         yield _sse({"type": "stage_complete", "stage": "analysis"})
 
         # Gather cross-file context
@@ -418,7 +540,7 @@ async def process(session_id: str):
             transform_prompt = (
                 f"## Change Specification (Source ICD -> Target ICD)\n\n"
                 f"{change_spec}\n\n"
-                f"## Target ICD Reference\n\n{target_icd}\n\n"
+                f"## Target ICD Consolidated Summary\n\n{target_summary}\n\n"
                 f"## All Project Files (cross-file context)\n{all_code_ctx}\n\n"
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
                 "Transform this file so it fully conforms to the Target ICD. "
@@ -526,6 +648,9 @@ async def download_all(session_id: str):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
             zf.write(f, f.name)
+        analysis_file = session_dir / "icd_analysis.txt"
+        if analysis_file.exists():
+            zf.write(analysis_file, "icd_analysis.txt")
     buf.seek(0)
 
     return StreamingResponse(
