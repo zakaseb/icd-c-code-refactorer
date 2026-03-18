@@ -242,7 +242,12 @@
           break;
 
         case 'info': {
-          if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
+          if (msg.stage === 'analysis') {
+            const out = analysisStep.querySelector('.step-output');
+            if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+          } else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
             const out = fileSteps[msg.file].querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
