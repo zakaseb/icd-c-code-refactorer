@@ -54,7 +54,6 @@ HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
 # Keep prompts bounded while still analyzing full ICDs via chunked map-reduce.
 ICD_CHUNK_CHARS = 10_000
 MAX_CODE_CONTEXT_CHARS = 8_000
-ANALYSIS_END_MARKER = "<<END_ANALYSIS>>"
 
 
 # ---------------------------------------------------------------------------
@@ -92,11 +91,45 @@ def _split_text_chunks(text: str, max_chars: int) -> list[str]:
     return chunks or [text]
 
 
-def _call_llm_text(system_prompt: str, user_prompt: str, max_tokens: int = 1024) -> str:
+def _call_llm_text(
+    system_prompt: str, user_prompt: str, max_tokens: int = 1024,
+    meta: dict | None = None,
+) -> str:
     parts: list[str] = []
-    for piece in _call_llm_stream(system_prompt, user_prompt, max_tokens=max_tokens):
+    for piece in _call_llm_stream(system_prompt, user_prompt,
+                                  max_tokens=max_tokens, meta=meta):
         parts.append(piece)
     return "".join(parts).strip()
+
+
+def _call_llm_complete(
+    system_prompt: str, user_prompt: str,
+    max_tokens: int = 4096, max_passes: int = 4,
+) -> str:
+    """Call LLM and automatically continue if the response is truncated
+    (``finish_reason == "length"``).  Returns the concatenated full text."""
+    result = ""
+    for attempt in range(max_passes):
+        meta: dict = {}
+        if attempt == 0:
+            prompt = user_prompt
+        else:
+            tail = result[-2000:] if len(result) > 2000 else result
+            prompt = (
+                "Your previous response was cut off due to length limits. "
+                "Here is the end of what you wrote:\n\n"
+                f"---\n{tail}\n---\n\n"
+                "Continue EXACTLY from where you left off. "
+                "Do not repeat already-written content."
+            )
+        text = _call_llm_text(system_prompt, prompt,
+                              max_tokens=max_tokens, meta=meta)
+        result = (result + "\n" + text).strip() if result else text
+        if meta.get("finish_reason") != "length":
+            break
+        log.info("_call_llm_complete: pass %d/%d truncated, continuing…",
+                 attempt + 1, max_passes)
+    return result
 
 
 def _looks_complete_c_file(generated: str, original: str, filename: str) -> bool:
@@ -141,11 +174,15 @@ def extract_pdf_text(pdf_path: Path) -> str:
 
 
 def _call_llm_stream(
-    system_prompt: str, user_prompt: str, max_tokens: int = 16384
+    system_prompt: str, user_prompt: str, max_tokens: int = 16384,
+    meta: dict | None = None,
 ):
     """Yield text chunks via SSE streaming from LLM.
 
     Uses direct llama-server to avoid proxy-side stalls.
+    If *meta* dict is provided, ``meta["finish_reason"]`` is set to the
+    finish_reason reported by the last SSE chunk (e.g. ``"stop"`` or
+    ``"length"``).
     """
     url = f"{LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
     payload = {
@@ -164,6 +201,7 @@ def _call_llm_stream(
     }
 
     yielded = False
+    finish_reason_last: str | None = None
     with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
         with client.stream("POST", url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -173,13 +211,19 @@ def _call_llm_stream(
                 if line.startswith("data: "):
                     try:
                         data = json.loads(line[6:])
-                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        choice = data.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
                         part = delta.get("content", "")
+                        fr = choice.get("finish_reason")
+                        if fr:
+                            finish_reason_last = fr
                         if part:
                             yielded = True
                             yield part
                     except (json.JSONDecodeError, KeyError):
                         pass
+    if meta is not None:
+        meta["finish_reason"] = finish_reason_last
     if not yielded:
         raise RuntimeError("LLM returned empty response from direct llama-server")
 
@@ -359,18 +403,21 @@ async def process(session_id: str):
         )
         merge_system = (
             "You are consolidating multiple ICD chunk notes from the SAME ICD document.\n"
-            "Merge them into one complete, deduplicated technical summary while preserving concrete details."
+            "Merge them into one complete, deduplicated technical summary while preserving\n"
+            "every concrete detail (names, values, sizes, types)."
         )
         compare_system = (
             "You are an expert systems engineer and C programmer specializing in ICD-driven changes.\n"
             "Compare the full Source ICD summary vs full Target ICD summary and produce a COMPLETE\n"
-            "code-impact change specification. Cover:\n"
-            "- structs/fields/types/sizes/alignment\n"
+            "and EXHAUSTIVE code-impact change specification. Cover ALL of the following:\n"
+            "- structs/fields/types/sizes/alignment changes\n"
             "- enums/constants/message IDs and payload formats\n"
-            "- function signatures/APIs/callbacks\n"
+            "- function signatures/APIs/callbacks changes\n"
             "- behavior/protocol/state/timing constraints\n"
-            "- header/source synchronization requirements\n\n"
-            f"End your final answer with exact marker: {ANALYSIS_END_MARKER}"
+            "- header/source synchronization requirements\n"
+            "- any additions, removals, or modifications between versions\n\n"
+            "Be thorough and detailed. Do not abbreviate or summarize. "
+            "List every single change with specific old and new values."
         )
 
         try:
@@ -385,21 +432,23 @@ async def process(session_id: str):
                 ),
             })
 
+            # -- Map phase: extract facts from each chunk --
             source_notes: list[str] = []
             for idx, chunk_text in enumerate(source_chunks, start=1):
                 yield _sse({
                     "type": "info",
                     "stage": "analysis",
-                    "message": f"Source ICD chunk {idx}/{len(source_chunks)}...",
+                    "message": f"Source ICD chunk {idx}/{len(source_chunks)}…",
                 })
-                note = _call_llm_text(
+                note = _call_llm_complete(
                     map_system,
                     (
                         f"Source ICD chunk {idx}/{len(source_chunks)}:\n\n"
                         f"{chunk_text}\n\n"
                         "Extract all code-relevant facts from this chunk."
                     ),
-                    max_tokens=1024,
+                    max_tokens=2048,
+                    max_passes=2,
                 )
                 source_notes.append(note)
 
@@ -408,48 +457,80 @@ async def process(session_id: str):
                 yield _sse({
                     "type": "info",
                     "stage": "analysis",
-                    "message": f"Target ICD chunk {idx}/{len(target_chunks)}...",
+                    "message": f"Target ICD chunk {idx}/{len(target_chunks)}…",
                 })
-                note = _call_llm_text(
+                note = _call_llm_complete(
                     map_system,
                     (
                         f"Target ICD chunk {idx}/{len(target_chunks)}:\n\n"
                         f"{chunk_text}\n\n"
                         "Extract all code-relevant facts from this chunk."
                     ),
-                    max_tokens=1024,
+                    max_tokens=2048,
+                    max_passes=2,
                 )
                 target_notes.append(note)
 
-            source_summary = _call_llm_text(
+            # -- Merge phase: consolidate notes per ICD --
+            yield _sse({
+                "type": "info",
+                "stage": "analysis",
+                "message": "Merging source ICD notes into consolidated summary…",
+            })
+            source_summary = _call_llm_complete(
                 merge_system,
                 "Merge these Source ICD notes into one complete technical summary:\n\n"
                 + "\n\n".join(
-                    f"## Source chunk note {i}\n{n}" for i, n in enumerate(source_notes, 1)
+                    f"## Source chunk note {i}\n{n}"
+                    for i, n in enumerate(source_notes, 1)
                 ),
-                max_tokens=2048,
+                max_tokens=4096,
+                max_passes=3,
             )
-            target_summary = _call_llm_text(
+
+            yield _sse({
+                "type": "info",
+                "stage": "analysis",
+                "message": "Merging target ICD notes into consolidated summary…",
+            })
+            target_summary = _call_llm_complete(
                 merge_system,
                 "Merge these Target ICD notes into one complete technical summary:\n\n"
                 + "\n\n".join(
-                    f"## Target chunk note {i}\n{n}" for i, n in enumerate(target_notes, 1)
+                    f"## Target chunk note {i}\n{n}"
+                    for i, n in enumerate(target_notes, 1)
                 ),
-                max_tokens=2048,
+                max_tokens=4096,
+                max_passes=3,
             )
 
+            # -- Compare phase: streamed to UI, finish_reason-based continuation --
+            yield _sse({
+                "type": "info",
+                "stage": "analysis",
+                "message": "Generating detailed change specification…",
+            })
+
             base_compare_prompt = (
-                "Compare the COMPLETE Source vs Target ICD summaries and produce a complete\n"
-                "code-impact change specification that can drive full .h/.c refactoring.\n\n"
+                "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "
+                "comparing the Source ICD to the Target ICD.  This specification will "
+                "be used to refactor C code, so it must cover every single difference.\n\n"
                 f"## Source ICD full summary\n{source_summary}\n\n"
                 f"## Target ICD full summary\n{target_summary}\n\n"
-                f"Finish with marker: {ANALYSIS_END_MARKER}"
+                "List EVERY difference between the two ICDs. For each change, state:\n"
+                "1. What it was in the Source ICD (old)\n"
+                "2. What it is in the Target ICD (new)\n"
+                "3. Impact on C code (structs, enums, functions, constants, etc.)"
             )
 
             analysis_parts: list[str] = []
             complete_analysis = ""
-            max_analysis_passes = 4
+            max_analysis_passes = 6
+            compare_max_tokens = 4096
+            last_meta: dict = {}
+
             for attempt in range(1, max_analysis_passes + 1):
+                meta: dict = {}
                 if attempt == 1:
                     prompt = base_compare_prompt
                 else:
@@ -457,18 +538,28 @@ async def process(session_id: str):
                         "type": "info",
                         "stage": "analysis",
                         "message": (
-                            f"Extending ICD analysis to complete output (pass {attempt}/{max_analysis_passes})..."
+                            f"Analysis output was truncated — continuing "
+                            f"(pass {attempt}/{max_analysis_passes})…"
                         ),
                     })
+                    tail_len = 3000
+                    tail = (complete_analysis[-tail_len:]
+                            if len(complete_analysis) > tail_len
+                            else complete_analysis)
                     prompt = (
-                        f"{base_compare_prompt}\n\n"
-                        "Previous output was incomplete. Continue from where it stopped and include\n"
-                        f"the exact end marker {ANALYSIS_END_MARKER}.\n\n"
-                        f"Current partial analysis:\n{complete_analysis}"
+                        "Your previous analysis was cut off due to length limits. "
+                        "Here is the end of what you wrote:\n\n"
+                        f"---\n{tail}\n---\n\n"
+                        "Continue EXACTLY from where you left off. Do not repeat "
+                        "content already written. Cover all remaining differences "
+                        "between the Source and Target ICDs."
                     )
 
                 pass_parts: list[str] = []
-                for piece in _call_llm_stream(compare_system, prompt, max_tokens=2048):
+                for piece in _call_llm_stream(
+                    compare_system, prompt,
+                    max_tokens=compare_max_tokens, meta=meta,
+                ):
                     pass_parts.append(piece)
                     yield _sse({
                         "type": "token",
@@ -479,17 +570,35 @@ async def process(session_id: str):
                 pass_text = "".join(pass_parts)
                 analysis_parts.append(pass_text)
                 complete_analysis = "".join(analysis_parts)
-                if ANALYSIS_END_MARKER in complete_analysis:
+                last_meta = meta
+
+                if meta.get("finish_reason") != "length":
+                    log.info(
+                        "Analysis pass %d done (finish_reason=%s)",
+                        attempt, meta.get("finish_reason"),
+                    )
                     break
+                log.info("Analysis pass %d hit token limit, continuing…", attempt)
 
-            if ANALYSIS_END_MARKER not in complete_analysis:
-                raise RuntimeError(
-                    "ICD analysis did not complete within continuation passes. "
-                    "Please retry with smaller ICD PDFs or GPU-enabled runtime."
+            if last_meta.get("finish_reason") == "length":
+                log.warning(
+                    "ICD analysis may be incomplete after %d passes",
+                    max_analysis_passes,
                 )
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": (
+                        "Note: analysis reached maximum continuation passes. "
+                        "Some minor details may be incomplete."
+                    ),
+                })
 
-            change_spec = complete_analysis.split(ANALYSIS_END_MARKER, 1)[0].strip()
-            log.info("ICD analysis complete (%d chars)", len(change_spec))
+            change_spec = complete_analysis.strip()
+            log.info(
+                "ICD analysis complete (%d chars, %d passes)",
+                len(change_spec), len(analysis_parts),
+            )
         except Exception as e:
             log.exception("LLM analysis failed: %s", e)
             yield _sse({"type": "error", "message": str(e)})
@@ -497,6 +606,7 @@ async def process(session_id: str):
 
         (session_dir / "change_spec.txt").write_text(change_spec)
         (session_dir / "icd_analysis.txt").write_text(change_spec)
+        (gen_dir / "icd_analysis.txt").write_text(change_spec)
         yield _sse({"type": "stage_complete", "stage": "analysis"})
 
         # Gather cross-file context
@@ -647,10 +757,17 @@ async def download_all(session_id: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
+            if f.name == "icd_analysis.txt":
+                continue
             zf.write(f, f.name)
-        analysis_file = session_dir / "icd_analysis.txt"
-        if analysis_file.exists():
-            zf.write(analysis_file, "icd_analysis.txt")
+        for candidate in [gen_dir / "icd_analysis.txt",
+                          session_dir / "icd_analysis.txt"]:
+            if candidate.exists():
+                zf.write(candidate, "icd_analysis.txt")
+                log.info("Added icd_analysis.txt from %s", candidate)
+                break
+        else:
+            log.warning("icd_analysis.txt not found for session %s", session_id[:8])
     buf.seek(0)
 
     return StreamingResponse(
