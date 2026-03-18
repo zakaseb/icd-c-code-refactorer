@@ -51,7 +51,13 @@ MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
 
 HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
 
-# Keep prompts bounded while still analyzing full ICDs via chunked map-reduce.
+# When combined ICD text is under this threshold we skip the expensive
+# map-reduce pipeline and do a single streaming comparison — much faster
+# and gives immediate UI feedback.  The limit is conservative relative to
+# the model's context window (32 768 tokens ≈ 90k+ chars).
+DIRECT_COMPARE_MAX_CHARS = 60_000
+
+# Fallback chunked map-reduce for very large ICDs.
 ICD_CHUNK_CHARS = 10_000
 MAX_CODE_CONTEXT_CHARS = 8_000
 
@@ -395,21 +401,10 @@ async def process(session_id: str):
             "message": "Analyzing ICD differences\u2026",
         })
 
-        map_system = (
-            "You are an ICD analyst. Extract exhaustive technical facts from this ICD chunk.\n"
-            "Capture structs, enums, constants, message IDs, payload layouts, field sizes/types,\n"
-            "function/interface signatures, protocol/state/timing requirements, and constraints.\n"
-            "Return concise bullet points with concrete values; no filler text."
-        )
-        merge_system = (
-            "You are consolidating multiple ICD chunk notes from the SAME ICD document.\n"
-            "Merge them into one complete, deduplicated technical summary while preserving\n"
-            "every concrete detail (names, values, sizes, types)."
-        )
         compare_system = (
             "You are an expert systems engineer and C programmer specializing in ICD-driven changes.\n"
-            "Compare the full Source ICD summary vs full Target ICD summary and produce a COMPLETE\n"
-            "and EXHAUSTIVE code-impact change specification. Cover ALL of the following:\n"
+            "Compare the Source ICD vs Target ICD and produce a COMPLETE and EXHAUSTIVE\n"
+            "code-impact change specification. Cover ALL of the following:\n"
             "- structs/fields/types/sizes/alignment changes\n"
             "- enums/constants/message IDs and payload formats\n"
             "- function signatures/APIs/callbacks changes\n"
@@ -420,109 +415,153 @@ async def process(session_id: str):
             "List every single change with specific old and new values."
         )
 
+        combined_icd_len = len(source_icd) + len(target_icd)
+        use_direct = combined_icd_len <= DIRECT_COMPARE_MAX_CHARS
+
         try:
-            source_chunks = _split_text_chunks(source_icd, ICD_CHUNK_CHARS)
-            target_chunks = _split_text_chunks(target_icd, ICD_CHUNK_CHARS)
-            yield _sse({
-                "type": "info",
-                "stage": "analysis",
-                "message": (
-                    f"Analyzing entire ICDs in chunks: source={len(source_chunks)}, "
-                    f"target={len(target_chunks)}."
-                ),
-            })
-
-            # -- Map phase: extract facts from each chunk --
-            source_notes: list[str] = []
-            for idx, chunk_text in enumerate(source_chunks, start=1):
+            if use_direct:
+                # ---- DIRECT path: one streaming comparison with full ICD texts ----
+                log.info("Using direct comparison (combined %d chars)", combined_icd_len)
                 yield _sse({
                     "type": "info",
                     "stage": "analysis",
-                    "message": f"Source ICD chunk {idx}/{len(source_chunks)}…",
-                })
-                note = _call_llm_complete(
-                    map_system,
-                    (
-                        f"Source ICD chunk {idx}/{len(source_chunks)}:\n\n"
-                        f"{chunk_text}\n\n"
-                        "Extract all code-relevant facts from this chunk."
+                    "message": (
+                        f"ICDs fit in context ({combined_icd_len:,} chars). "
+                        "Performing direct full-text comparison…"
                     ),
-                    max_tokens=2048,
-                    max_passes=2,
-                )
-                source_notes.append(note)
+                })
 
-            target_notes: list[str] = []
-            for idx, chunk_text in enumerate(target_chunks, start=1):
+                base_compare_prompt = (
+                    "Compare these two complete ICD documents and produce a COMPLETE "
+                    "and EXHAUSTIVE code-impact change specification that will be used "
+                    "to refactor C source code.\n\n"
+                    f"## Source ICD (Full Text)\n{source_icd}\n\n"
+                    f"## Target ICD (Full Text)\n{target_icd}\n\n"
+                    "List EVERY difference between the two ICDs. For each change, state:\n"
+                    "1. What it was in the Source ICD (old)\n"
+                    "2. What it is in the Target ICD (new)\n"
+                    "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                )
+                target_summary = _truncate_text(target_icd, 12_000, "target_icd_for_transform")
+
+            else:
+                # ---- MAP-REDUCE path: for very large ICDs ----
+                log.info("Using map-reduce (combined %d chars > %d threshold)",
+                         combined_icd_len, DIRECT_COMPARE_MAX_CHARS)
+                map_system = (
+                    "You are an ICD analyst. Extract exhaustive technical facts from this ICD chunk.\n"
+                    "Capture structs, enums, constants, message IDs, payload layouts, field sizes/types,\n"
+                    "function/interface signatures, protocol/state/timing requirements, and constraints.\n"
+                    "Return concise bullet points with concrete values; no filler text."
+                )
+                merge_system = (
+                    "You are consolidating multiple ICD chunk notes from the SAME ICD document.\n"
+                    "Merge them into one complete, deduplicated technical summary while preserving\n"
+                    "every concrete detail (names, values, sizes, types)."
+                )
+
+                source_chunks = _split_text_chunks(source_icd, ICD_CHUNK_CHARS)
+                target_chunks = _split_text_chunks(target_icd, ICD_CHUNK_CHARS)
                 yield _sse({
                     "type": "info",
                     "stage": "analysis",
-                    "message": f"Target ICD chunk {idx}/{len(target_chunks)}…",
-                })
-                note = _call_llm_complete(
-                    map_system,
-                    (
-                        f"Target ICD chunk {idx}/{len(target_chunks)}:\n\n"
-                        f"{chunk_text}\n\n"
-                        "Extract all code-relevant facts from this chunk."
+                    "message": (
+                        f"Large ICDs — using chunked analysis: "
+                        f"source={len(source_chunks)} chunks, "
+                        f"target={len(target_chunks)} chunks. "
+                        "This will take a while…"
                     ),
-                    max_tokens=2048,
-                    max_passes=2,
+                })
+
+                source_notes: list[str] = []
+                for idx, chunk_text in enumerate(source_chunks, start=1):
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": f"Extracting facts from source ICD chunk {idx}/{len(source_chunks)}…",
+                    })
+                    note = _call_llm_complete(
+                        map_system,
+                        (
+                            f"Source ICD chunk {idx}/{len(source_chunks)}:\n\n"
+                            f"{chunk_text}\n\n"
+                            "Extract all code-relevant facts from this chunk."
+                        ),
+                        max_tokens=2048,
+                        max_passes=2,
+                    )
+                    source_notes.append(note)
+
+                target_notes: list[str] = []
+                for idx, chunk_text in enumerate(target_chunks, start=1):
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": f"Extracting facts from target ICD chunk {idx}/{len(target_chunks)}…",
+                    })
+                    note = _call_llm_complete(
+                        map_system,
+                        (
+                            f"Target ICD chunk {idx}/{len(target_chunks)}:\n\n"
+                            f"{chunk_text}\n\n"
+                            "Extract all code-relevant facts from this chunk."
+                        ),
+                        max_tokens=2048,
+                        max_passes=2,
+                    )
+                    target_notes.append(note)
+
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": "Consolidating source ICD summary…",
+                })
+                source_summary = _call_llm_complete(
+                    merge_system,
+                    "Merge these Source ICD notes into one complete technical summary:\n\n"
+                    + "\n\n".join(
+                        f"## Source chunk note {i}\n{n}"
+                        for i, n in enumerate(source_notes, 1)
+                    ),
+                    max_tokens=4096,
+                    max_passes=3,
                 )
-                target_notes.append(note)
 
-            # -- Merge phase: consolidate notes per ICD --
-            yield _sse({
-                "type": "info",
-                "stage": "analysis",
-                "message": "Merging source ICD notes into consolidated summary…",
-            })
-            source_summary = _call_llm_complete(
-                merge_system,
-                "Merge these Source ICD notes into one complete technical summary:\n\n"
-                + "\n\n".join(
-                    f"## Source chunk note {i}\n{n}"
-                    for i, n in enumerate(source_notes, 1)
-                ),
-                max_tokens=4096,
-                max_passes=3,
-            )
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": "Consolidating target ICD summary…",
+                })
+                target_summary = _call_llm_complete(
+                    merge_system,
+                    "Merge these Target ICD notes into one complete technical summary:\n\n"
+                    + "\n\n".join(
+                        f"## Target chunk note {i}\n{n}"
+                        for i, n in enumerate(target_notes, 1)
+                    ),
+                    max_tokens=4096,
+                    max_passes=3,
+                )
 
-            yield _sse({
-                "type": "info",
-                "stage": "analysis",
-                "message": "Merging target ICD notes into consolidated summary…",
-            })
-            target_summary = _call_llm_complete(
-                merge_system,
-                "Merge these Target ICD notes into one complete technical summary:\n\n"
-                + "\n\n".join(
-                    f"## Target chunk note {i}\n{n}"
-                    for i, n in enumerate(target_notes, 1)
-                ),
-                max_tokens=4096,
-                max_passes=3,
-            )
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": "Generating detailed change specification…",
+                })
 
-            # -- Compare phase: streamed to UI, finish_reason-based continuation --
-            yield _sse({
-                "type": "info",
-                "stage": "analysis",
-                "message": "Generating detailed change specification…",
-            })
+                base_compare_prompt = (
+                    "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "
+                    "comparing the Source ICD to the Target ICD.  This specification will "
+                    "be used to refactor C code, so it must cover every single difference.\n\n"
+                    f"## Source ICD full summary\n{source_summary}\n\n"
+                    f"## Target ICD full summary\n{target_summary}\n\n"
+                    "List EVERY difference between the two ICDs. For each change, state:\n"
+                    "1. What it was in the Source ICD (old)\n"
+                    "2. What it is in the Target ICD (new)\n"
+                    "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                )
 
-            base_compare_prompt = (
-                "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "
-                "comparing the Source ICD to the Target ICD.  This specification will "
-                "be used to refactor C code, so it must cover every single difference.\n\n"
-                f"## Source ICD full summary\n{source_summary}\n\n"
-                f"## Target ICD full summary\n{target_summary}\n\n"
-                "List EVERY difference between the two ICDs. For each change, state:\n"
-                "1. What it was in the Source ICD (old)\n"
-                "2. What it is in the Target ICD (new)\n"
-                "3. Impact on C code (structs, enums, functions, constants, etc.)"
-            )
-
+            # ---- Streaming comparison (used by both paths) ----
             analysis_parts: list[str] = []
             complete_analysis = ""
             max_analysis_passes = 6
@@ -596,8 +635,9 @@ async def process(session_id: str):
 
             change_spec = complete_analysis.strip()
             log.info(
-                "ICD analysis complete (%d chars, %d passes)",
+                "ICD analysis complete (%d chars, %d passes, mode=%s)",
                 len(change_spec), len(analysis_parts),
+                "direct" if use_direct else "map-reduce",
             )
         except Exception as e:
             log.exception("LLM analysis failed: %s", e)
