@@ -51,14 +51,14 @@ MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
 
 HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
 
-# When combined ICD text is under this threshold we skip the expensive
-# map-reduce pipeline and do a single streaming comparison — much faster
-# and gives immediate UI feedback.  The limit is conservative relative to
-# the model's context window (32 768 tokens ≈ 90k+ chars).
-DIRECT_COMPARE_MAX_CHARS = 60_000
+# Disable direct full-text compare by default on CPU runs.
+# In practice the prompt prefill for very large full-ICD prompts can take a long
+# time before the first streamed token appears. The chunked path yields analysis
+# chunk-by-chunk so users see progress sooner.
+DIRECT_COMPARE_MAX_CHARS = 0
 
 # Fallback chunked map-reduce for very large ICDs.
-ICD_CHUNK_CHARS = 10_000
+ICD_CHUNK_CHARS = 3_000
 MAX_CODE_CONTEXT_CHARS = 8_000
 
 
@@ -100,17 +100,21 @@ def _split_text_chunks(text: str, max_chars: int) -> list[str]:
 def _call_llm_text(
     system_prompt: str, user_prompt: str, max_tokens: int = 1024,
     meta: dict | None = None,
+    on_chunk=None,
 ) -> str:
     parts: list[str] = []
     for piece in _call_llm_stream(system_prompt, user_prompt,
                                   max_tokens=max_tokens, meta=meta):
         parts.append(piece)
+        if on_chunk is not None:
+            on_chunk(piece)
     return "".join(parts).strip()
 
 
 def _call_llm_complete(
     system_prompt: str, user_prompt: str,
     max_tokens: int = 4096, max_passes: int = 4,
+    on_chunk=None,
 ) -> str:
     """Call LLM and automatically continue if the response is truncated
     (``finish_reason == "length"``).  Returns the concatenated full text."""
@@ -129,7 +133,7 @@ def _call_llm_complete(
                 "Do not repeat already-written content."
             )
         text = _call_llm_text(system_prompt, prompt,
-                              max_tokens=max_tokens, meta=meta)
+                              max_tokens=max_tokens, meta=meta, on_chunk=on_chunk)
         result = (result + "\n" + text).strip() if result else text
         if meta.get("finish_reason") != "length":
             break
@@ -200,6 +204,9 @@ def _call_llm_stream(
         "max_tokens": max_tokens,
         "temperature": 0.2,
         "stream": True,
+        # Disable hidden reasoning stream so content tokens appear promptly.
+        "reasoning_format": "none",
+        "reasoning_in_content": True,
     }
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
@@ -491,6 +498,14 @@ async def process(session_id: str):
                         max_passes=2,
                     )
                     source_notes.append(note)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "analysis",
+                        "token": (
+                            f"\n\n[Source chunk {idx}/{len(source_chunks)} analysis]\n"
+                            f"{note}\n"
+                        ),
+                    })
 
                 target_notes: list[str] = []
                 for idx, chunk_text in enumerate(target_chunks, start=1):
@@ -510,6 +525,14 @@ async def process(session_id: str):
                         max_passes=2,
                     )
                     target_notes.append(note)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "analysis",
+                        "token": (
+                            f"\n\n[Target chunk {idx}/{len(target_chunks)} analysis]\n"
+                            f"{note}\n"
+                        ),
+                    })
 
                 yield _sse({
                     "type": "info",
@@ -526,6 +549,11 @@ async def process(session_id: str):
                     max_tokens=4096,
                     max_passes=3,
                 )
+                yield _sse({
+                    "type": "token",
+                    "stage": "analysis",
+                    "token": f"\n\n[Consolidated Source ICD Summary]\n{source_summary}\n",
+                })
 
                 yield _sse({
                     "type": "info",
@@ -542,6 +570,11 @@ async def process(session_id: str):
                     max_tokens=4096,
                     max_passes=3,
                 )
+                yield _sse({
+                    "type": "token",
+                    "stage": "analysis",
+                    "token": f"\n\n[Consolidated Target ICD Summary]\n{target_summary}\n",
+                })
 
                 yield _sse({
                     "type": "info",

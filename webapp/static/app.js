@@ -284,7 +284,17 @@
 
     es.onerror = function () {
       es.close();
-      if (generatedFiles.length) showResults(generatedFiles);
+      if (generatedFiles.length) {
+        showResults(generatedFiles);
+        return;
+      }
+      setStepStatus(analysisStep, 'error');
+      analysisStep.querySelector('.step-label').textContent = 'Analysis stream interrupted';
+      const out = analysisStep.querySelector('.step-output');
+      if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';
+      out.textContent += '\nError: connection to processing stream was interrupted. Please retry.';
+      out.classList.add('visible');
+      processBtn.disabled = false;
     };
   }
 
