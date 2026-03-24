@@ -35,6 +35,20 @@ chmod +x build.sh run.sh run_web.sh entrypoint.sh
 
 ### Run
 
+`run_web.sh` and `run.sh` use `docker run ... --gpus all` so every visible NVIDIA GPU is passed into the container. The image defaults configure **llama-server** to offload **all** model layers to the GPU (`LLAMA_ARG_N_GPU_LAYERS=all`), enable flash attention when available (`LLAMA_ARG_FLASH_ATTN=on`), and use quantized KV caches (`LLAMA_ARG_CACHE_TYPE_*`) for higher throughput within available VRAM.
+
+If you hit out-of-memory errors, lower context or layers at runtime, for example:
+
+```bash
+docker run -ti --rm --network=host --gpus all \
+  -e LLAMA_ARG_N_GPU_LAYERS=48 \
+  -e LLAMA_ARG_CTX_SIZE=16384 \
+  -e LLAMA_ARG_N_PREDICT=16384 \
+  -v "$PWD/models":/home/developer/models \
+  -v "$PWD/workspace":/home/developer/workspace \
+  icd-c-code-refactorer:llama.cpp
+```
+
 ```bash
 ./run_web.sh
 ```
@@ -94,6 +108,19 @@ Environment variables (set in Docker or shell):
 | `LITELLM_BASE_URL` | `http://127.0.0.1:4000` | LiteLLM proxy URL |
 | `HF_MODEL` | `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf` | Model filename |
 | `WORKSPACE_DIR` | `./workspace` | Session/file storage directory |
+
+### GPU acceleration (llama.cpp)
+
+These are read by **llama-server** (see [llama.cpp server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)). Defaults in `Dockerfile` favor maximum GPU use; override when you need to fit a smaller card.
+
+| Variable | Default in image | Description |
+|---|---|---|
+| `LLAMA_ARG_N_GPU_LAYERS` | `all` | Offload all layers to GPU(s). Use a number (e.g. `40`) if VRAM is insufficient. |
+| `LLAMA_ARG_FLASH_ATTN` | `on` | Flash attention on GPU when supported. |
+| `LLAMA_ARG_CTX_SIZE` | `98274` (image); `32768` in `run_web.sh` / `run.sh`) | Prompt context length (affects KV cache size on GPU). |
+| `LLAMA_ARG_N_PREDICT` | Same as context in each file | Max tokens per generation (`-1` = unlimited in llama.cpp). |
+| `LLAMA_ARG_SPLIT_MODE` | `row` | Multi-GPU tensor split mode (`row`, `layer`, or `none`). |
+| `LLAMA_ARG_MAIN_GPU` | `0` | Primary GPU index when using multiple devices. |
 
 ## Derived From
 
