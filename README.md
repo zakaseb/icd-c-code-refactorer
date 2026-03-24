@@ -39,9 +39,8 @@ chmod +x build.sh run.sh run_web.sh entrypoint.sh
 
 **Sustainable defaults:** The image configures **llama-server** to use the GPU aggressively but safely:
 
-- **`LLAMA_ARG_N_GPU_LAYERS=auto`** — offload as many layers as fit; typically all layers when VRAM allows.
-- **`LLAMA_ARG_FIT=on`** with **`LLAMA_ARG_FIT_TARGET=2048`** — reserve ~2 GiB per GPU for the OS, display stack, and other apps, reducing edge-case OOMs.
-- **`LLAMA_ARG_FLASH_ATTN=on`** and **quantized KV caches** (`LLAMA_ARG_CACHE_TYPE_*`) — better throughput within the remaining VRAM.
+- **`LLAMA_ARG_N_GPU_LAYERS=9999`** — request all layers on GPU. llama.cpp's built-in `--fit` mechanism (on by default) automatically reduces this to what actually fits in VRAM, leaving a ~1 GiB margin. On GPUs smaller than the model, this produces **partial offload** (most layers on GPU, remainder on CPU) which is still far faster than CPU-only.
+- **`LLAMA_ARG_FLASH_ATTN=on`** and **quantized KV caches** (`LLAMA_ARG_CACHE_TYPE_*`) — reduce VRAM footprint and improve throughput.
 - **Normal process priority** (`--prio 0` in `entrypoint.sh`) — avoids realtime scheduling that can freeze the desktop.
 - **`run_web.sh` / `run.sh`** pass **`LLAMA_ARG_THREADS=(nproc - 2)`** (minimum 1) so the host keeps cores free for other work.
 
@@ -123,9 +122,7 @@ These are read by **llama-server** (see [llama.cpp server README](https://github
 
 | Variable | Default in image | Description |
 |---|---|---|
-| `LLAMA_ARG_N_GPU_LAYERS` | `auto` | Offload as many layers as fit (usually all when VRAM allows). Use `all` or a number to override. |
-| `LLAMA_ARG_FIT` | `on` | Let llama.cpp adjust parameters to fit device memory when needed. |
-| `LLAMA_ARG_FIT_TARGET` | `2048` | Target free VRAM margin per GPU (MiB) for `--fit`. Increase if you need more headroom for other apps. |
+| `LLAMA_ARG_N_GPU_LAYERS` | `9999` | Request all layers on GPU; llama.cpp's `--fit` auto-reduces to what fits. Lower this number to free more VRAM for other apps. |
 | `LLAMA_ARG_FLASH_ATTN` | `on` | Flash attention on GPU when supported. |
 | `LLAMA_ARG_CTX_SIZE` | `98274` (image); `32768` in `run_web.sh` / `run.sh`) | Prompt context length (affects KV cache size on GPU). |
 | `LLAMA_ARG_N_PREDICT` | Same as context in each file | Max tokens per generation (`-1` = unlimited in llama.cpp). |
