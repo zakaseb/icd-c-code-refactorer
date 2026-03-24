@@ -127,7 +127,7 @@ These are read by **llama-server** (see [llama.cpp server README](https://github
 | `LLAMA_ARG_CTX_SIZE` | `98274` (image); `32768` in `run_web.sh` / `run.sh`) | Prompt context length (affects KV cache size on GPU). |
 | `LLAMA_ARG_N_PREDICT` | Same as context in each file | Max tokens per generation (`-1` = unlimited in llama.cpp). |
 | `LLAMA_ARG_THREADS` | `-1` in image; overridden by `run_web.sh` / `run.sh` | CPU threads for llama (prefill/decode helpers); scripts reserve 2 cores for the host. |
-| `LLAMA_ARG_SPLIT_MODE` | `row` | Multi-GPU tensor split mode (`row`, `layer`, or `none`). |
+| `LLAMA_ARG_SPLIT_MODE` | `none` | Default single-GPU. Use `row` or `layer` when you have multiple GPUs (override in `docker run`). |
 | `LLAMA_ARG_MAIN_GPU` | `0` | Primary GPU index when using multiple devices. |
 
 ## Derived From
