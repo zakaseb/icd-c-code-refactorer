@@ -32,15 +32,15 @@ echo "llama-server CPU threads: $LLAMA_THREADS (host logical CPUs: $HOST_CPU)"
 echo "Running GPU preflight (llama-server --list-devices)..."
 GPU_PREFLIGHT_OUT=$(docker run --rm --gpus all --entrypoint /app/llama-server \
   icd-c-code-refactorer:llama.cpp --list-devices 2>&1 || true)
-if echo "$GPU_PREFLIGHT_OUT" | python3 - <<'PY'
+if printf '%s\n' "$GPU_PREFLIGHT_OUT" | python3 -c '
 import re
 import sys
 txt = sys.stdin.read()
 # Device lines generally look like:
 #   0: NVIDIA RTX ... (CUDA)
-device_lines = re.findall(r'^\s*\d+\s*:\s+.+$', txt, flags=re.MULTILINE)
+device_lines = re.findall(r"^\s*\d+\s*:\s+.+$", txt, flags=re.MULTILINE)
 sys.exit(0 if device_lines else 1)
-PY
+'
 then
   echo "GPU preflight passed."
 else
