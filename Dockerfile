@@ -59,8 +59,9 @@ ENV LLAMA_ARG_NO_CONTEXT_SHIFT=1
 ENV LLAMA_ARG_FLASH_ATTN=on
 ENV LLAMA_ARG_CACHE_TYPE_K=q8_0
 ENV LLAMA_ARG_CACHE_TYPE_V=q8_0
-# Row-parallel tensor split across GPUs when multiple devices are visible (see llama.cpp --split-mode).
-ENV LLAMA_ARG_SPLIT_MODE=row
+# Single-GPU default: 'none' uses one device. 'row' is for multi-GPU tensor parallel and can
+# prevent offload when only one GPU is present.
+ENV LLAMA_ARG_SPLIT_MODE=none
 ENV LLAMA_SAMPLING_TEMPERATURE=0.7
 ENV LLAMA_SAMPLING_MIN_P=0
 ENV LLAMA_SAMPLING_TOP_P=0.80
