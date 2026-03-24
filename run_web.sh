@@ -28,6 +28,31 @@ else
 fi
 echo "llama-server CPU threads: $LLAMA_THREADS (host logical CPUs: $HOST_CPU)"
 
+# GPU preflight: fail fast if CUDA device initialization is unavailable in containers.
+echo "Running GPU preflight (llama-server --list-devices)..."
+GPU_PREFLIGHT_OUT=$(docker run --rm --gpus all --entrypoint /app/llama-server \
+  icd-c-code-refactorer:llama.cpp --list-devices 2>&1 || true)
+if echo "$GPU_PREFLIGHT_OUT" | python3 - <<'PY'
+import re
+import sys
+txt = sys.stdin.read()
+# Device lines generally look like:
+#   0: NVIDIA RTX ... (CUDA)
+device_lines = re.findall(r'^\s*\d+\s*:\s+.+$', txt, flags=re.MULTILINE)
+sys.exit(0 if device_lines else 1)
+PY
+then
+  echo "GPU preflight passed."
+else
+  echo "ERROR: GPU preflight failed. llama.cpp could not initialize a usable CUDA device."
+  echo "Preflight output:"
+  echo "$GPU_PREFLIGHT_OUT"
+  echo
+  echo "Fix host GPU container runtime first (nvidia-container-toolkit / driver / docker integration),"
+  echo "then rerun ./run_web.sh. Starting anyway would cause UI LLM 'connection refused' errors."
+  exit 1
+fi
+
 docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
   -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
   -e LLAMA_ARG_CTX_SIZE=32768 \

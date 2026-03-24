@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import shutil
 import zipfile
@@ -215,30 +216,82 @@ def _call_llm_stream(
 
     yielded = False
     finish_reason_last: str | None = None
-    with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
-        with client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line or line == "data: [DONE]":
-                    continue
-                if line.startswith("data: "):
-                    try:
-                        data = json.loads(line[6:])
-                        choice = data.get("choices", [{}])[0]
-                        delta = choice.get("delta", {})
-                        part = delta.get("content", "")
-                        fr = choice.get("finish_reason")
-                        if fr:
-                            finish_reason_last = fr
-                        if part:
-                            yielded = True
-                            yield part
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+    last_err: Exception | None = None
+    max_attempts = 4
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
+                with client.stream("POST", url, json=payload, headers=headers) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if not line or line == "data: [DONE]":
+                            continue
+                        if line.startswith("data: "):
+                            try:
+                                data = json.loads(line[6:])
+                                choice = data.get("choices", [{}])[0]
+                                delta = choice.get("delta", {})
+                                part = delta.get("content", "")
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    finish_reason_last = fr
+                                if part:
+                                    yielded = True
+                                    yield part
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError) as e:
+            last_err = e
+            if attempt == max_attempts:
+                break
+            backoff = min(2 ** (attempt - 1), 6)
+            log.warning(
+                "LLM stream connect attempt %d/%d failed (%s). Retrying in %ss...",
+                attempt, max_attempts, e, backoff,
+            )
+            time.sleep(backoff)
+            continue
+
     if meta is not None:
         meta["finish_reason"] = finish_reason_last
+    if last_err is not None and not yielded:
+        raise RuntimeError(
+            "Failed to connect to llama-server after retries. "
+            "Check container logs/tmux for llama-server startup errors."
+        ) from last_err
     if not yielded:
         raise RuntimeError("LLM returned empty response from direct llama-server")
+
+
+def _wait_for_llm_ready(timeout_s: int = 120) -> None:
+    """Wait until llama-server responds to a health endpoint."""
+    health_url = f"{LLM_BASE_URL.rstrip('/')}/health"
+    models_url = f"{LLM_BASE_URL.rstrip('/')}/v1/models"
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    deadline = time.time() + timeout_s
+    last_err: Exception | None = None
+
+    with httpx.Client(timeout=httpx.Timeout(timeout=5.0, connect=2.0)) as client:
+        while time.time() < deadline:
+            try:
+                r = client.get(health_url)
+                if r.status_code == 200:
+                    return
+            except Exception as e:
+                last_err = e
+            try:
+                r2 = client.get(models_url, headers=headers)
+                if r2.status_code == 200:
+                    return
+            except Exception as e:
+                last_err = e
+            time.sleep(2)
+
+    raise RuntimeError(
+        "llama-server is not reachable. It may have failed to start (often GPU/CUDA init failure)."
+    ) from last_err
 
 
 def _extract_fenced(text: str, lang_hint: str = "") -> str:
@@ -401,6 +454,23 @@ async def process(session_id: str):
              session_id[:8], len(code_files), len(source_icd), len(target_icd))
 
     def event_stream():
+        yield _sse({
+            "type": "info",
+            "stage": "analysis",
+            "message": "Checking llama-server availability...",
+        })
+        try:
+            _wait_for_llm_ready(timeout_s=120)
+        except Exception as e:
+            yield _sse({
+                "type": "error",
+                "message": (
+                    f"{e} This usually means llama-server failed during startup. "
+                    "Check container terminal/tmux logs for CUDA/GPU errors."
+                ),
+            })
+            return
+
         # ---- Step 1: Analyse ICD delta --------------------------------
         yield _sse({
             "type": "stage",
