@@ -50,12 +50,18 @@ ENV LLAMA_LOG_PREFIX=1
 ENV LLAMA_ARG_MODEL="/home/developer/models/$HF_REPO_ID/$HF_MODEL"
 ENV LLAMA_ARG_CTX_SIZE=98274
 ENV LLAMA_ARG_N_PREDICT=$LLAMA_ARG_CTX_SIZE
-ENV LLAMA_ARG_N_GPU_LAYERS=49
+# GPU offload policy:
+# - "auto" lets llama.cpp fit offload against current free VRAM + context/KV footprint.
+# - This avoids startup OOMs on laptops where free VRAM fluctuates.
+ENV LLAMA_ARG_N_GPU_LAYERS=auto
 ENV LLAMA_ARG_NO_CONTEXT_SHIFT=1
-ENV LLAMA_ARG_FLASH_ATTN=1
+# Prefer GPU flash-attention when the backend supports it (CUDA).
+ENV LLAMA_ARG_FLASH_ATTN=on
 ENV LLAMA_ARG_CACHE_TYPE_K=q8_0
 ENV LLAMA_ARG_CACHE_TYPE_V=q8_0
-ENV LLAMA_ARG_SPLIT_MODE=row
+# Single-GPU default: 'none' uses one device. 'row' is for multi-GPU tensor parallel and can
+# prevent offload when only one GPU is present.
+ENV LLAMA_ARG_SPLIT_MODE=none
 ENV LLAMA_SAMPLING_TEMPERATURE=0.7
 ENV LLAMA_SAMPLING_MIN_P=0
 ENV LLAMA_SAMPLING_TOP_P=0.80

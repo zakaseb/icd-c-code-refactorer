@@ -242,7 +242,12 @@
           break;
 
         case 'info': {
-          if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
+          if (msg.stage === 'analysis') {
+            const out = analysisStep.querySelector('.step-output');
+            if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+          } else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
             const out = fileSteps[msg.file].querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
@@ -279,7 +284,17 @@
 
     es.onerror = function () {
       es.close();
-      if (generatedFiles.length) showResults(generatedFiles);
+      if (generatedFiles.length) {
+        showResults(generatedFiles);
+        return;
+      }
+      setStepStatus(analysisStep, 'error');
+      analysisStep.querySelector('.step-label').textContent = 'Analysis stream interrupted';
+      const out = analysisStep.querySelector('.step-output');
+      if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';
+      out.textContent += '\nError: connection to processing stream was interrupted. Please retry.';
+      out.classList.add('visible');
+      processBtn.disabled = false;
     };
   }
 
