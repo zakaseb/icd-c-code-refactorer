@@ -265,7 +265,7 @@ def _call_llm_stream(
         raise RuntimeError("LLM returned empty response from direct llama-server")
 
 
-def _wait_for_llm_ready(timeout_s: int = 120) -> None:
+def _wait_for_llm_ready(timeout_s: int = 300) -> None:
     """Wait until llama-server responds to a health endpoint."""
     health_url = f"{LLM_BASE_URL.rstrip('/')}/health"
     models_url = f"{LLM_BASE_URL.rstrip('/')}/v1/models"
@@ -290,7 +290,8 @@ def _wait_for_llm_ready(timeout_s: int = 120) -> None:
             time.sleep(2)
 
     raise RuntimeError(
-        "llama-server is not reachable. It may have failed to start (often GPU/CUDA init failure)."
+        "llama-server is not reachable. It may still be loading the model, or startup may have failed "
+        "(often GPU/CUDA init/OOM)."
     ) from last_err
 
 
@@ -460,7 +461,7 @@ async def process(session_id: str):
             "message": "Checking llama-server availability...",
         })
         try:
-            _wait_for_llm_ready(timeout_s=120)
+            _wait_for_llm_ready(timeout_s=300)
         except Exception as e:
             yield _sse({
                 "type": "error",
