@@ -18,8 +18,9 @@ fi
 
 echo "Starting container (models: $SCRIPT_DIR/models)."
 echo "Once ready, open http://localhost:$WEB_PORT in your browser."
+# --gpus all: expose every NVIDIA GPU. LLAMA_ARG_N_GPU_LAYERS=all is set in the Dockerfile
+# for full layer offload; add -e LLAMA_ARG_N_GPU_LAYERS=N here only if you must cap VRAM use.
 docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
-  -e LLAMA_ARG_N_GPU_LAYERS=30 \
   -e LLAMA_ARG_CTX_SIZE=32768 \
   -e LLAMA_ARG_N_PREDICT=32768 \
   -v "$SCRIPT_DIR/models":/home/developer/models \
