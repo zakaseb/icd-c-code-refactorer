@@ -36,9 +36,10 @@ if printf '%s\n' "$GPU_PREFLIGHT_OUT" | python3 -c '
 import re
 import sys
 txt = sys.stdin.read()
-# Device lines generally look like:
+# Device lines can look like either:
 #   0: NVIDIA RTX ... (CUDA)
-device_lines = re.findall(r"^\s*\d+\s*:\s+.+$", txt, flags=re.MULTILINE)
+#   CUDA0: NVIDIA RTX ...
+device_lines = re.findall(r"^\s*(?:\d+|CUDA\d+)\s*:\s+.+$", txt, flags=re.MULTILINE)
 sys.exit(0 if device_lines else 1)
 '
 then
