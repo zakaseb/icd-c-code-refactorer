@@ -18,9 +18,18 @@ fi
 
 echo "Starting container (models: $SCRIPT_DIR/models)."
 echo "Once ready, open http://localhost:$WEB_PORT in your browser."
-# --gpus all: expose every NVIDIA GPU. LLAMA_ARG_N_GPU_LAYERS=all is set in the Dockerfile
-# for full layer offload; add -e LLAMA_ARG_N_GPU_LAYERS=N here only if you must cap VRAM use.
+
+# Reserve CPU cores for the OS and other apps (llama still uses the GPU for inference).
+HOST_CPU=$(nproc 2>/dev/null || echo 4)
+if [ "$HOST_CPU" -gt 2 ]; then
+  LLAMA_THREADS=$((HOST_CPU - 2))
+else
+  LLAMA_THREADS=1
+fi
+echo "llama-server CPU threads: $LLAMA_THREADS (host logical CPUs: $HOST_CPU)"
+
 docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
+  -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
   -e LLAMA_ARG_CTX_SIZE=32768 \
   -e LLAMA_ARG_N_PREDICT=32768 \
   -v "$SCRIPT_DIR/models":/home/developer/models \
