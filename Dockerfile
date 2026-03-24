@@ -50,12 +50,10 @@ ENV LLAMA_LOG_PREFIX=1
 ENV LLAMA_ARG_MODEL="/home/developer/models/$HF_REPO_ID/$HF_MODEL"
 ENV LLAMA_ARG_CTX_SIZE=98274
 ENV LLAMA_ARG_N_PREDICT=$LLAMA_ARG_CTX_SIZE
-# GPU offload: 'auto' lets llama.cpp pick the maximum layers that fit (fastest sustainable path).
-# Pair with FIT + FIT_TARGET so VRAM headroom is reserved (fewer OOMs; room for desktop / other apps).
-ENV LLAMA_ARG_N_GPU_LAYERS=auto
-ENV LLAMA_ARG_FIT=on
-# Free VRAM margin per GPU (MiB) for --fit: OS, compositor, browser, and safety below OOM.
-ENV LLAMA_ARG_FIT_TARGET=2048
+# GPU offload: request all layers on GPU. llama.cpp's built-in --fit (on by default)
+# will automatically reduce this to the number that actually fits, leaving a ~1 GiB
+# VRAM margin for the OS/display. Partial offload is still far faster than pure CPU.
+ENV LLAMA_ARG_N_GPU_LAYERS=9999
 ENV LLAMA_ARG_NO_CONTEXT_SHIFT=1
 # Prefer GPU flash-attention when the backend supports it (CUDA).
 ENV LLAMA_ARG_FLASH_ATTN=on
