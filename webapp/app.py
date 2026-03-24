@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import shutil
 import zipfile
@@ -51,8 +52,14 @@ MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
 
 HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
 
-# Keep prompts small enough to complete on CPU fallback if GPU offload is unavailable.
-MAX_ICD_CHARS = 4_000
+# Disable direct full-text compare by default on CPU runs.
+# In practice the prompt prefill for very large full-ICD prompts can take a long
+# time before the first streamed token appears. The chunked path yields analysis
+# chunk-by-chunk so users see progress sooner.
+DIRECT_COMPARE_MAX_CHARS = 0
+
+# Fallback chunked map-reduce for very large ICDs.
+ICD_CHUNK_CHARS = 3_000
 MAX_CODE_CONTEXT_CHARS = 8_000
 
 
@@ -60,20 +67,80 @@ MAX_CODE_CONTEXT_CHARS = 8_000
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _truncate_icd(text: str, label: str) -> str:
-    """Truncate ICD text to fit model context; warn if truncated."""
-    if len(text) <= MAX_ICD_CHARS:
-        return text
-    truncated = text[:MAX_ICD_CHARS] + "\n\n[... TRUNCATED - document too long for model context ...]"
-    log.warning("%s truncated from %d to %d chars", label, len(text), MAX_ICD_CHARS)
-    return truncated
-
-
 def _truncate_text(text: str, max_chars: int, label: str) -> str:
     if len(text) <= max_chars:
         return text
     log.warning("%s truncated from %d to %d chars", label, len(text), max_chars)
     return text[:max_chars] + f"\n\n[... TRUNCATED {label} ...]"
+
+
+def _split_text_chunks(text: str, max_chars: int) -> list[str]:
+    """Split large ICD text into bounded chunks, preserving paragraph boundaries."""
+    blocks = text.split("\n\n")
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = (current + "\n\n" + block).strip() if current else block
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(block) <= max_chars:
+            current = block
+        else:
+            # Hard split exceptionally large block.
+            for i in range(0, len(block), max_chars):
+                chunks.append(block[i:i + max_chars])
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+def _call_llm_text(
+    system_prompt: str, user_prompt: str, max_tokens: int = 1024,
+    meta: dict | None = None,
+    on_chunk=None,
+) -> str:
+    parts: list[str] = []
+    for piece in _call_llm_stream(system_prompt, user_prompt,
+                                  max_tokens=max_tokens, meta=meta):
+        parts.append(piece)
+        if on_chunk is not None:
+            on_chunk(piece)
+    return "".join(parts).strip()
+
+
+def _call_llm_complete(
+    system_prompt: str, user_prompt: str,
+    max_tokens: int = 4096, max_passes: int = 4,
+    on_chunk=None,
+) -> str:
+    """Call LLM and automatically continue if the response is truncated
+    (``finish_reason == "length"``).  Returns the concatenated full text."""
+    result = ""
+    for attempt in range(max_passes):
+        meta: dict = {}
+        if attempt == 0:
+            prompt = user_prompt
+        else:
+            tail = result[-2000:] if len(result) > 2000 else result
+            prompt = (
+                "Your previous response was cut off due to length limits. "
+                "Here is the end of what you wrote:\n\n"
+                f"---\n{tail}\n---\n\n"
+                "Continue EXACTLY from where you left off. "
+                "Do not repeat already-written content."
+            )
+        text = _call_llm_text(system_prompt, prompt,
+                              max_tokens=max_tokens, meta=meta, on_chunk=on_chunk)
+        result = (result + "\n" + text).strip() if result else text
+        if meta.get("finish_reason") != "length":
+            break
+        log.info("_call_llm_complete: pass %d/%d truncated, continuing…",
+                 attempt + 1, max_passes)
+    return result
 
 
 def _looks_complete_c_file(generated: str, original: str, filename: str) -> bool:
@@ -118,11 +185,15 @@ def extract_pdf_text(pdf_path: Path) -> str:
 
 
 def _call_llm_stream(
-    system_prompt: str, user_prompt: str, max_tokens: int = 16384
+    system_prompt: str, user_prompt: str, max_tokens: int = 16384,
+    meta: dict | None = None,
 ):
     """Yield text chunks via SSE streaming from LLM.
 
     Uses direct llama-server to avoid proxy-side stalls.
+    If *meta* dict is provided, ``meta["finish_reason"]`` is set to the
+    finish_reason reported by the last SSE chunk (e.g. ``"stop"`` or
+    ``"length"``).
     """
     url = f"{LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
     payload = {
@@ -134,6 +205,9 @@ def _call_llm_stream(
         "max_tokens": max_tokens,
         "temperature": 0.2,
         "stream": True,
+        # Disable hidden reasoning stream so content tokens appear promptly.
+        "reasoning_format": "none",
+        "reasoning_in_content": True,
     }
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
@@ -141,24 +215,84 @@ def _call_llm_stream(
     }
 
     yielded = False
-    with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
-        with client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line or line == "data: [DONE]":
-                    continue
-                if line.startswith("data: "):
-                    try:
-                        data = json.loads(line[6:])
-                        delta = data.get("choices", [{}])[0].get("delta", {})
-                        part = delta.get("content", "")
-                        if part:
-                            yielded = True
-                            yield part
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+    finish_reason_last: str | None = None
+    last_err: Exception | None = None
+    max_attempts = 4
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
+                with client.stream("POST", url, json=payload, headers=headers) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if not line or line == "data: [DONE]":
+                            continue
+                        if line.startswith("data: "):
+                            try:
+                                data = json.loads(line[6:])
+                                choice = data.get("choices", [{}])[0]
+                                delta = choice.get("delta", {})
+                                part = delta.get("content", "")
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    finish_reason_last = fr
+                                if part:
+                                    yielded = True
+                                    yield part
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError) as e:
+            last_err = e
+            if attempt == max_attempts:
+                break
+            backoff = min(2 ** (attempt - 1), 6)
+            log.warning(
+                "LLM stream connect attempt %d/%d failed (%s). Retrying in %ss...",
+                attempt, max_attempts, e, backoff,
+            )
+            time.sleep(backoff)
+            continue
+
+    if meta is not None:
+        meta["finish_reason"] = finish_reason_last
+    if last_err is not None and not yielded:
+        raise RuntimeError(
+            "Failed to connect to llama-server after retries. "
+            "Check container logs/tmux for llama-server startup errors."
+        ) from last_err
     if not yielded:
         raise RuntimeError("LLM returned empty response from direct llama-server")
+
+
+def _wait_for_llm_ready(timeout_s: int = 300) -> None:
+    """Wait until llama-server responds to a health endpoint."""
+    health_url = f"{LLM_BASE_URL.rstrip('/')}/health"
+    models_url = f"{LLM_BASE_URL.rstrip('/')}/v1/models"
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    deadline = time.time() + timeout_s
+    last_err: Exception | None = None
+
+    with httpx.Client(timeout=httpx.Timeout(timeout=5.0, connect=2.0)) as client:
+        while time.time() < deadline:
+            try:
+                r = client.get(health_url)
+                if r.status_code == 200:
+                    return
+            except Exception as e:
+                last_err = e
+            try:
+                r2 = client.get(models_url, headers=headers)
+                if r2.status_code == 200:
+                    return
+            except Exception as e:
+                last_err = e
+            time.sleep(2)
+
+    raise RuntimeError(
+        "llama-server is not reachable. It may still be loading the model, or startup may have failed "
+        "(often GPU/CUDA init/OOM)."
+    ) from last_err
 
 
 def _extract_fenced(text: str, lang_hint: str = "") -> str:
@@ -314,17 +448,30 @@ async def process(session_id: str):
 
     code_dir = session_dir / "original_code"
     gen_dir = session_dir / "generated_code"
-    source_icd = _truncate_icd(
-        (session_dir / "source_icd.txt").read_text(), "source_icd"
-    )
-    target_icd = _truncate_icd(
-        (session_dir / "target_icd.txt").read_text(), "target_icd"
-    )
+    source_icd = (session_dir / "source_icd.txt").read_text()
+    target_icd = (session_dir / "target_icd.txt").read_text()
     code_files = sorted(p for p in code_dir.iterdir() if p.is_file())
     log.info("Process %s: %d code files, source_icd=%d chars, target_icd=%d chars",
              session_id[:8], len(code_files), len(source_icd), len(target_icd))
 
     def event_stream():
+        yield _sse({
+            "type": "info",
+            "stage": "analysis",
+            "message": "Checking llama-server availability...",
+        })
+        try:
+            _wait_for_llm_ready(timeout_s=300)
+        except Exception as e:
+            yield _sse({
+                "type": "error",
+                "message": (
+                    f"{e} This usually means llama-server failed during startup. "
+                    "Check container terminal/tmux logs for CUDA/GPU errors."
+                ),
+            })
+            return
+
         # ---- Step 1: Analyse ICD delta --------------------------------
         yield _sse({
             "type": "stage",
@@ -332,49 +479,278 @@ async def process(session_id: str):
             "message": "Analyzing ICD differences\u2026",
         })
 
-        analysis_system = (
-            "You are an expert systems engineer and C programmer specializing in "
-            "Interface Control Documents (ICDs) and embedded systems.\n"
-            "Analyze the differences between the Source ICD and Target ICD.\n"
-            "Focus on:\n"
-            "- Data structure changes (added/removed/modified fields, types, sizes)\n"
-            "- Message format changes (new/removed/modified messages)\n"
-            "- Protocol and behavioral changes\n"
-            "- Interface parameter changes (function signatures, callbacks)\n"
-            "- Enumeration and constant value changes\n"
-            "- Timing or sequencing requirement changes\n\n"
-            "Produce a precise, actionable change specification that a C programmer "
-            "can use to update source code."
-        )
-        analysis_prompt = (
-            f"## Source ICD (Original Version)\n\n{source_icd}\n\n"
-            f"## Target ICD (New Version)\n\n{target_icd}\n\n"
-            "Produce a detailed change specification listing ALL differences "
-            "between these two ICD versions that would affect C code. "
-            "Be specific about struct fields, enum values, function signatures, "
-            "message IDs, sizes, and any other concrete code-level changes."
+        compare_system = (
+            "You are an expert systems engineer and C programmer specializing in ICD-driven changes.\n"
+            "Compare the Source ICD vs Target ICD and produce a COMPLETE and EXHAUSTIVE\n"
+            "code-impact change specification. Cover ALL of the following:\n"
+            "- structs/fields/types/sizes/alignment changes\n"
+            "- enums/constants/message IDs and payload formats\n"
+            "- function signatures/APIs/callbacks changes\n"
+            "- behavior/protocol/state/timing constraints\n"
+            "- header/source synchronization requirements\n"
+            "- any additions, removals, or modifications between versions\n\n"
+            "Be thorough and detailed. Do not abbreviate or summarize. "
+            "List every single change with specific old and new values."
         )
 
-        analysis_parts: list[str] = []
+        combined_icd_len = len(source_icd) + len(target_icd)
+        use_direct = combined_icd_len <= DIRECT_COMPARE_MAX_CHARS
+
         try:
-            log.info("Calling LLM for ICD analysis (prompt=%d chars)...", len(analysis_prompt))
-            for chunk in _call_llm_stream(
-                analysis_system, analysis_prompt, max_tokens=512
-            ):
-                analysis_parts.append(chunk)
+            if use_direct:
+                # ---- DIRECT path: one streaming comparison with full ICD texts ----
+                log.info("Using direct comparison (combined %d chars)", combined_icd_len)
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": (
+                        f"ICDs fit in context ({combined_icd_len:,} chars). "
+                        "Performing direct full-text comparison…"
+                    ),
+                })
+
+                base_compare_prompt = (
+                    "Compare these two complete ICD documents and produce a COMPLETE "
+                    "and EXHAUSTIVE code-impact change specification that will be used "
+                    "to refactor C source code.\n\n"
+                    f"## Source ICD (Full Text)\n{source_icd}\n\n"
+                    f"## Target ICD (Full Text)\n{target_icd}\n\n"
+                    "List EVERY difference between the two ICDs. For each change, state:\n"
+                    "1. What it was in the Source ICD (old)\n"
+                    "2. What it is in the Target ICD (new)\n"
+                    "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                )
+                target_summary = _truncate_text(target_icd, 12_000, "target_icd_for_transform")
+
+            else:
+                # ---- MAP-REDUCE path: for very large ICDs ----
+                log.info("Using map-reduce (combined %d chars > %d threshold)",
+                         combined_icd_len, DIRECT_COMPARE_MAX_CHARS)
+                map_system = (
+                    "You are an ICD analyst. Extract exhaustive technical facts from this ICD chunk.\n"
+                    "Capture structs, enums, constants, message IDs, payload layouts, field sizes/types,\n"
+                    "function/interface signatures, protocol/state/timing requirements, and constraints.\n"
+                    "Return concise bullet points with concrete values; no filler text."
+                )
+                merge_system = (
+                    "You are consolidating multiple ICD chunk notes from the SAME ICD document.\n"
+                    "Merge them into one complete, deduplicated technical summary while preserving\n"
+                    "every concrete detail (names, values, sizes, types)."
+                )
+
+                source_chunks = _split_text_chunks(source_icd, ICD_CHUNK_CHARS)
+                target_chunks = _split_text_chunks(target_icd, ICD_CHUNK_CHARS)
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": (
+                        f"Large ICDs — using chunked analysis: "
+                        f"source={len(source_chunks)} chunks, "
+                        f"target={len(target_chunks)} chunks. "
+                        "This will take a while…"
+                    ),
+                })
+
+                source_notes: list[str] = []
+                for idx, chunk_text in enumerate(source_chunks, start=1):
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": f"Extracting facts from source ICD chunk {idx}/{len(source_chunks)}…",
+                    })
+                    note = _call_llm_complete(
+                        map_system,
+                        (
+                            f"Source ICD chunk {idx}/{len(source_chunks)}:\n\n"
+                            f"{chunk_text}\n\n"
+                            "Extract all code-relevant facts from this chunk."
+                        ),
+                        max_tokens=2048,
+                        max_passes=2,
+                    )
+                    source_notes.append(note)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "analysis",
+                        "token": (
+                            f"\n\n[Source chunk {idx}/{len(source_chunks)} analysis]\n"
+                            f"{note}\n"
+                        ),
+                    })
+
+                target_notes: list[str] = []
+                for idx, chunk_text in enumerate(target_chunks, start=1):
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": f"Extracting facts from target ICD chunk {idx}/{len(target_chunks)}…",
+                    })
+                    note = _call_llm_complete(
+                        map_system,
+                        (
+                            f"Target ICD chunk {idx}/{len(target_chunks)}:\n\n"
+                            f"{chunk_text}\n\n"
+                            "Extract all code-relevant facts from this chunk."
+                        ),
+                        max_tokens=2048,
+                        max_passes=2,
+                    )
+                    target_notes.append(note)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "analysis",
+                        "token": (
+                            f"\n\n[Target chunk {idx}/{len(target_chunks)} analysis]\n"
+                            f"{note}\n"
+                        ),
+                    })
+
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": "Consolidating source ICD summary…",
+                })
+                source_summary = _call_llm_complete(
+                    merge_system,
+                    "Merge these Source ICD notes into one complete technical summary:\n\n"
+                    + "\n\n".join(
+                        f"## Source chunk note {i}\n{n}"
+                        for i, n in enumerate(source_notes, 1)
+                    ),
+                    max_tokens=4096,
+                    max_passes=3,
+                )
                 yield _sse({
                     "type": "token",
                     "stage": "analysis",
-                    "token": chunk,
+                    "token": f"\n\n[Consolidated Source ICD Summary]\n{source_summary}\n",
                 })
-            log.info("ICD analysis complete (%d chars)", len("".join(analysis_parts)))
+
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": "Consolidating target ICD summary…",
+                })
+                target_summary = _call_llm_complete(
+                    merge_system,
+                    "Merge these Target ICD notes into one complete technical summary:\n\n"
+                    + "\n\n".join(
+                        f"## Target chunk note {i}\n{n}"
+                        for i, n in enumerate(target_notes, 1)
+                    ),
+                    max_tokens=4096,
+                    max_passes=3,
+                )
+                yield _sse({
+                    "type": "token",
+                    "stage": "analysis",
+                    "token": f"\n\n[Consolidated Target ICD Summary]\n{target_summary}\n",
+                })
+
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": "Generating detailed change specification…",
+                })
+
+                base_compare_prompt = (
+                    "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "
+                    "comparing the Source ICD to the Target ICD.  This specification will "
+                    "be used to refactor C code, so it must cover every single difference.\n\n"
+                    f"## Source ICD full summary\n{source_summary}\n\n"
+                    f"## Target ICD full summary\n{target_summary}\n\n"
+                    "List EVERY difference between the two ICDs. For each change, state:\n"
+                    "1. What it was in the Source ICD (old)\n"
+                    "2. What it is in the Target ICD (new)\n"
+                    "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                )
+
+            # ---- Streaming comparison (used by both paths) ----
+            analysis_parts: list[str] = []
+            complete_analysis = ""
+            max_analysis_passes = 6
+            compare_max_tokens = 4096
+            last_meta: dict = {}
+
+            for attempt in range(1, max_analysis_passes + 1):
+                meta: dict = {}
+                if attempt == 1:
+                    prompt = base_compare_prompt
+                else:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": (
+                            f"Analysis output was truncated — continuing "
+                            f"(pass {attempt}/{max_analysis_passes})…"
+                        ),
+                    })
+                    tail_len = 3000
+                    tail = (complete_analysis[-tail_len:]
+                            if len(complete_analysis) > tail_len
+                            else complete_analysis)
+                    prompt = (
+                        "Your previous analysis was cut off due to length limits. "
+                        "Here is the end of what you wrote:\n\n"
+                        f"---\n{tail}\n---\n\n"
+                        "Continue EXACTLY from where you left off. Do not repeat "
+                        "content already written. Cover all remaining differences "
+                        "between the Source and Target ICDs."
+                    )
+
+                pass_parts: list[str] = []
+                for piece in _call_llm_stream(
+                    compare_system, prompt,
+                    max_tokens=compare_max_tokens, meta=meta,
+                ):
+                    pass_parts.append(piece)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "analysis",
+                        "token": piece,
+                    })
+
+                pass_text = "".join(pass_parts)
+                analysis_parts.append(pass_text)
+                complete_analysis = "".join(analysis_parts)
+                last_meta = meta
+
+                if meta.get("finish_reason") != "length":
+                    log.info(
+                        "Analysis pass %d done (finish_reason=%s)",
+                        attempt, meta.get("finish_reason"),
+                    )
+                    break
+                log.info("Analysis pass %d hit token limit, continuing…", attempt)
+
+            if last_meta.get("finish_reason") == "length":
+                log.warning(
+                    "ICD analysis may be incomplete after %d passes",
+                    max_analysis_passes,
+                )
+                yield _sse({
+                    "type": "info",
+                    "stage": "analysis",
+                    "message": (
+                        "Note: analysis reached maximum continuation passes. "
+                        "Some minor details may be incomplete."
+                    ),
+                })
+
+            change_spec = complete_analysis.strip()
+            log.info(
+                "ICD analysis complete (%d chars, %d passes, mode=%s)",
+                len(change_spec), len(analysis_parts),
+                "direct" if use_direct else "map-reduce",
+            )
         except Exception as e:
             log.exception("LLM analysis failed: %s", e)
             yield _sse({"type": "error", "message": str(e)})
             return
 
-        change_spec = "".join(analysis_parts)
         (session_dir / "change_spec.txt").write_text(change_spec)
+        (session_dir / "icd_analysis.txt").write_text(change_spec)
+        (gen_dir / "icd_analysis.txt").write_text(change_spec)
         yield _sse({"type": "stage_complete", "stage": "analysis"})
 
         # Gather cross-file context
@@ -418,7 +794,7 @@ async def process(session_id: str):
             transform_prompt = (
                 f"## Change Specification (Source ICD -> Target ICD)\n\n"
                 f"{change_spec}\n\n"
-                f"## Target ICD Reference\n\n{target_icd}\n\n"
+                f"## Target ICD Consolidated Summary\n\n{target_summary}\n\n"
                 f"## All Project Files (cross-file context)\n{all_code_ctx}\n\n"
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
                 "Transform this file so it fully conforms to the Target ICD. "
@@ -525,7 +901,17 @@ async def download_all(session_id: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
+            if f.name == "icd_analysis.txt":
+                continue
             zf.write(f, f.name)
+        for candidate in [gen_dir / "icd_analysis.txt",
+                          session_dir / "icd_analysis.txt"]:
+            if candidate.exists():
+                zf.write(candidate, "icd_analysis.txt")
+                log.info("Added icd_analysis.txt from %s", candidate)
+                break
+        else:
+            log.warning("icd_analysis.txt not found for session %s", session_id[:8])
     buf.seek(0)
 
     return StreamingResponse(
