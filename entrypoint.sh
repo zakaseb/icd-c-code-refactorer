@@ -15,8 +15,22 @@ tmux send-keys -t llama-server 'litellm --model $ANTHROPIC_MODEL --temperature $
 tmux split-window -v -t llama-server
 tmux send-keys -t llama-server 'cd /home/developer/webapp && python3 -m uvicorn app:app --host 0.0.0.0 --port 8081' C-m
 tmux select-layout tiled
-echo 'Loading model (wait 15s for llama-server to be ready)...'
-sleep 15
+echo 'Loading model (waiting for llama-server health)...'
+READY=0
+for i in $(seq 1 60); do
+  if curl -s -H "Authorization: Bearer $OPENAI_API_KEY" "http://${LLAMA_ARG_HOST}:${LLAMA_ARG_PORT}/v1/models" >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+  sleep 2
+done
+
+if [ "$READY" -ne 1 ]; then
+  echo 'ERROR: llama-server did not become ready in time.'
+  echo 'Last llama-server pane output:'
+  tmux capture-pane -t llama-server:0.0 -p -S -120 || true
+  exit 1
+fi
 
 /bin/bash
 
