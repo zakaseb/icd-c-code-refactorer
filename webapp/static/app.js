@@ -5,17 +5,21 @@
   let codeFiles = [];
   let sourceIcdFile = null;
   let targetIcdFile = null;
+  let repoZipFile = null;
 
   /* ----- DOM refs ------------------------------------------------ */
   const dropCode       = document.getElementById('drop-code');
   const dropSourceIcd  = document.getElementById('drop-source-icd');
   const dropTargetIcd  = document.getElementById('drop-target-icd');
+  const dropRepoZip    = document.getElementById('drop-repo-zip');
   const inputCode      = document.getElementById('input-code');
   const inputSourceIcd = document.getElementById('input-source-icd');
   const inputTargetIcd = document.getElementById('input-target-icd');
+  const inputRepoZip   = document.getElementById('input-repo-zip');
   const codeFileList   = document.getElementById('code-file-list');
   const srcIcdList     = document.getElementById('source-icd-file-list');
   const tgtIcdList     = document.getElementById('target-icd-file-list');
+  const repoZipList    = document.getElementById('repo-zip-file-list');
   const processBtn     = document.getElementById('process-btn');
   const resetBtn       = document.getElementById('reset-btn');
   const procSection    = document.getElementById('processing-section');
@@ -107,6 +111,24 @@
     processBtn.disabled = !(codeFiles.length > 0 && sourceIcdFile && targetIcdFile);
   }
 
+  function renderZipFile(file, listEl, dropEl, cardId) {
+    listEl.innerHTML = '';
+    if (file) {
+      const d = document.createElement('div');
+      d.className = 'file-item';
+      d.innerHTML =
+        '<span class="file-icon">ZIP</span>' +
+        '<span class="file-name">' + file.name + '</span>' +
+        '<span class="file-size">' + fmtSize(file.size) + '</span>';
+      listEl.appendChild(d);
+      document.getElementById(cardId).classList.add('has-files');
+      dropEl.classList.add('uploaded');
+    } else {
+      document.getElementById(cardId).classList.remove('has-files');
+      dropEl.classList.remove('uploaded');
+    }
+  }
+
   /* ----- Upload helpers ------------------------------------------ */
 
   async function uploadCodeFiles() {
@@ -119,6 +141,13 @@
     const fd = new FormData();
     fd.append('file', file);
     return (await fetch('/api/upload/' + endpoint + '/' + sessionId, { method: 'POST', body: fd })).json();
+  }
+
+  async function uploadRepoZip() {
+    if (!repoZipFile) return null;
+    const fd = new FormData();
+    fd.append('file', repoZipFile);
+    return (await fetch('/api/upload/repo-zip/' + sessionId, { method: 'POST', body: fd })).json();
   }
 
   /* ----- Pipeline step UI ---------------------------------------- */
@@ -170,13 +199,16 @@
 
     try {
       await initSession();
-      await Promise.all([
+      const uploads = [
         uploadCodeFiles(),
         uploadIcd('source-icd', sourceIcdFile),
         uploadIcd('target-icd', targetIcdFile),
-      ]);
+      ];
+      if (repoZipFile) uploads.push(uploadRepoZip());
+      await Promise.all(uploads);
       setStepStatus(upStep, 'complete');
-      upStep.querySelector('.step-label').textContent = 'Files uploaded';
+      upStep.querySelector('.step-label').textContent =
+        'Files uploaded' + (repoZipFile ? ' (including repository)' : '');
     } catch (err) {
       setStepStatus(upStep, 'error');
       const out = upStep.querySelector('.step-output');
@@ -196,6 +228,7 @@
 
     const fileSteps = {};
     let generatedFiles = [];
+    let verificationStep = null;
 
     const es = new EventSource('/api/process/' + sessionId);
 
@@ -206,6 +239,7 @@
         case 'token': {
           let step;
           if (msg.stage === 'analysis') step = analysisStep;
+          else if (msg.stage === 'verification') step = verificationStep;
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
             const o = step.querySelector('.step-output');
@@ -223,6 +257,12 @@
             setStepStatus(s, 'running');
             s.querySelector('.step-output').classList.add('visible');
             fileSteps[msg.file] = s;
+          } else if (msg.stage === 'verification' && !verificationStep) {
+            verificationStep = createStep('verification',
+              'Verifying generated code against ICDs & repository\u2026');
+            pipelineSteps.appendChild(verificationStep);
+            setStepStatus(verificationStep, 'running');
+            verificationStep.querySelector('.step-output').classList.add('visible');
           }
           break;
 
@@ -230,6 +270,9 @@
           if (msg.stage === 'analysis') {
             setStepStatus(analysisStep, 'complete');
             analysisStep.querySelector('.step-label').textContent = 'ICD analysis complete';
+          } else if (msg.stage === 'verification' && verificationStep) {
+            setStepStatus(verificationStep, 'complete');
+            verificationStep.querySelector('.step-label').textContent = 'Verification complete';
           }
           break;
 
@@ -245,6 +288,10 @@
           if (msg.stage === 'analysis') {
             const out = analysisStep.querySelector('.step-output');
             if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+          } else if (msg.stage === 'verification' && verificationStep) {
+            const out = verificationStep.querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
           } else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
@@ -333,9 +380,11 @@
     codeFiles = [];
     sourceIcdFile = null;
     targetIcdFile = null;
+    repoZipFile = null;
     renderCodeFiles();
     renderIcdFile(null, srcIcdList, dropSourceIcd, 'card-source-icd');
     renderIcdFile(null, tgtIcdList, dropTargetIcd, 'card-target-icd');
+    renderZipFile(null, repoZipList, dropRepoZip, 'card-repo-zip');
     updateBtn();
     procSection.classList.add('hidden');
     resultsSection.classList.add('hidden');
@@ -344,6 +393,7 @@
     inputCode.value = '';
     inputSourceIcd.value = '';
     inputTargetIcd.value = '';
+    inputRepoZip.value = '';
   }
 
   /* ----- Wire up events ------------------------------------------ */
@@ -363,6 +413,11 @@
   setupDropZone(dropTargetIcd, inputTargetIcd, files => {
     const pdf = files.find(f => f.name.toLowerCase().endsWith('.pdf'));
     if (pdf) { targetIcdFile = pdf; renderIcdFile(pdf, tgtIcdList, dropTargetIcd, 'card-target-icd'); updateBtn(); }
+  });
+
+  setupDropZone(dropRepoZip, inputRepoZip, files => {
+    const zip = files.find(f => f.name.toLowerCase().endsWith('.zip'));
+    if (zip) { repoZipFile = zip; renderZipFile(zip, repoZipList, dropRepoZip, 'card-repo-zip'); updateBtn(); }
   });
 
   document.addEventListener('dragover', e => e.preventDefault());
