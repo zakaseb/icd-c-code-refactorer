@@ -61,6 +61,7 @@ DIRECT_COMPARE_MAX_CHARS = 0
 # Fallback chunked map-reduce for very large ICDs.
 ICD_CHUNK_CHARS = 3_000
 MAX_CODE_CONTEXT_CHARS = 8_000
+MAX_REPO_CONTEXT_CHARS = 50_000
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +321,119 @@ def _sse(payload: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Repository context helpers
+# ---------------------------------------------------------------------------
+
+_HEADER_EXTS = {'.h', '.hpp', '.hh', '.hxx'}
+_SOURCE_EXTS = {'.c', '.cpp', '.cc', '.cxx'}
+_BUILD_NAMES = {'Makefile', 'CMakeLists.txt'}
+_BUILD_EXTS = {'.mk', '.cmake', '.mak'}
+
+
+def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> dict:
+    """Extract a ZIP safely into *dest_dir*, returning file statistics."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    file_count = 0
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            target = (dest_dir / info.filename).resolve()
+            if not str(target).startswith(str(dest_dir.resolve())):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, open(target, 'wb') as dst:
+                dst.write(src.read())
+            file_count += 1
+    return {"file_count": file_count}
+
+
+def _build_repo_context(repo_dir: Path, exclude_names: set[str] | None = None) -> str:
+    """Build a structured context string from an extracted repository.
+
+    Prioritises header files (interface definitions), then source files,
+    then build-system files.  The result is bounded by MAX_REPO_CONTEXT_CHARS.
+    Files whose basenames appear in *exclude_names* are skipped to avoid
+    duplicating the uploaded source files.
+    """
+    exclude = exclude_names or set()
+    all_files = sorted(p for p in repo_dir.rglob("*") if p.is_file())
+
+    headers: list[Path] = []
+    sources: list[Path] = []
+    build_files: list[Path] = []
+    tree_lines: list[str] = []
+
+    for f in all_files:
+        rel = str(f.relative_to(repo_dir))
+        tree_lines.append(rel)
+        if f.name in exclude:
+            continue
+        suffix = f.suffix.lower()
+        if suffix in _HEADER_EXTS:
+            headers.append(f)
+        elif suffix in _SOURCE_EXTS:
+            sources.append(f)
+        elif f.name in _BUILD_NAMES or suffix in _BUILD_EXTS:
+            build_files.append(f)
+
+    sections: list[str] = []
+    budget = MAX_REPO_CONTEXT_CHARS
+
+    tree_text = (
+        "## Repository File Structure\n```\n"
+        + "\n".join(tree_lines)
+        + "\n```\n"
+    )
+    sections.append(tree_text)
+    budget -= len(tree_text)
+
+    def _append_file_section(
+        title: str, files: list[Path], lang: str, share: float,
+    ) -> None:
+        nonlocal budget
+        if not files or budget <= 0:
+            return
+        cap = min(budget, int(MAX_REPO_CONTEXT_CHARS * share))
+        parts = [f"## {title}\n"]
+        used = 0
+        for fp in files:
+            try:
+                content = fp.read_text(errors="replace")
+            except Exception:
+                continue
+            rel = str(fp.relative_to(repo_dir))
+            entry = f"\n### {rel}\n```{lang}\n{content}\n```\n"
+            if used + len(entry) > cap:
+                remaining = cap - used
+                if remaining > 300:
+                    trim = content[: remaining - 200]
+                    entry = f"\n### {rel}\n```{lang}\n{trim}\n/* ... truncated ... */\n```\n"
+                    parts.append(entry)
+                break
+            parts.append(entry)
+            used += len(entry)
+        text = "".join(parts)
+        sections.append(text)
+        budget -= len(text)
+
+    _append_file_section(
+        "Repository Headers (Interfaces & Declarations)", headers, "c", 0.50,
+    )
+    _append_file_section(
+        "Repository Source Files (Implementation Context)", sources, "c", 0.35,
+    )
+    _append_file_section(
+        "Build System Files", build_files, "", 0.15,
+    )
+
+    result = "\n".join(sections)
+    if len(result) > MAX_REPO_CONTEXT_CHARS:
+        result = result[: MAX_REPO_CONTEXT_CHARS] + "\n[... TRUNCATED repo_context ...]"
+    return result
+
+
+# ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
 
@@ -339,6 +453,7 @@ async def create_session():
         "files": [],
         "source_icd": False,
         "target_icd": False,
+        "repo_zip": False,
     }
     (session_dir / "status.json").write_text(json.dumps(status))
     return {"session_id": session_id}
@@ -423,6 +538,40 @@ async def upload_target_icd(session_id: str, file: UploadFile = File(...)):
     return {"filename": file.filename, "text_length": len(text)}
 
 
+@app.post("/api/upload/repo-zip/{session_id}")
+async def upload_repo_zip(session_id: str, file: UploadFile = File(...)):
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Repository archive must be a ZIP file")
+
+    zip_path = session_dir / "repo.zip"
+    zip_path.write_bytes(await file.read())
+
+    repo_dir = session_dir / "repo_contents"
+    if repo_dir.exists():
+        shutil.rmtree(repo_dir)
+
+    try:
+        stats = _safe_extract_zip(zip_path, repo_dir)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to extract ZIP archive: {e}"
+        )
+
+    status = json.loads((session_dir / "status.json").read_text())
+    status["repo_zip"] = True
+    status["repo_zip_name"] = file.filename
+    status["repo_zip_files"] = stats["file_count"]
+    (session_dir / "status.json").write_text(json.dumps(status))
+
+    return {
+        "filename": file.filename,
+        "file_count": stats["file_count"],
+    }
+
+
 @app.get("/api/status/{session_id}")
 async def get_status(session_id: str):
     session_dir = SESSIONS_DIR / session_id
@@ -451,8 +600,19 @@ async def process(session_id: str):
     source_icd = (session_dir / "source_icd.txt").read_text()
     target_icd = (session_dir / "target_icd.txt").read_text()
     code_files = sorted(p for p in code_dir.iterdir() if p.is_file())
-    log.info("Process %s: %d code files, source_icd=%d chars, target_icd=%d chars",
-             session_id[:8], len(code_files), len(source_icd), len(target_icd))
+
+    repo_dir = session_dir / "repo_contents"
+    has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
+    repo_context = ""
+    if has_repo:
+        uploaded_names = {p.name for p in code_files}
+        repo_context = _build_repo_context(repo_dir, exclude_names=uploaded_names)
+        log.info("Repo context built: %d chars", len(repo_context))
+
+    log.info(
+        "Process %s: %d code files, source_icd=%d chars, target_icd=%d chars, repo_ctx=%d chars",
+        session_id[:8], len(code_files), len(source_icd), len(target_icd), len(repo_context),
+    )
 
     def event_stream():
         yield _sse({
@@ -788,17 +948,36 @@ async def process(session_id: str):
                 "6. Ensure type correctness and compilability\n"
                 "7. Keep header/source consistency across the project\n"
                 "8. Do NOT add prose explanations — only output C code\n"
-                "9. Wrap the entire output in ```c ... ``` fences"
+                "9. Wrap the entire output in ```c ... ``` fences\n"
+                "10. Match naming conventions, coding style, variable naming, "
+                "and communication patterns from the repository codebase\n"
+                "11. Ensure #include directives reference correct repository headers\n"
+                "12. Maintain compatibility with all dependent modules in the repository"
             )
+
+            repo_section = ""
+            if repo_context:
+                repo_section = (
+                    f"## Repository Codebase Context\n"
+                    f"The following is the full repository that this code belongs to. "
+                    f"Use it to match naming conventions, variable names, types, "
+                    f"communication patterns, #include paths, and ensure compatibility "
+                    f"with dependent modules.\n\n{repo_context}\n\n"
+                )
 
             transform_prompt = (
                 f"## Change Specification (Source ICD -> Target ICD)\n\n"
                 f"{change_spec}\n\n"
                 f"## Target ICD Consolidated Summary\n\n{target_summary}\n\n"
+                f"{repo_section}"
                 f"## All Project Files (cross-file context)\n{all_code_ctx}\n\n"
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
                 "Transform this file so it fully conforms to the Target ICD. "
                 "Apply every relevant change from the change specification. "
+                "Ensure the generated code is FULLY COMPATIBLE with the repository "
+                "codebase — match naming conventions, use correct types from repo "
+                "headers, reference correct #include paths, and maintain compatibility "
+                "with all dependent modules. "
                 "Output the complete file — do not omit any sections. "
                 "Do not summarize. Do not truncate. Include the full ending of the file."
             )
@@ -868,6 +1047,126 @@ async def process(session_id: str):
                 "size": len(clean),
             })
 
+        # ---- Step 3: Verification --------------------------------------
+        gen_files = sorted(p for p in gen_dir.iterdir()
+                           if p.is_file() and p.suffix in ('.c', '.h'))
+        if gen_files:
+            yield _sse({
+                "type": "stage",
+                "stage": "verification",
+                "message": "Verifying generated code against ICDs, original scripts, and repository\u2026",
+            })
+
+            verify_system = (
+                "You are a code verification expert for embedded C systems governed "
+                "by Interface Control Documents. Your task is to verify that "
+                "transformed C code is correct, complete, and fully compatible with "
+                "the surrounding repository codebase.\n\n"
+                "Check the following:\n"
+                "1. ALL changes from the change specification are correctly applied\n"
+                "2. Naming conventions (variables, functions, types, macros) match "
+                "the repository codebase\n"
+                "3. Data types, structs, and enums are consistent with repository headers\n"
+                "4. #include directives reference correct repository header paths\n"
+                "5. Communication interfaces and protocol patterns match the repository\n"
+                "6. No compilation issues (mismatched braces, missing semicolons, "
+                "undeclared identifiers)\n"
+                "7. The code maintains functional correctness for the overall system\n\n"
+                "If the code is correct, output it UNCHANGED wrapped in ```c fences.\n"
+                "If there are issues, fix them and output the CORRECTED version in "
+                "```c fences.\n"
+                "Before the code block, write a brief verification report starting "
+                "with 'VERIFICATION REPORT:' listing what was checked and any "
+                "corrections made. If no corrections needed, state 'All checks passed.'"
+            )
+
+            for gf in gen_files:
+                gfname = gf.name
+                generated_code = gf.read_text()
+                orig_path = code_dir / gfname
+                original_code = orig_path.read_text() if orig_path.exists() else ""
+
+                yield _sse({
+                    "type": "info",
+                    "stage": "verification",
+                    "file": gfname,
+                    "message": f"Verifying {gfname}\u2026",
+                })
+
+                verify_repo_section = ""
+                if repo_context:
+                    verify_repo_section = (
+                        f"## Repository Codebase (for compatibility checks)\n"
+                        f"{repo_context}\n\n"
+                    )
+
+                verify_prompt = (
+                    f"## Change Specification\n{change_spec}\n\n"
+                    f"{verify_repo_section}"
+                    f"## Original Code ({gfname})\n```c\n{original_code}\n```\n\n"
+                    f"## Generated / Transformed Code ({gfname})\n```c\n{generated_code}\n```\n\n"
+                    "Verify this transformed code. Check all ICD changes are applied, "
+                    "naming conventions match the repository, types are consistent, "
+                    "includes are correct, and the code will compile and function "
+                    "correctly within the repository. Output the verification report "
+                    "then the final (corrected if needed) code."
+                )
+
+                try:
+                    verify_parts: list[str] = []
+                    for chunk in _call_llm_stream(
+                        verify_system, verify_prompt, max_tokens=4096
+                    ):
+                        verify_parts.append(chunk)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "verification",
+                            "file": gfname,
+                            "token": chunk,
+                        })
+
+                    verify_output = "".join(verify_parts)
+                    verified_code = _extract_fenced(verify_output, "c").strip()
+
+                    if verified_code and _looks_complete_c_file(
+                        verified_code, original_code, gfname
+                    ):
+                        gf.write_text(verified_code)
+                        yield _sse({
+                            "type": "info",
+                            "stage": "verification",
+                            "file": gfname,
+                            "message": f"{gfname} verification complete — updated.",
+                        })
+                    else:
+                        yield _sse({
+                            "type": "info",
+                            "stage": "verification",
+                            "file": gfname,
+                            "message": (
+                                f"{gfname} verification produced incomplete output; "
+                                "keeping original generated version."
+                            ),
+                        })
+                except Exception as e:
+                    log.warning("Verification failed for %s: %s", gfname, e)
+                    yield _sse({
+                        "type": "info",
+                        "stage": "verification",
+                        "file": gfname,
+                        "message": f"Verification error for {gfname}: {e} — keeping generated version.",
+                    })
+
+            report_path = gen_dir / "verification_report.txt"
+            report_path.write_text(
+                "Verification completed for all generated files.\n"
+                "Each file was checked against:\n"
+                "  - ICD change specification\n"
+                "  - Original source code\n"
+                "  - Repository codebase context\n"
+            )
+            yield _sse({"type": "stage_complete", "stage": "verification"})
+
         # ---- Done -----------------------------------------------------
         status["state"] = "completed"
         status["generated_files"] = sorted(
@@ -901,7 +1200,7 @@ async def download_all(session_id: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
-            if f.name == "icd_analysis.txt":
+            if f.name in ("icd_analysis.txt", "verification_report.txt"):
                 continue
             zf.write(f, f.name)
         for candidate in [gen_dir / "icd_analysis.txt",
@@ -912,6 +1211,10 @@ async def download_all(session_id: str):
                 break
         else:
             log.warning("icd_analysis.txt not found for session %s", session_id[:8])
+        vr = gen_dir / "verification_report.txt"
+        if vr.exists():
+            zf.write(vr, "verification_report.txt")
+            log.info("Added verification_report.txt")
     buf.seek(0)
 
     return StreamingResponse(
