@@ -29,29 +29,50 @@ fi
 echo "llama-server CPU threads: $LLAMA_THREADS (host logical CPUs: $HOST_CPU)"
 
 # GPU preflight: fail fast if CUDA device initialization is unavailable in containers.
-echo "Running GPU preflight (llama-server --list-devices)..."
-GPU_PREFLIGHT_OUT=$(docker run --rm --gpus all --entrypoint /app/llama-server \
-  icd-c-code-refactorer:llama.cpp --list-devices 2>&1 || true)
-if printf '%s\n' "$GPU_PREFLIGHT_OUT" | python3 -c '
-import re
-import sys
+# Retry up to 3 times with increasing delays — CUDA can fail transiently after a
+# previous container exits without cleaning up the driver state.
+GPU_OK=0
+MAX_GPU_ATTEMPTS=3
+for gpu_attempt in $(seq 1 $MAX_GPU_ATTEMPTS); do
+  echo "Running GPU preflight (attempt $gpu_attempt/$MAX_GPU_ATTEMPTS)..."
+  GPU_PREFLIGHT_OUT=$(docker run --rm --gpus all --entrypoint /app/llama-server \
+    icd-c-code-refactorer:llama.cpp --list-devices 2>&1 || true)
+  if printf '%s\n' "$GPU_PREFLIGHT_OUT" | python3 -c '
+import re, sys
 txt = sys.stdin.read()
-# Device lines can look like either:
-#   0: NVIDIA RTX ... (CUDA)
-#   CUDA0: NVIDIA RTX ...
-device_lines = re.findall(r"^\s*(?:\d+|CUDA\d+)\s*:\s+.+$", txt, flags=re.MULTILINE)
+device_lines = re.findall(r"^\s*(?:\d+|CUDA\d+|Device\s+\d+)\s*:\s+.+(?:NVIDIA|AMD|GPU).+$", txt, flags=re.MULTILINE | re.IGNORECASE)
 sys.exit(0 if device_lines else 1)
 '
-then
-  echo "GPU preflight passed."
-else
-  echo "ERROR: GPU preflight failed. llama.cpp could not initialize a usable CUDA device."
+  then
+    GPU_OK=1
+    echo "GPU preflight passed."
+    break
+  fi
+
+  if [ "$gpu_attempt" -lt "$MAX_GPU_ATTEMPTS" ]; then
+    WAIT=$((gpu_attempt * 3))
+    echo "GPU preflight attempt $gpu_attempt failed. Trying nvidia-smi reset and waiting ${WAIT}s..."
+    nvidia-smi 2>/dev/null || true
+    sleep "$WAIT"
+  fi
+done
+
+if [ "$GPU_OK" -ne 1 ]; then
+  echo "WARNING: GPU preflight failed after $MAX_GPU_ATTEMPTS attempts."
   echo "Preflight output:"
   echo "$GPU_PREFLIGHT_OUT"
   echo
-  echo "Fix host GPU container runtime first (nvidia-container-toolkit / driver / docker integration),"
-  echo "then rerun ./run_web.sh. Starting anyway would cause UI LLM 'connection refused' errors."
-  exit 1
+  echo "Possible fixes:"
+  echo "  1. Run: sudo nvidia-smi --gpu-reset"
+  echo "  2. Restart nvidia-persistenced: sudo systemctl restart nvidia-persistenced"
+  echo "  3. Check: nvidia-container-toolkit / driver / docker integration"
+  echo
+  read -r -p "Continue anyway in CPU-only mode? (y/N) " REPLY
+  if [ "$REPLY" != "y" ] && [ "$REPLY" != "Y" ]; then
+    echo "Aborting. Fix GPU access, then rerun ./run_web.sh."
+    exit 1
+  fi
+  echo "Continuing without GPU acceleration (inference will be slow)."
 fi
 
 docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
