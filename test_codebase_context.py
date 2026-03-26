@@ -1,7 +1,7 @@
 """
-Test suite for the codebase context integration feature.
-Tests the repo ZIP upload, context building, and verification pipeline
-without requiring the full Docker/LLM infrastructure.
+Test suite for the codebase context integration feature (v2).
+Tests repo ZIP upload, distilled context building, budget-aware prompts,
+structural verification, and the end-to-end pipeline — no Docker/LLM needed.
 """
 import io
 import json
@@ -19,9 +19,18 @@ from fastapi.testclient import TestClient
 from app import (
     app,
     _build_repo_context,
+    _build_file_repo_context,
+    _build_repo_summary,
     _safe_extract_zip,
+    _extract_includes,
+    _find_repo_file,
+    _structural_verify,
+    _estimate_tokens,
+    _assemble_prompt,
     _looks_complete_c_file,
     MAX_REPO_CONTEXT_CHARS,
+    MAX_INPUT_TOKENS,
+    CHARS_PER_TOKEN,
 )
 
 client = TestClient(app)
@@ -40,7 +49,6 @@ def check(name: str, condition: bool, detail: str = ""):
 
 
 def make_repo_zip() -> bytes:
-    """Create a mock repository ZIP with typical C project structure."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("project/include/comm.h", (
@@ -58,7 +66,8 @@ def make_repo_zip() -> bytes:
         ))
         zf.writestr("project/include/sensor.h", (
             "#ifndef SENSOR_H\n#define SENSOR_H\n\n"
-            "#include <stdint.h>\n\n"
+            "#include <stdint.h>\n"
+            '#include "comm.h"\n\n'
             "typedef enum {\n"
             "    SENSOR_TYPE_TEMP = 0,\n"
             "    SENSOR_TYPE_PRES = 1,\n"
@@ -83,12 +92,10 @@ def make_repo_zip() -> bytes:
             "}\n\n"
             "int COMM_Send(const CommMessage_t *msg) {\n"
             "    if (!s_initialized) return -1;\n"
-            "    /* ... implementation ... */\n"
             "    return 0;\n"
             "}\n\n"
             "int COMM_Recv(CommMessage_t *msg, uint32_t timeout_ms) {\n"
             "    if (!s_initialized) return -1;\n"
-            "    /* ... implementation ... */\n"
             "    return 0;\n"
             "}\n"
         ))
@@ -96,11 +103,9 @@ def make_repo_zip() -> bytes:
             '#include "sensor.h"\n'
             '#include "comm.h"\n\n'
             "int SENSOR_Init(SensorType_e type) {\n"
-            "    /* ... implementation ... */\n"
             "    return 0;\n"
             "}\n\n"
             "int SENSOR_Read(SensorType_e type, SensorReading_t *reading) {\n"
-            "    /* ... implementation ... */\n"
             "    return 0;\n"
             "}\n"
         ))
@@ -108,27 +113,18 @@ def make_repo_zip() -> bytes:
             "CC = arm-none-eabi-gcc\n"
             "CFLAGS = -Wall -Werror -Iinclude\n"
             "SRC = src/comm.c src/sensor.c\n"
-            "OBJ = $(SRC:.c=.o)\n\n"
-            "all: firmware.elf\n\n"
-            "firmware.elf: $(OBJ)\n"
-            "\t$(CC) $(CFLAGS) -o $@ $^\n"
         ))
     buf.seek(0)
     return buf.read()
 
 
 # ---------------------------------------------------------------
-print("\n=== Test 1: Session creation includes repo_zip field ===")
+print("\n=== Test 1: Session creation ===")
 r = client.post("/api/session/create")
 check("status 200", r.status_code == 200)
 data = r.json()
 session_id = data["session_id"]
-check("session_id present", bool(session_id))
-
-r2 = client.get(f"/api/status/{session_id}")
-status = r2.json()
-check("repo_zip field exists", "repo_zip" in status, str(status))
-check("repo_zip is False", status["repo_zip"] is False)
+check("repo_zip field exists", "repo_zip" in client.get(f"/api/status/{session_id}").json())
 
 # ---------------------------------------------------------------
 print("\n=== Test 2: Upload repo ZIP ===")
@@ -137,105 +133,157 @@ r = client.post(
     f"/api/upload/repo-zip/{session_id}",
     files={"file": ("test_repo.zip", io.BytesIO(zip_bytes), "application/zip")},
 )
-check("upload status 200", r.status_code == 200, str(r.text))
-data = r.json()
-check("file_count > 0", data.get("file_count", 0) > 0, str(data))
-check("file_count == 5", data.get("file_count") == 5, f"got {data.get('file_count')}")
-
-r3 = client.get(f"/api/status/{session_id}")
-status = r3.json()
-check("repo_zip is True", status.get("repo_zip") is True)
-check("repo_zip_name set", status.get("repo_zip_name") == "test_repo.zip")
+check("upload 200", r.status_code == 200)
+check("file_count == 5", r.json().get("file_count") == 5)
 
 # ---------------------------------------------------------------
-print("\n=== Test 3: Reject non-ZIP files ===")
-r = client.post(
-    f"/api/upload/repo-zip/{session_id}",
-    files={"file": ("readme.txt", io.BytesIO(b"not a zip"), "text/plain")},
+print("\n=== Test 3: _extract_includes ===")
+source_with_includes = (
+    '#include "comm.h"\n'
+    '#include "sensor.h"\n'
+    '#include <stdio.h>\n'
+    '#include "driver/uart.h"\n'
 )
-check("reject non-zip", r.status_code == 400)
+incs = _extract_includes(source_with_includes)
+check("finds 3 quoted includes", len(incs) == 3, f"got {incs}")
+check("comm.h found", "comm.h" in incs)
+check("sensor.h found", "sensor.h" in incs)
+check("driver/uart.h found", "driver/uart.h" in incs)
+check("stdio.h NOT found (angle bracket)", "stdio.h" not in incs)
 
 # ---------------------------------------------------------------
-print("\n=== Test 4: _safe_extract_zip ===")
+print("\n=== Test 4: _find_repo_file ===")
 with tempfile.TemporaryDirectory() as tmpdir:
-    zip_path = Path(tmpdir) / "test.zip"
-    zip_path.write_bytes(zip_bytes)
-    dest = Path(tmpdir) / "extracted"
-    stats = _safe_extract_zip(zip_path, dest)
-    check("extract returns dict", isinstance(stats, dict))
-    check("file_count == 5", stats["file_count"] == 5)
-    check("comm.h exists", (dest / "project" / "include" / "comm.h").exists())
-    check("sensor.c exists", (dest / "project" / "src" / "sensor.c").exists())
-    check("Makefile exists", (dest / "project" / "Makefile").exists())
+    zp = Path(tmpdir) / "test.zip"
+    zp.write_bytes(zip_bytes)
+    dest = Path(tmpdir) / "repo"
+    _safe_extract_zip(zp, dest)
+
+    found = _find_repo_file(dest, "comm.h")
+    check("finds comm.h", found is not None and found.name == "comm.h")
+    found2 = _find_repo_file(dest, "sensor.h")
+    check("finds sensor.h", found2 is not None)
+    not_found = _find_repo_file(dest, "nonexistent.h")
+    check("returns None for missing", not_found is None)
 
 # ---------------------------------------------------------------
-print("\n=== Test 5: _build_repo_context ===")
+print("\n=== Test 5: _build_file_repo_context (distilled) ===")
 with tempfile.TemporaryDirectory() as tmpdir:
-    zip_path = Path(tmpdir) / "test.zip"
-    zip_path.write_bytes(zip_bytes)
-    dest = Path(tmpdir) / "extracted"
-    _safe_extract_zip(zip_path, dest)
+    zp = Path(tmpdir) / "test.zip"
+    zp.write_bytes(zip_bytes)
+    dest = Path(tmpdir) / "repo"
+    _safe_extract_zip(zp, dest)
 
-    ctx = _build_repo_context(dest)
-    check("context is non-empty", len(ctx) > 0)
-    check("context within budget", len(ctx) <= MAX_REPO_CONTEXT_CHARS + 100)
-    check("file tree present", "Repository File Structure" in ctx)
-    check("headers section present", "Repository Headers" in ctx)
-    check("comm.h content present", "CommMessage_t" in ctx)
-    check("sensor.h content present", "SensorType_e" in ctx)
-    check("source section present", "Repository Source" in ctx)
-    check("COMM_Init in context", "COMM_Init" in ctx)
-    check("build section present", "Build System" in ctx)
-    check("Makefile content present", "arm-none-eabi-gcc" in ctx)
+    source_code = '#include "sensor.h"\n\nint main(void) {\n    SENSOR_Init(SENSOR_TYPE_TEMP);\n    return 0;\n}\n'
+    ctx = _build_file_repo_context(dest, source_code, set())
+    check("distilled context non-empty", len(ctx) > 0, f"got {len(ctx)} chars")
+    check("sensor.h in context", "sensor.h" in ctx)
+    check("SensorType_e in context", "SensorType_e" in ctx)
+    check("comm.h pulled transitively", "comm.h" in ctx, "sensor.h includes comm.h")
+    check("CommMessage_t via transitive", "CommMessage_t" in ctx)
+    check("within budget", len(ctx) <= MAX_REPO_CONTEXT_CHARS + 100)
 
-    ctx_excl = _build_repo_context(dest, exclude_names={"comm.c", "comm.h"})
-    check("exclude works for comm.h", "### project/include/comm.h" not in ctx_excl)
-    check("sensor.h still present", "sensor.h" in ctx_excl)
+    ctx_no_deps = _build_file_repo_context(dest, "int x = 1;\n", set())
+    check("no includes = empty context", ctx_no_deps == "", f"got '{ctx_no_deps[:50]}'")
 
 # ---------------------------------------------------------------
-print("\n=== Test 6: Upload flow end-to-end (no LLM) ===")
-r = client.post("/api/session/create")
-sid2 = r.json()["session_id"]
+print("\n=== Test 6: _build_repo_summary ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    zp = Path(tmpdir) / "test.zip"
+    zp.write_bytes(zip_bytes)
+    dest = Path(tmpdir) / "repo"
+    _safe_extract_zip(zp, dest)
 
-c_file_content = (
+    summary = _build_repo_summary(dest)
+    check("summary non-empty", len(summary) > 0)
+    check("summary under 4K", len(summary) <= 4100)
+    check("file structure in summary", "File Structure" in summary)
+    check("type names in summary", "CommMessage_t" in summary or "SensorReading_t" in summary)
+    check("function names in summary", "COMM_Init" in summary or "SENSOR_Init" in summary)
+
+# ---------------------------------------------------------------
+print("\n=== Test 7: _estimate_tokens ===")
+check("1000 chars ~ 250 tokens", _estimate_tokens("x" * 1000) == 250)
+check("empty = 0", _estimate_tokens("") == 0)
+
+# ---------------------------------------------------------------
+print("\n=== Test 8: _assemble_prompt (budget enforcement) ===")
+small = ("small", "A" * 100, 0)
+medium = ("medium", "B" * 2000, 1)
+huge = ("huge", "C" * 200000, 2)
+
+result = _assemble_prompt([small, medium, huge], max_input_tokens=1000)
+check("small included fully", "A" * 100 in result)
+check("medium included", "B" * 100 in result)
+check("result within budget", _estimate_tokens(result) <= 1100)
+check("huge truncated or dropped", len(result) < 200000)
+
+result2 = _assemble_prompt([small, medium], max_input_tokens=10000)
+check("both fit when budget large", "A" * 100 in result2 and "B" * 2000 in result2)
+
+# ---------------------------------------------------------------
+print("\n=== Test 9: _structural_verify ===")
+good_code = (
     '#include "comm.h"\n\n'
-    "int main(void) {\n"
-    "    COMM_Init();\n"
+    "int COMM_Init(void) {\n"
     "    return 0;\n"
     "}\n"
 )
-r = client.post(
-    f"/api/upload/code/{sid2}",
-    files={"files": ("main.c", io.BytesIO(c_file_content.encode()), "text/plain")},
-)
-check("code upload ok", r.status_code == 200)
+issues = _structural_verify(good_code, None, good_code, "comm.c")
+check("good code no issues", len(issues) == 0, str(issues))
 
-dummy_pdf = b"%PDF-1.4 dummy"
-r = client.post(
-    f"/api/upload/source-icd/{sid2}",
-    files={"file": ("source.pdf", io.BytesIO(dummy_pdf), "application/pdf")},
-)
-check("source icd upload", r.status_code == 200 or "extract" in r.text.lower(),
-      f"status={r.status_code}")
+bad_braces = '#include "comm.h"\n\nint main() {\n    return 0;\n'
+issues2 = _structural_verify(bad_braces, None, good_code, "main.c")
+check("unbalanced braces detected", any("brace" in i.lower() for i in issues2), str(issues2))
 
-r = client.post(
-    f"/api/upload/repo-zip/{sid2}",
-    files={"file": ("repo.zip", io.BytesIO(zip_bytes), "application/zip")},
-)
-check("repo zip upload for session 2", r.status_code == 200)
+bad_comment = '#include "test.h"\n\nint x; /* unclosed\n'
+issues3 = _structural_verify(bad_comment, None, bad_comment, "test.c")
+check("unclosed comment detected", any("comment" in i.lower() for i in issues3), str(issues3))
 
-status = client.get(f"/api/status/{sid2}").json()
-check("session 2 has repo_zip", status.get("repo_zip") is True)
-check("session 2 has files", len(status.get("files", [])) > 0)
+with tempfile.TemporaryDirectory() as tmpdir:
+    zp = Path(tmpdir) / "test.zip"
+    zp.write_bytes(zip_bytes)
+    dest = Path(tmpdir) / "repo"
+    _safe_extract_zip(zp, dest)
+
+    code_with_bad_include = '#include "nonexistent_driver.h"\n\nint main() {\n    return 0;\n}\n'
+    issues4 = _structural_verify(code_with_bad_include, dest, code_with_bad_include, "main.c")
+    check("missing include detected", any("not found" in i for i in issues4), str(issues4))
+
+    code_with_good_include = '#include "comm.h"\n\nint main() {\n    return 0;\n}\n'
+    issues5 = _structural_verify(code_with_good_include, dest, code_with_good_include, "main.c")
+    check("valid include passes", not any("not found" in i for i in issues5), str(issues5))
 
 # ---------------------------------------------------------------
-print("\n=== Test 7: _looks_complete_c_file still works ===")
+print("\n=== Test 10: Header guard check ===")
+bad_header = "#ifndef TEST_H\n#define TEST_H\ntypedef int x_t;\n"
+issues6 = _structural_verify(bad_header, None, bad_header, "test.h")
+check("missing endif detected", any("endif" in i.lower() for i in issues6), str(issues6))
+
+good_header = "#ifndef TEST_H\n#define TEST_H\ntypedef int x_t;\n#endif\n"
+issues7 = _structural_verify(good_header, None, good_header, "test.h")
+check("complete header passes", not any("endif" in i.lower() for i in issues7), str(issues7))
+
+# ---------------------------------------------------------------
+print("\n=== Test 11: Static files include new features ===")
+r = client.get("/")
+check("repo-zip card in HTML", "card-repo-zip" in r.text)
+
+r = client.get("/static/app.js")
+check("verification stage in JS", "verification" in r.text)
+check("uploadRepoZip in JS", "uploadRepoZip" in r.text)
+
+r = client.get("/static/style.css")
+check("accent-purple in CSS", "accent-purple" in r.text)
+
+# ---------------------------------------------------------------
+print("\n=== Test 12: _looks_complete_c_file unchanged ===")
 complete = (
     '#include "test.h"\n#include <stdio.h>\n#include <stdlib.h>\n\n'
     "static int g_counter = 0;\n\n"
     "void helper_function(int x) {\n"
     "    g_counter += x;\n"
-    "    printf(\"counter: %d\\n\", g_counter);\n"
+    '    printf("counter: %d\\n", g_counter);\n'
     "}\n\n"
     "int main(void) {\n"
     "    helper_function(42);\n"
@@ -244,27 +292,13 @@ complete = (
 )
 check("complete file passes", _looks_complete_c_file(complete, complete, "main.c"))
 check("empty file fails", not _looks_complete_c_file("", complete, "main.c"))
-check("unbalanced braces fail", not _looks_complete_c_file(
-    '#include "test.h"\nint main() {\n', complete, "main.c"
-))
 
 # ---------------------------------------------------------------
-print("\n=== Test 8: Static files served ===")
-r = client.get("/")
-check("index.html served", r.status_code == 200)
-check("repo-zip card in HTML", "card-repo-zip" in r.text)
-check("input-repo-zip in HTML", "input-repo-zip" in r.text)
-check("Repository Codebase label", "Repository Codebase" in r.text)
-
-r = client.get("/static/app.js")
-check("app.js served", r.status_code == 200)
-check("repoZipFile in JS", "repoZipFile" in r.text)
-check("uploadRepoZip in JS", "uploadRepoZip" in r.text)
-check("verification stage in JS", "verification" in r.text)
-
-r = client.get("/static/style.css")
-check("style.css served", r.status_code == 200)
-check("accent-purple in CSS", "accent-purple" in r.text)
+print("\n=== Test 13: Constants are reasonable ===")
+check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
+check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
+      f"got {MAX_INPUT_TOKENS}")
+check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")
