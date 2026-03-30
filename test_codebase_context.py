@@ -27,6 +27,7 @@ from app import (
     _structural_verify,
     _estimate_tokens,
     _assemble_prompt,
+    _extract_fenced,
     _looks_complete_c_file,
     MAX_REPO_CONTEXT_CHARS,
     MAX_INPUT_TOKENS,
@@ -294,7 +295,22 @@ check("complete file passes", _looks_complete_c_file(complete, complete, "main.c
 check("empty file fails", not _looks_complete_c_file("", complete, "main.c"))
 
 # ---------------------------------------------------------------
-print("\n=== Test 13: Constants are reasonable ===")
+print("\n=== Test 13: _extract_fenced handles prefixed report text ===")
+verify_output = (
+    "FIXES: corrected include path and enum type\n\n"
+    "```c\n"
+    '#include "imu.h"\n'
+    "int IMU_Init(void) {\n"
+    "    return 0;\n"
+    "}\n"
+    "```\n"
+)
+fenced = _extract_fenced(verify_output, "c")
+check("extracts code block when report prefix exists", "int IMU_Init(void)" in fenced, fenced)
+check("strips FIXES preamble", "FIXES:" not in fenced, fenced)
+
+# ---------------------------------------------------------------
+print("\n=== Test 14: Constants are reasonable ===")
 check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
