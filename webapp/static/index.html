@@ -103,6 +103,34 @@
           <div class="file-list" id="target-icd-file-list"></div>
         </div>
 
+        <!-- Card 4: Repository Codebase ZIP -->
+        <div class="upload-card" id="card-repo-zip">
+          <div class="card-header">
+            <div class="card-icon accent-purple">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                <line x1="12" y1="11" x2="12" y2="17"/>
+                <line x1="9" y1="14" x2="15" y2="14"/>
+              </svg>
+            </div>
+            <h3>Repository Codebase</h3>
+            <p class="card-desc">ZIP of the full repository for context &amp; compatibility (optional)</p>
+          </div>
+          <label class="drop-zone" id="drop-repo-zip" for="input-repo-zip">
+            <input type="file" id="input-repo-zip" accept=".zip">
+            <div class="drop-content">
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.45">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p>Drag &amp; drop repository .zip file</p>
+              <span class="drop-hint">or click to browse</span>
+            </div>
+          </label>
+          <div class="file-list" id="repo-zip-file-list"></div>
+        </div>
+
       </div>
     </section>
 

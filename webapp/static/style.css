@@ -73,10 +73,10 @@ main {
 
 .upload-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 1.25rem;
 }
-@media (max-width: 900px) {
+@media (max-width: 700px) {
   .upload-grid { grid-template-columns: 1fr; }
 }
 
@@ -107,6 +107,7 @@ main {
 }
 .card-icon.accent-orange { background: rgba(210,153,34,.1); color: var(--accent-orange); }
 .card-icon.accent-green  { background: rgba(63,185,80,.1);  color: var(--accent-green); }
+.card-icon.accent-purple { background: rgba(163,113,247,.1); color: #a371f7; }
 
 .card-header h3 {
   font-size: 1.05rem;
