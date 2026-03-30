@@ -302,23 +302,25 @@ def _wait_for_llm_ready(timeout_s: int = 300) -> None:
 
 
 def _extract_fenced(text: str, lang_hint: str = "") -> str:
-    """Strip markdown fences if the LLM wraps output in ```."""
+    """Extract first markdown fenced block anywhere in text.
+
+    Falls back to raw text when no code fence is present.
+    """
     text = text.strip()
-    if not text.startswith("```"):
+    if not text:
         return text
-    lines = text.split("\n")
-    out: list[str] = []
-    in_block = False
-    for line in lines:
-        stripped = line.strip()
-        if not in_block and stripped.startswith("```"):
-            in_block = True
-            continue
-        if in_block and stripped == "```":
-            break
-        if in_block:
-            out.append(line)
-    return "\n".join(out) if out else text
+    lang_re = rf"(?:{re.escape(lang_hint)})" if lang_hint else r"[A-Za-z0-9_+-]*"
+    pattern = re.compile(
+        rf"```[ \t]*{lang_re}[ \t]*\n(.*?)\n```",
+        flags=re.DOTALL,
+    )
+    m = pattern.search(text)
+    if m:
+        return m.group(1).strip()
+    fallback = re.search(r"```[^\n]*\n(.*?)\n```", text, flags=re.DOTALL)
+    if fallback:
+        return fallback.group(1).strip()
+    return text
 
 
 def _sse(payload: dict) -> str:
@@ -1170,8 +1172,8 @@ async def process(session_id: str):
             transform_prompt = _assemble_prompt(
                 [
                     ("file_to_transform", sec_file, 0),
+                    ("repo_dependencies", sec_repo, 1),
                     ("change_spec", sec_change, 1),
-                    ("repo_dependencies", sec_repo, 2),
                     ("target_summary", sec_target, 3),
                     ("cross_file_ctx", sec_code, 4),
                 ],
@@ -1332,7 +1334,8 @@ async def process(session_id: str):
                         "Output ONLY the corrected complete C file in ```c fences. "
                         "Before the code, write a one-line summary starting with "
                         "'FIXES:' listing corrections made, or 'NO FIXES NEEDED' "
-                        "if the code is correct."
+                        "if the code is correct. "
+                        "The output MUST include a complete fenced C file."
                     )
 
                     sec_issues = f"## Issues to Fix{issue_guidance}" if issue_guidance else ""
@@ -1358,24 +1361,32 @@ async def process(session_id: str):
                     )
 
                     try:
-                        verify_parts: list[str] = []
-                        for chunk in _call_llm_stream(
-                            verify_system, verify_prompt, max_tokens=MAX_OUTPUT_TOKENS
-                        ):
-                            verify_parts.append(chunk)
+                        verify_pieces = []
+                        verify_output = _call_llm_complete(
+                            verify_system,
+                            verify_prompt,
+                            max_tokens=MAX_OUTPUT_TOKENS,
+                            max_passes=4,
+                            on_chunk=lambda c: verify_pieces.append(c),
+                        )
+                        for piece in verify_pieces:
                             yield _sse({
                                 "type": "token",
                                 "stage": "verification",
                                 "file": gfname,
-                                "token": chunk,
+                                "token": piece,
                             })
-
-                        verify_output = "".join(verify_parts)
                         verified_code = _extract_fenced(verify_output, "c").strip()
+                        verify_issues = (
+                            _structural_verify(
+                                verified_code, repo_dir if has_repo else None,
+                                original_code, gfname,
+                            ) if verified_code else ["empty verification output"]
+                        )
 
                         if verified_code and _looks_complete_c_file(
                             verified_code, original_code, gfname
-                        ):
+                        ) and not verify_issues:
                             gf.write_text(verified_code)
                             verification_reports.append(
                                 f"{gfname}: LLM verification applied corrections"
@@ -1387,18 +1398,55 @@ async def process(session_id: str):
                                 "message": f"{gfname} verification complete — updated.",
                             })
                         else:
-                            verification_reports.append(
-                                f"{gfname}: LLM output incomplete, kept generated version"
+                            # Final targeted correction pass: constrain to known issues only.
+                            fix_prompt = (
+                                f"## Structural issues to fix\n"
+                                + "\n".join(f"- {i}" for i in verify_issues[:12])
+                                + "\n\n"
+                                + f"## Repository dependency headers\n{verify_repo}\n\n"
+                                + f"## Current code ({gfname})\n```c\n{generated_code}\n```\n\n"
+                                + "Rewrite this file to fix the listed issues while preserving ICD-required behavior. "
+                                  "Output only one complete ```c fenced file."
                             )
-                            yield _sse({
-                                "type": "info",
-                                "stage": "verification",
-                                "file": gfname,
-                                "message": (
-                                    f"{gfname} verification produced incomplete output; "
-                                    "keeping generated version."
-                                ),
-                            })
+                            fix_output = _call_llm_complete(
+                                verify_system,
+                                fix_prompt,
+                                max_tokens=MAX_OUTPUT_TOKENS,
+                                max_passes=3,
+                            )
+                            fixed_code = _extract_fenced(fix_output, "c").strip()
+                            fixed_issues = (
+                                _structural_verify(
+                                    fixed_code, repo_dir if has_repo else None,
+                                    original_code, gfname,
+                                ) if fixed_code else ["empty targeted-fix output"]
+                            )
+                            if fixed_code and _looks_complete_c_file(
+                                fixed_code, original_code, gfname
+                            ) and not fixed_issues:
+                                gf.write_text(fixed_code)
+                                verification_reports.append(
+                                    f"{gfname}: LLM verification applied targeted fix pass"
+                                )
+                                yield _sse({
+                                    "type": "info",
+                                    "stage": "verification",
+                                    "file": gfname,
+                                    "message": f"{gfname} verification complete — targeted fixes applied.",
+                                })
+                            else:
+                                verification_reports.append(
+                                    f"{gfname}: verification could not produce a complete compilable correction"
+                                )
+                                yield _sse({
+                                    "type": "info",
+                                    "stage": "verification",
+                                    "file": gfname,
+                                    "message": (
+                                        f"{gfname} verification still incomplete after targeted retry; "
+                                        "keeping generated version."
+                                    ),
+                                })
                     except Exception as e:
                         log.warning("Verification failed for %s: %s", gfname, e)
                         verification_reports.append(f"{gfname}: error — {e}")
