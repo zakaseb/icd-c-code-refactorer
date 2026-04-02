@@ -350,7 +350,10 @@ def _build_conversation_context(messages: list[dict]) -> str:
         "The following messages were provided by the user after reviewing the "
         "previously generated code. These typically contain build errors, compiler "
         "warnings, test failures, or other issues found when integrating the "
-        "generated code into the repository. Fix ALL issues described below.\n",
+        "generated code into the repository. Fix ALL issues described below "
+        "while maintaining full compliance with the ICD change specification "
+        "and repository conventions. Do not introduce regressions in areas "
+        "that were previously correct.\n",
     ]
     for msg in messages:
         role = msg.get("role", "user")
@@ -517,6 +520,212 @@ def _build_repo_summary(repo_dir: Path) -> str:
 
     result = "".join(parts)
     return _truncate_text(result, 4000, "repo_summary")
+
+
+def _build_repo_knowledge(repo_dir: Path, max_chars: int = 10_000) -> str:
+    """Extract comprehensive high-level and low-level knowledge from the repo.
+
+    High-level: file structure, module organisation, naming conventions.
+    Low-level: struct/union definitions with fields, enum definitions with
+    values, full function signatures, global variable declarations, and
+    macro definitions with their values.
+    """
+    all_files = sorted(p for p in repo_dir.rglob("*") if p.is_file())
+    code_exts = _HEADER_EXTS | _SOURCE_EXTS
+    tree_lines = [str(f.relative_to(repo_dir)) for f in all_files]
+
+    struct_re = re.compile(
+        r'typedef\s+(?:struct|union)\s*\w*\s*\{([^}]*)\}\s*(\w+)\s*;', re.DOTALL)
+    enum_re = re.compile(
+        r'typedef\s+enum\s*\w*\s*\{([^}]*)\}\s*(\w+)\s*;', re.DOTALL)
+    func_sig_re = re.compile(
+        r'^(?:(?:static|extern|inline|const|unsigned|void)\s+)*'
+        r'[A-Za-z_]\w*(?:\s*\*)*\s+([A-Za-z_]\w*)\s*\(([^)]*)\)',
+        re.MULTILINE)
+    global_var_re = re.compile(
+        r'^(?:(?:static|extern|volatile|const)\s+)+'
+        r'([A-Za-z_]\w*(?:\s*\*)*)\s+([A-Za-z_]\w*)'
+        r'(?:\s*\[[^\]]*\])*'
+        r'(?:\s*=\s*[^;]+)?;',
+        re.MULTILINE)
+    define_re = re.compile(
+        r'^\s*#\s*define\s+([A-Z_][A-Z0-9_]+)[ \t]+(.+?)$', re.MULTILINE)
+
+    structs: list[str] = []
+    enums: list[str] = []
+    func_sigs: list[str] = []
+    global_vars: list[str] = []
+    macros: list[str] = []
+
+    for f in all_files:
+        if f.suffix.lower() not in code_exts:
+            continue
+        try:
+            content = f.read_text(errors="replace")
+        except Exception:
+            continue
+        for m in struct_re.finditer(content):
+            fields = " ".join(m.group(1).split())
+            structs.append(f"  {m.group(2)}: {{ {fields} }}")
+        for m in enum_re.finditer(content):
+            vals = " ".join(m.group(1).split())
+            enums.append(f"  {m.group(2)}: {{ {vals} }}")
+        for m in func_sig_re.finditer(content):
+            params = " ".join(m.group(2).split())
+            func_sigs.append(f"  {m.group(1)}({params})")
+        for m in global_var_re.finditer(content):
+            global_vars.append(f"  {m.group(1)} {m.group(2)}")
+        for m in define_re.finditer(content):
+            macros.append(f"  {m.group(1)} = {m.group(2).strip()}")
+
+    structs = structs[:30]
+    enums = enums[:20]
+    func_sigs = sorted(set(func_sigs))[:40]
+    global_vars = sorted(set(global_vars))[:30]
+    macros = macros[:40]
+
+    parts = [
+        "=" * 65 + "\n",
+        "REPOSITORY CODEBASE KNOWLEDGE\n",
+        "=" * 65 + "\n\n",
+        "## High-Level: File Structure & Organisation\n```\n",
+        "\n".join(tree_lines[:100]),
+        "\n```\n",
+    ]
+    if structs:
+        parts.append("\n## Low-Level: Struct / Union Definitions\n")
+        parts.append("\n".join(structs) + "\n")
+    if enums:
+        parts.append("\n## Low-Level: Enum Definitions\n")
+        parts.append("\n".join(enums) + "\n")
+    if func_sigs:
+        parts.append("\n## Low-Level: Function Signatures\n")
+        parts.append("\n".join(func_sigs) + "\n")
+    if global_vars:
+        parts.append("\n## Low-Level: Global Variable Declarations\n")
+        parts.append("\n".join(global_vars) + "\n")
+    if macros:
+        parts.append("\n## Low-Level: Macro Definitions\n")
+        parts.append("\n".join(macros) + "\n")
+
+    result = "".join(parts)
+    return _truncate_text(result, max_chars, "repo_knowledge")
+
+
+def _extract_c_variables(code: str, filename: str) -> list[dict]:
+    """Extract variable declarations from C source code.
+
+    Returns a list of dicts with keys: name, type, scope, extra.
+    """
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    global_re = re.compile(
+        r'^(?:(?:static|extern|volatile|const|unsigned|signed|short|long|register)\s+)*'
+        r'([A-Za-z_]\w*(?:\s*\*)*)\s*'
+        r'\*?([A-Za-z_]\w*)'
+        r'(\s*\[[^\]]*\])?'
+        r'(?:\s*=\s*([^;]+))?;',
+        re.MULTILINE)
+
+    func_re = re.compile(
+        r'^(?:(?:static|extern|inline|const|unsigned|void)\s+)*'
+        r'[A-Za-z_]\w*(?:\s*\*)*\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{',
+        re.MULTILINE)
+
+    define_re = re.compile(
+        r'^\s*#\s*define\s+([A-Za-z_]\w+)(?:[ \t]+(.+?))?$', re.MULTILINE)
+
+    brace_depth = 0
+    in_function = False
+    current_func = ""
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("/*"):
+            pass
+        fm = func_re.match(line)
+        if fm and brace_depth == 0:
+            in_function = True
+            current_func = fm.group(1)
+            params = fm.group(2).strip()
+            if params and params != "void":
+                for param in params.split(","):
+                    parts = param.strip().rsplit(None, 1)
+                    if len(parts) == 2:
+                        ptype, pname = parts
+                        pname = pname.lstrip("*")
+                        key = f"param:{current_func}:{pname}"
+                        if key not in seen:
+                            seen.add(key)
+                            results.append({
+                                "name": pname,
+                                "type": ptype.strip(),
+                                "scope": f"parameter of {current_func}()",
+                                "extra": "",
+                            })
+        brace_depth += stripped.count("{") - stripped.count("}")
+
+        if brace_depth <= 0:
+            in_function = False
+            current_func = ""
+            brace_depth = max(brace_depth, 0)
+
+    for m in global_re.finditer(code):
+        vtype = m.group(1).strip()
+        vname = m.group(2)
+        arr = (m.group(3) or "").strip()
+        init = (m.group(4) or "").strip()
+        pos = m.start()
+        depth = code[:pos].count("{") - code[:pos].count("}")
+        scope = "global" if depth == 0 else "local"
+        key = f"{scope}:{vname}"
+        if vname in ("if", "while", "for", "switch", "return", "sizeof",
+                      "else", "case", "break", "continue", "goto"):
+            continue
+        if key not in seen:
+            seen.add(key)
+            extra = ""
+            if arr:
+                extra = f"array{arr}"
+            if init:
+                extra += (", " if extra else "") + f"init={init[:60]}"
+            results.append({
+                "name": vname,
+                "type": vtype,
+                "scope": scope,
+                "extra": extra,
+            })
+
+    for m in define_re.finditer(code):
+        mname = m.group(1)
+        mval = (m.group(2) or "").strip()
+        key = f"macro:{mname}"
+        if key not in seen:
+            seen.add(key)
+            results.append({
+                "name": mname,
+                "type": "#define",
+                "scope": "macro",
+                "extra": mval[:80] if mval else "(flag)",
+            })
+
+    return results
+
+
+def _format_variable_inventory(variables: list[dict], filename: str) -> str:
+    """Format extracted variables into a report section."""
+    if not variables:
+        return f"  (no variables extracted from {filename})\n"
+    lines = []
+    by_scope: dict[str, list[dict]] = {}
+    for v in variables:
+        by_scope.setdefault(v["scope"], []).append(v)
+    for scope in sorted(by_scope):
+        lines.append(f"  [{scope}]")
+        for v in by_scope[scope]:
+            extra = f"  ({v['extra']})" if v["extra"] else ""
+            lines.append(f"    {v['type']:30s} {v['name']}{extra}")
+    return "\n".join(lines) + "\n"
 
 
 def _build_repo_context(repo_dir: Path, exclude_names: set[str] | None = None) -> str:
@@ -804,9 +1013,13 @@ async def process(session_id: str):
     repo_dir = session_dir / "repo_contents"
     has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
     repo_summary = ""
+    repo_knowledge = ""
     if has_repo:
         repo_summary = _build_repo_summary(repo_dir)
-        log.info("Repo summary for ICD analysis: %d chars", len(repo_summary))
+        repo_knowledge = _build_repo_knowledge(repo_dir)
+        (session_dir / "repo_knowledge.txt").write_text(repo_knowledge)
+        log.info("Repo summary for ICD analysis: %d chars, repo knowledge: %d chars",
+                 len(repo_summary), len(repo_knowledge))
 
     uploaded_names = {p.name for p in code_files}
     log.info(
@@ -1119,9 +1332,14 @@ async def process(session_id: str):
             return
 
         (session_dir / "change_spec.txt").write_text(change_spec)
-        (session_dir / "icd_analysis.txt").write_text(change_spec)
-        (gen_dir / "icd_analysis.txt").write_text(change_spec)
         (session_dir / "target_summary.txt").write_text(target_summary)
+
+        analysis_report_parts = [change_spec]
+        if repo_knowledge:
+            analysis_report_parts.append("\n\n" + repo_knowledge)
+        full_analysis = "\n".join(analysis_report_parts)
+        (session_dir / "icd_analysis.txt").write_text(full_analysis)
+        (gen_dir / "icd_analysis.txt").write_text(full_analysis)
         yield _sse({"type": "stage_complete", "stage": "analysis"})
 
         # Gather cross-file context (the uploaded source files)
@@ -1193,6 +1411,14 @@ async def process(session_id: str):
                     f"Use the exact type names, function signatures, macros, and "
                     f"naming conventions from these files.\n\n{file_repo_ctx}"
                 )
+            sec_knowledge = ""
+            if repo_knowledge:
+                sec_knowledge = (
+                    f"## Repository Codebase Knowledge\n"
+                    f"Detailed inventory of types, functions, variables, and macros "
+                    f"from the repository. Use these as ground truth for naming, "
+                    f"types, and conventions.\n\n{repo_knowledge}"
+                )
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             sec_file = (
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
@@ -1206,14 +1432,16 @@ async def process(session_id: str):
             )
 
             system_tokens = _estimate_tokens(transform_system)
+            prompt_sections = [
+                ("file_to_transform", sec_file, 0),
+                ("repo_dependencies", sec_repo, 1),
+                ("change_spec", sec_change, 1),
+                ("repo_knowledge", sec_knowledge, 2),
+                ("target_summary", sec_target, 3),
+                ("cross_file_ctx", sec_code, 4),
+            ]
             transform_prompt = _assemble_prompt(
-                [
-                    ("file_to_transform", sec_file, 0),
-                    ("repo_dependencies", sec_repo, 1),
-                    ("change_spec", sec_change, 1),
-                    ("target_summary", sec_target, 3),
-                    ("cross_file_ctx", sec_code, 4),
-                ],
+                prompt_sections,
                 max_input_tokens=MAX_INPUT_TOKENS - system_tokens,
             )
             log.info("Transform prompt for %s: %d chars (%d est. tokens)",
@@ -1527,6 +1755,7 @@ async def process(session_id: str):
                 "3. Function/symbol presence compared to original source files",
                 "4. ICD change specification compliance (LLM-verified)",
                 "5. Repository naming and type compatibility (LLM-verified)",
+                "6. Variable inventory of generated code files",
                 "",
                 "-" * 65,
                 "RESULTS",
@@ -1554,6 +1783,20 @@ async def process(session_id: str):
                     report_lines.append(diff_text)
                 else:
                     report_lines.append("\nNo changes applied during verification.")
+
+            report_lines.extend([
+                "",
+                "-" * 65,
+                "VARIABLE INVENTORY",
+                "-" * 65,
+            ])
+            for gf_r in gen_files:
+                gfn = gf_r.name
+                final_code = gf_r.read_text()
+                variables = _extract_c_variables(final_code, gfn)
+                report_lines.append(f"\n### {gfn}\n")
+                report_lines.append(_format_variable_inventory(variables, gfn))
+
             report_path.write_text("\n".join(report_lines) + "\n")
             yield _sse({"type": "stage_complete", "stage": "verification"})
 
@@ -1714,6 +1957,12 @@ async def regenerate(session_id: str):
         )
     )
 
+    repo_knowledge_path = session_dir / "repo_knowledge.txt"
+    repo_knowledge = repo_knowledge_path.read_text() if repo_knowledge_path.exists() else ""
+    if not repo_knowledge and has_repo:
+        repo_knowledge = _build_repo_knowledge(repo_dir)
+        repo_knowledge_path.write_text(repo_knowledge)
+
     prev_dir = session_dir / f"generated_code_v{regen_count - 1}"
     if not prev_dir.exists():
         shutil.copytree(gen_dir, prev_dir)
@@ -1778,6 +2027,13 @@ async def regenerate(session_id: str):
                 "The user has previously generated code that had issues (build errors, "
                 "warnings, or other problems). You must re-generate the code fixing ALL "
                 "reported issues while maintaining full ICD compliance.\n\n"
+                "CRITICAL: You must consider ALL provided context HOLISTICALLY — the "
+                "ICD change specification, repository codebase knowledge, dependency "
+                "headers, AND user feedback — to produce correct code. Do NOT focus "
+                "solely on user-reported errors at the expense of ICD compliance or "
+                "repository compatibility. Fixing one error must not introduce "
+                "regressions elsewhere. Use the repository's actual type names, "
+                "function signatures, macros, and variable conventions as ground truth.\n\n"
                 "RULES:\n"
                 "1. Output ONLY the complete, transformed C source code\n"
                 "2. Fix ALL issues described in the user feedback/error logs\n"
@@ -1785,11 +2041,13 @@ async def regenerate(session_id: str):
                 "4. Preserve the overall code architecture, style, and conventions\n"
                 "5. Ensure type correctness and compilability\n"
                 "6. Keep header/source consistency across the project\n"
-                "7. Do NOT add prose explanations \u2014 only output C code\n"
+                "7. Do NOT add prose explanations — only output C code\n"
                 "8. Wrap the entire output in ```c ... ``` fences\n"
                 "9. Match naming conventions from the repository codebase\n"
                 "10. Ensure #include directives reference correct repository headers\n"
-                "11. Maintain compatibility with all dependent modules in the repository"
+                "11. Maintain compatibility with all dependent modules in the repository\n"
+                "12. Cross-check every fix against the change spec and repo headers "
+                "to prevent error loops"
             )
 
             file_repo_ctx = ""
@@ -1819,11 +2077,21 @@ async def regenerate(session_id: str):
                     f"Use exact type names, function signatures, macros, and naming "
                     f"conventions from these files.\n\n{file_repo_ctx}"
                 )
+            sec_knowledge = ""
+            if repo_knowledge:
+                sec_knowledge = (
+                    f"## Repository Codebase Knowledge\n"
+                    f"Detailed inventory of types, functions, variables, and macros "
+                    f"from the repository. Use these as ground truth for naming, "
+                    f"types, and conventions.\n\n{repo_knowledge}"
+                )
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             sec_file = (
                 f"## Original File: {fname}\n\n```c\n{original}\n```\n\n"
                 "Re-generate this file to conform to the Target ICD while fixing "
-                "ALL issues from the user feedback. Output the complete file in "
+                "ALL issues from the user feedback. Use the change specification "
+                "and repository knowledge as ground truth — do not introduce "
+                "regressions. Output the complete file in "
                 "```c fences. Do not omit any sections."
             )
 
@@ -1832,9 +2100,10 @@ async def regenerate(session_id: str):
                 [
                     ("file_to_transform", sec_file, 0),
                     ("user_feedback", sec_conv, 0),
+                    ("change_spec", sec_change, 1),
                     ("previous_generated", sec_prev, 1),
                     ("repo_dependencies", sec_repo, 2),
-                    ("change_spec", sec_change, 2),
+                    ("repo_knowledge", sec_knowledge, 2),
                     ("target_summary", sec_target_v, 3),
                     ("cross_file_ctx", sec_code, 4),
                 ],
@@ -2132,6 +2401,7 @@ async def regenerate(session_id: str):
                 "3. Function/symbol presence compared to original source files",
                 "4. ICD change specification compliance (LLM-verified)",
                 "5. Repository naming and type compatibility (LLM-verified)",
+                "6. Variable inventory of generated code files",
                 "",
             ]
 
@@ -2184,6 +2454,19 @@ async def regenerate(session_id: str):
                     report_lines.append(diff_text)
                 else:
                     report_lines.append("\nNo changes applied during verification.")
+
+            report_lines.extend([
+                "",
+                "-" * 65,
+                "VARIABLE INVENTORY",
+                "-" * 65,
+            ])
+            for gf_r in gen_files:
+                gfn = gf_r.name
+                final_code = gf_r.read_text()
+                variables = _extract_c_variables(final_code, gfn)
+                report_lines.append(f"\n### {gfn}\n")
+                report_lines.append(_format_variable_inventory(variables, gfn))
 
             (gen_dir / "verification_report.txt").write_text(
                 "\n".join(report_lines) + "\n"
