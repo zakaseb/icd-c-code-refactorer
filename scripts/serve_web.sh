@@ -1,14 +1,15 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [ ! -d "$SCRIPT_DIR/models" ]; then
-  echo "ERROR: models/ directory not found at $SCRIPT_DIR/models"
+if [ ! -d "$PROJECT_ROOT/models" ]; then
+  echo "ERROR: models/ directory not found at $PROJECT_ROOT/models"
   echo "Create a symlink to your model cache, e.g.:"
-  echo "  ln -s /path/to/qwen-claude-code-sw2/models $SCRIPT_DIR/models"
+  echo "  ln -s /path/to/your/models $PROJECT_ROOT/models"
   exit 1
 fi
 
-mkdir -p "$SCRIPT_DIR/workspace"
+mkdir -p "$PROJECT_ROOT/workspace"
 
 WEB_PORT=8081
 if ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT" || netstat -tlnp 2>/dev/null | grep -q ":$WEB_PORT"; then
@@ -108,6 +109,6 @@ docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
   -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
   -e LLAMA_ARG_CTX_SIZE=32768 \
   -e LLAMA_ARG_N_PREDICT=32768 \
-  -v "$SCRIPT_DIR/models":/home/developer/models \
-  -v "$SCRIPT_DIR/workspace":/home/developer/workspace \
+  -v "$PROJECT_ROOT/models":/home/developer/models \
+  -v "$PROJECT_ROOT/workspace":/home/developer/workspace \
   icd-c-code-refactorer:llama.cpp
