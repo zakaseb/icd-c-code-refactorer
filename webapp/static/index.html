@@ -173,6 +173,35 @@
       <div class="file-tabs" id="result-tabs"></div>
       <pre class="code-preview" id="code-preview"></pre>
     </section>
+
+    <!-- ============================================================ -->
+    <!-- CONVERSATION / FEEDBACK                                       -->
+    <!-- ============================================================ -->
+    <section class="conversation-section hidden" id="conversation-section">
+      <h2>Provide Feedback</h2>
+      <p class="section-desc">Share build errors, compiler warnings, or other feedback to refine the generated code.</p>
+      <div class="conversation-messages" id="conversation-messages"></div>
+      <div class="conversation-input-area">
+        <textarea id="conversation-input" rows="6"
+                  placeholder="Paste build error logs, compiler warnings, or describe issues with the generated code here..."></textarea>
+        <div class="conversation-actions">
+          <button type="button" id="send-msg-btn" class="btn-primary btn-send">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+            Send Feedback
+          </button>
+          <button type="button" id="regenerate-btn" class="btn-primary btn-regenerate" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+            Re-generate Code
+          </button>
+        </div>
+      </div>
+    </section>
   </main>
 
   <footer>

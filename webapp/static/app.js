@@ -28,6 +28,11 @@
   const resultTabs     = document.getElementById('result-tabs');
   const codePreview    = document.getElementById('code-preview');
   const downloadBtn    = document.getElementById('download-btn');
+  const convSection    = document.getElementById('conversation-section');
+  const convMessages   = document.getElementById('conversation-messages');
+  const convInput      = document.getElementById('conversation-input');
+  const sendMsgBtn     = document.getElementById('send-msg-btn');
+  const regenerateBtn  = document.getElementById('regenerate-btn');
 
   /* ----- Helpers ------------------------------------------------- */
 
@@ -350,6 +355,7 @@
   function showResults(files) {
     if (!files.length) return;
     resultsSection.classList.remove('hidden');
+    convSection.classList.remove('hidden');
     resultTabs.innerHTML = '';
     files.forEach((f, i) => {
       const tab = document.createElement('button');
@@ -388,12 +394,208 @@
     updateBtn();
     procSection.classList.add('hidden');
     resultsSection.classList.add('hidden');
+    convSection.classList.add('hidden');
+    convMessages.innerHTML = '';
+    convInput.value = '';
+    regenerateBtn.disabled = true;
     pipelineSteps.innerHTML = '';
     resetBtn.style.display = 'none';
     inputCode.value = '';
     inputSourceIcd.value = '';
     inputTargetIcd.value = '';
     inputRepoZip.value = '';
+  }
+
+  /* ----- Conversation -------------------------------------------- */
+
+  function escapeHtml(text) {
+    var d = document.createElement('div');
+    d.textContent = text;
+    return d.innerHTML;
+  }
+
+  function renderConversation(messages) {
+    convMessages.innerHTML = '';
+    messages.forEach(function (msg) {
+      var div = document.createElement('div');
+      div.className = 'conversation-msg msg-' + msg.role;
+      var roleLabel = msg.role === 'user' ? 'You' : 'System';
+      var timeStr = '';
+      if (msg.timestamp) {
+        try { timeStr = new Date(msg.timestamp).toLocaleTimeString(); } catch (e) { /* ignore */ }
+      }
+      div.innerHTML =
+        '<div class="msg-role">' + escapeHtml(roleLabel) + '</div>' +
+        '<pre class="msg-content">' + escapeHtml(msg.content) + '</pre>' +
+        (timeStr ? '<div class="msg-time">' + escapeHtml(timeStr) + '</div>' : '');
+      convMessages.appendChild(div);
+    });
+    convMessages.scrollTop = convMessages.scrollHeight;
+  }
+
+  async function sendMessage() {
+    var text = convInput.value.trim();
+    if (!text || !sessionId) return;
+    sendMsgBtn.disabled = true;
+    try {
+      var r = await fetch('/api/conversation/' + sessionId, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text }),
+      });
+      var d = await r.json();
+      convInput.value = '';
+      renderConversation(d.messages);
+      regenerateBtn.disabled = false;
+    } catch (err) {
+      console.error('Failed to send message:', err);
+    } finally {
+      sendMsgBtn.disabled = false;
+    }
+  }
+
+  /* ----- Re-generation ------------------------------------------- */
+
+  async function runRegenerate() {
+    regenerateBtn.disabled = true;
+    sendMsgBtn.disabled = true;
+    procSection.classList.remove('hidden');
+    pipelineSteps.innerHTML = '';
+    resultsSection.classList.add('hidden');
+
+    var regenStep = createStep('regeneration', 'Re-generating code with user feedback\u2026');
+    pipelineSteps.appendChild(regenStep);
+    setStepStatus(regenStep, 'running');
+    regenStep.querySelector('.step-output').classList.add('visible');
+    regenStep.querySelector('.step-output').textContent = 'Starting re-generation\u2026';
+
+    var fileSteps = {};
+    var generatedFiles = [];
+    var verificationStep = null;
+    var regenInfoDone = false;
+
+    var es = new EventSource('/api/regenerate/' + sessionId);
+
+    es.onmessage = function (event) {
+      var msg = JSON.parse(event.data);
+
+      switch (msg.type) {
+        case 'token': {
+          var step;
+          if (msg.stage === 'regeneration') step = regenStep;
+          else if (msg.stage === 'verification') step = verificationStep;
+          else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
+          if (step) {
+            var o = step.querySelector('.step-output');
+            o.textContent += msg.token;
+            o.scrollTop = o.scrollHeight;
+          }
+          break;
+        }
+        case 'stage':
+          if (msg.stage === 'transform' && msg.file && !fileSteps[msg.file]) {
+            if (!regenInfoDone) {
+              setStepStatus(regenStep, 'complete');
+              regenStep.querySelector('.step-label').textContent = 'Re-generation initialized';
+              regenInfoDone = true;
+            }
+            var s = createStep('file-' + msg.index,
+              'Re-generating ' + msg.file + ' (' + (msg.index + 1) + '/' + msg.total + ')');
+            pipelineSteps.appendChild(s);
+            setStepStatus(s, 'running');
+            s.querySelector('.step-output').classList.add('visible');
+            fileSteps[msg.file] = s;
+          } else if (msg.stage === 'verification' && !verificationStep) {
+            verificationStep = createStep('verification', 'Verifying re-generated code\u2026');
+            pipelineSteps.appendChild(verificationStep);
+            setStepStatus(verificationStep, 'running');
+            verificationStep.querySelector('.step-output').classList.add('visible');
+          }
+          break;
+
+        case 'stage_complete':
+          if (msg.stage === 'verification' && verificationStep) {
+            setStepStatus(verificationStep, 'complete');
+            verificationStep.querySelector('.step-label').textContent = 'Verification complete';
+          }
+          break;
+
+        case 'file_complete':
+          if (fileSteps[msg.file]) {
+            setStepStatus(fileSteps[msg.file], 'complete');
+            fileSteps[msg.file].querySelector('.step-label').textContent =
+              msg.file + ' re-generated (' + fmtSize(msg.size) + ')';
+          }
+          break;
+
+        case 'info': {
+          var target;
+          if (msg.stage === 'regeneration') target = regenStep;
+          else if (msg.stage === 'verification' && verificationStep) target = verificationStep;
+          else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) target = fileSteps[msg.file];
+          if (target) {
+            var out = target.querySelector('.step-output');
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+          }
+          break;
+        }
+
+        case 'error':
+          es.close();
+          if (msg.file && fileSteps[msg.file]) {
+            setStepStatus(fileSteps[msg.file], 'error');
+            fileSteps[msg.file].querySelector('.step-label').textContent = msg.file + ' failed';
+            var outE = fileSteps[msg.file].querySelector('.step-output');
+            outE.textContent += '\nError: ' + msg.message + '\n';
+            outE.classList.add('visible');
+          } else {
+            setStepStatus(regenStep, 'error');
+            regenStep.querySelector('.step-label').textContent = 'Re-generation failed';
+            var outR = regenStep.querySelector('.step-output');
+            outR.textContent += '\nError: ' + msg.message + '\n';
+            outR.classList.add('visible');
+          }
+          regenerateBtn.disabled = false;
+          sendMsgBtn.disabled = false;
+          break;
+
+        case 'complete':
+          es.close();
+          generatedFiles = msg.files || [];
+          showResults(generatedFiles);
+          regenerateBtn.disabled = true;
+          sendMsgBtn.disabled = false;
+          refreshConversation();
+          break;
+      }
+    };
+
+    es.onerror = function () {
+      es.close();
+      if (generatedFiles.length) {
+        showResults(generatedFiles);
+        regenerateBtn.disabled = true;
+        sendMsgBtn.disabled = false;
+        return;
+      }
+      setStepStatus(regenStep, 'error');
+      regenStep.querySelector('.step-label').textContent = 'Re-generation stream interrupted';
+      var outErr = regenStep.querySelector('.step-output');
+      outErr.textContent += '\nError: connection interrupted. Please retry.';
+      outErr.classList.add('visible');
+      regenerateBtn.disabled = false;
+      sendMsgBtn.disabled = false;
+    };
+  }
+
+  async function refreshConversation() {
+    if (!sessionId) return;
+    try {
+      var r = await fetch('/api/conversation/' + sessionId);
+      var d = await r.json();
+      renderConversation(d.messages);
+    } catch (e) { /* ignore */ }
   }
 
   /* ----- Wire up events ------------------------------------------ */
@@ -427,6 +629,11 @@
   resetBtn.addEventListener('click', resetAll);
   downloadBtn.addEventListener('click', () => {
     if (sessionId) window.location.href = '/api/download/' + sessionId;
+  });
+  sendMsgBtn.addEventListener('click', sendMessage);
+  regenerateBtn.addEventListener('click', runRegenerate);
+  convInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendMessage();
   });
 
   initSession();
