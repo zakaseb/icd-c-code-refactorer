@@ -1,4 +1,5 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 HOST_CPU=$(nproc 2>/dev/null || echo 4)
 if [ "$HOST_CPU" -gt 2 ]; then
@@ -11,6 +12,6 @@ docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
   -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
   -e LLAMA_ARG_CTX_SIZE=32768 \
   -e LLAMA_ARG_N_PREDICT=32768 \
-  -v "$SCRIPT_DIR/models":/home/developer/models \
-  -v "$SCRIPT_DIR/workspace":/home/developer/workspace \
+  -v "$PROJECT_ROOT/models":/home/developer/models \
+  -v "$PROJECT_ROOT/workspace":/home/developer/workspace \
   icd-c-code-refactorer:llama.cpp
