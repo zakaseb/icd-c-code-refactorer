@@ -5,6 +5,7 @@ Upload original .c/.h files, source ICD (PDF), and target ICD (PDF).
 The tool analyzes both ICDs, understands the differences, and transforms
 the code to conform to the target ICD.
 """
+import difflib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import uuid
 import shutil
 import zipfile
 import io
+from datetime import datetime, timezone
 
 import httpx
 
@@ -26,6 +28,7 @@ from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 app = FastAPI(title="ICD C Code Refactorer", docs_url=None, redoc_url=None)
 
@@ -327,6 +330,42 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _generate_diff(old_text: str, new_text: str, old_label: str, new_label: str) -> str:
+    """Produce a unified diff between two texts."""
+    diff_lines = list(difflib.unified_diff(
+        old_text.splitlines(keepends=True),
+        new_text.splitlines(keepends=True),
+        fromfile=old_label,
+        tofile=new_label,
+    ))
+    return "".join(diff_lines) if diff_lines else "(no changes)\n"
+
+
+def _build_conversation_context(messages: list[dict]) -> str:
+    """Format conversation messages into LLM prompt context."""
+    if not messages:
+        return ""
+    parts = [
+        "## User Feedback and Error Logs\n",
+        "The following messages were provided by the user after reviewing the "
+        "previously generated code. These typically contain build errors, compiler "
+        "warnings, test failures, or other issues found when integrating the "
+        "generated code into the repository. Fix ALL issues described below "
+        "while maintaining full compliance with the ICD change specification "
+        "and repository conventions. Do not introduce regressions in areas "
+        "that were previously correct.\n",
+    ]
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        parts.append(f"\n### {role.title()} Message\n```\n{content}\n```\n")
+    return "\n".join(parts)
+
+
+class ChatMessage(BaseModel):
+    message: str
+
+
 # ---------------------------------------------------------------------------
 # Repository context helpers
 # ---------------------------------------------------------------------------
@@ -481,6 +520,212 @@ def _build_repo_summary(repo_dir: Path) -> str:
 
     result = "".join(parts)
     return _truncate_text(result, 4000, "repo_summary")
+
+
+def _build_repo_knowledge(repo_dir: Path, max_chars: int = 10_000) -> str:
+    """Extract comprehensive high-level and low-level knowledge from the repo.
+
+    High-level: file structure, module organisation, naming conventions.
+    Low-level: struct/union definitions with fields, enum definitions with
+    values, full function signatures, global variable declarations, and
+    macro definitions with their values.
+    """
+    all_files = sorted(p for p in repo_dir.rglob("*") if p.is_file())
+    code_exts = _HEADER_EXTS | _SOURCE_EXTS
+    tree_lines = [str(f.relative_to(repo_dir)) for f in all_files]
+
+    struct_re = re.compile(
+        r'typedef\s+(?:struct|union)\s*\w*\s*\{([^}]*)\}\s*(\w+)\s*;', re.DOTALL)
+    enum_re = re.compile(
+        r'typedef\s+enum\s*\w*\s*\{([^}]*)\}\s*(\w+)\s*;', re.DOTALL)
+    func_sig_re = re.compile(
+        r'^(?:(?:static|extern|inline|const|unsigned|void)\s+)*'
+        r'[A-Za-z_]\w*(?:\s*\*)*\s+([A-Za-z_]\w*)\s*\(([^)]*)\)',
+        re.MULTILINE)
+    global_var_re = re.compile(
+        r'^(?:(?:static|extern|volatile|const)\s+)+'
+        r'([A-Za-z_]\w*(?:\s*\*)*)\s+([A-Za-z_]\w*)'
+        r'(?:\s*\[[^\]]*\])*'
+        r'(?:\s*=\s*[^;]+)?;',
+        re.MULTILINE)
+    define_re = re.compile(
+        r'^\s*#\s*define\s+([A-Z_][A-Z0-9_]+)[ \t]+(.+?)$', re.MULTILINE)
+
+    structs: list[str] = []
+    enums: list[str] = []
+    func_sigs: list[str] = []
+    global_vars: list[str] = []
+    macros: list[str] = []
+
+    for f in all_files:
+        if f.suffix.lower() not in code_exts:
+            continue
+        try:
+            content = f.read_text(errors="replace")
+        except Exception:
+            continue
+        for m in struct_re.finditer(content):
+            fields = " ".join(m.group(1).split())
+            structs.append(f"  {m.group(2)}: {{ {fields} }}")
+        for m in enum_re.finditer(content):
+            vals = " ".join(m.group(1).split())
+            enums.append(f"  {m.group(2)}: {{ {vals} }}")
+        for m in func_sig_re.finditer(content):
+            params = " ".join(m.group(2).split())
+            func_sigs.append(f"  {m.group(1)}({params})")
+        for m in global_var_re.finditer(content):
+            global_vars.append(f"  {m.group(1)} {m.group(2)}")
+        for m in define_re.finditer(content):
+            macros.append(f"  {m.group(1)} = {m.group(2).strip()}")
+
+    structs = structs[:30]
+    enums = enums[:20]
+    func_sigs = sorted(set(func_sigs))[:40]
+    global_vars = sorted(set(global_vars))[:30]
+    macros = macros[:40]
+
+    parts = [
+        "=" * 65 + "\n",
+        "REPOSITORY CODEBASE KNOWLEDGE\n",
+        "=" * 65 + "\n\n",
+        "## High-Level: File Structure & Organisation\n```\n",
+        "\n".join(tree_lines[:100]),
+        "\n```\n",
+    ]
+    if structs:
+        parts.append("\n## Low-Level: Struct / Union Definitions\n")
+        parts.append("\n".join(structs) + "\n")
+    if enums:
+        parts.append("\n## Low-Level: Enum Definitions\n")
+        parts.append("\n".join(enums) + "\n")
+    if func_sigs:
+        parts.append("\n## Low-Level: Function Signatures\n")
+        parts.append("\n".join(func_sigs) + "\n")
+    if global_vars:
+        parts.append("\n## Low-Level: Global Variable Declarations\n")
+        parts.append("\n".join(global_vars) + "\n")
+    if macros:
+        parts.append("\n## Low-Level: Macro Definitions\n")
+        parts.append("\n".join(macros) + "\n")
+
+    result = "".join(parts)
+    return _truncate_text(result, max_chars, "repo_knowledge")
+
+
+def _extract_c_variables(code: str, filename: str) -> list[dict]:
+    """Extract variable declarations from C source code.
+
+    Returns a list of dicts with keys: name, type, scope, extra.
+    """
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    global_re = re.compile(
+        r'^(?:(?:static|extern|volatile|const|unsigned|signed|short|long|register)\s+)*'
+        r'([A-Za-z_]\w*(?:\s*\*)*)\s*'
+        r'\*?([A-Za-z_]\w*)'
+        r'(\s*\[[^\]]*\])?'
+        r'(?:\s*=\s*([^;]+))?;',
+        re.MULTILINE)
+
+    func_re = re.compile(
+        r'^(?:(?:static|extern|inline|const|unsigned|void)\s+)*'
+        r'[A-Za-z_]\w*(?:\s*\*)*\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{',
+        re.MULTILINE)
+
+    define_re = re.compile(
+        r'^\s*#\s*define\s+([A-Za-z_]\w+)(?:[ \t]+(.+?))?$', re.MULTILINE)
+
+    brace_depth = 0
+    in_function = False
+    current_func = ""
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("/*"):
+            pass
+        fm = func_re.match(line)
+        if fm and brace_depth == 0:
+            in_function = True
+            current_func = fm.group(1)
+            params = fm.group(2).strip()
+            if params and params != "void":
+                for param in params.split(","):
+                    parts = param.strip().rsplit(None, 1)
+                    if len(parts) == 2:
+                        ptype, pname = parts
+                        pname = pname.lstrip("*")
+                        key = f"param:{current_func}:{pname}"
+                        if key not in seen:
+                            seen.add(key)
+                            results.append({
+                                "name": pname,
+                                "type": ptype.strip(),
+                                "scope": f"parameter of {current_func}()",
+                                "extra": "",
+                            })
+        brace_depth += stripped.count("{") - stripped.count("}")
+
+        if brace_depth <= 0:
+            in_function = False
+            current_func = ""
+            brace_depth = max(brace_depth, 0)
+
+    for m in global_re.finditer(code):
+        vtype = m.group(1).strip()
+        vname = m.group(2)
+        arr = (m.group(3) or "").strip()
+        init = (m.group(4) or "").strip()
+        pos = m.start()
+        depth = code[:pos].count("{") - code[:pos].count("}")
+        scope = "global" if depth == 0 else "local"
+        key = f"{scope}:{vname}"
+        if vname in ("if", "while", "for", "switch", "return", "sizeof",
+                      "else", "case", "break", "continue", "goto"):
+            continue
+        if key not in seen:
+            seen.add(key)
+            extra = ""
+            if arr:
+                extra = f"array{arr}"
+            if init:
+                extra += (", " if extra else "") + f"init={init[:60]}"
+            results.append({
+                "name": vname,
+                "type": vtype,
+                "scope": scope,
+                "extra": extra,
+            })
+
+    for m in define_re.finditer(code):
+        mname = m.group(1)
+        mval = (m.group(2) or "").strip()
+        key = f"macro:{mname}"
+        if key not in seen:
+            seen.add(key)
+            results.append({
+                "name": mname,
+                "type": "#define",
+                "scope": "macro",
+                "extra": mval[:80] if mval else "(flag)",
+            })
+
+    return results
+
+
+def _format_variable_inventory(variables: list[dict], filename: str) -> str:
+    """Format extracted variables into a report section."""
+    if not variables:
+        return f"  (no variables extracted from {filename})\n"
+    lines = []
+    by_scope: dict[str, list[dict]] = {}
+    for v in variables:
+        by_scope.setdefault(v["scope"], []).append(v)
+    for scope in sorted(by_scope):
+        lines.append(f"  [{scope}]")
+        for v in by_scope[scope]:
+            extra = f"  ({v['extra']})" if v["extra"] else ""
+            lines.append(f"    {v['type']:30s} {v['name']}{extra}")
+    return "\n".join(lines) + "\n"
 
 
 def _build_repo_context(repo_dir: Path, exclude_names: set[str] | None = None) -> str:
@@ -768,9 +1013,13 @@ async def process(session_id: str):
     repo_dir = session_dir / "repo_contents"
     has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
     repo_summary = ""
+    repo_knowledge = ""
     if has_repo:
         repo_summary = _build_repo_summary(repo_dir)
-        log.info("Repo summary for ICD analysis: %d chars", len(repo_summary))
+        repo_knowledge = _build_repo_knowledge(repo_dir)
+        (session_dir / "repo_knowledge.txt").write_text(repo_knowledge)
+        log.info("Repo summary for ICD analysis: %d chars, repo knowledge: %d chars",
+                 len(repo_summary), len(repo_knowledge))
 
     uploaded_names = {p.name for p in code_files}
     log.info(
@@ -1083,8 +1332,14 @@ async def process(session_id: str):
             return
 
         (session_dir / "change_spec.txt").write_text(change_spec)
-        (session_dir / "icd_analysis.txt").write_text(change_spec)
-        (gen_dir / "icd_analysis.txt").write_text(change_spec)
+        (session_dir / "target_summary.txt").write_text(target_summary)
+
+        analysis_report_parts = [change_spec]
+        if repo_knowledge:
+            analysis_report_parts.append("\n\n" + repo_knowledge)
+        full_analysis = "\n".join(analysis_report_parts)
+        (session_dir / "icd_analysis.txt").write_text(full_analysis)
+        (gen_dir / "icd_analysis.txt").write_text(full_analysis)
         yield _sse({"type": "stage_complete", "stage": "analysis"})
 
         # Gather cross-file context (the uploaded source files)
@@ -1156,6 +1411,14 @@ async def process(session_id: str):
                     f"Use the exact type names, function signatures, macros, and "
                     f"naming conventions from these files.\n\n{file_repo_ctx}"
                 )
+            sec_knowledge = ""
+            if repo_knowledge:
+                sec_knowledge = (
+                    f"## Repository Codebase Knowledge\n"
+                    f"Detailed inventory of types, functions, variables, and macros "
+                    f"from the repository. Use these as ground truth for naming, "
+                    f"types, and conventions.\n\n{repo_knowledge}"
+                )
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             sec_file = (
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
@@ -1169,14 +1432,16 @@ async def process(session_id: str):
             )
 
             system_tokens = _estimate_tokens(transform_system)
+            prompt_sections = [
+                ("file_to_transform", sec_file, 0),
+                ("repo_dependencies", sec_repo, 1),
+                ("change_spec", sec_change, 1),
+                ("repo_knowledge", sec_knowledge, 2),
+                ("target_summary", sec_target, 3),
+                ("cross_file_ctx", sec_code, 4),
+            ]
             transform_prompt = _assemble_prompt(
-                [
-                    ("file_to_transform", sec_file, 0),
-                    ("repo_dependencies", sec_repo, 1),
-                    ("change_spec", sec_change, 1),
-                    ("target_summary", sec_target, 3),
-                    ("cross_file_ctx", sec_code, 4),
-                ],
+                prompt_sections,
                 max_input_tokens=MAX_INPUT_TOKENS - system_tokens,
             )
             log.info("Transform prompt for %s: %d chars (%d est. tokens)",
@@ -1258,10 +1523,13 @@ async def process(session_id: str):
             })
 
             verification_reports: list[str] = []
+            verify_diffs: dict[str, str] = {}
+            structural_results: dict[str, list[str]] = {}
 
             for gf in gen_files:
                 gfname = gf.name
                 generated_code = gf.read_text()
+                pre_verify_code = generated_code
                 orig_path = code_dir / gfname
                 original_code = orig_path.read_text() if orig_path.exists() else ""
 
@@ -1279,6 +1547,7 @@ async def process(session_id: str):
                     original_code,
                     gfname,
                 )
+                structural_results[gfname] = structural_issues
 
                 if structural_issues:
                     issue_text = "\n".join(f"  - {i}" for i in structural_issues)
@@ -1388,6 +1657,11 @@ async def process(session_id: str):
                             verified_code, original_code, gfname
                         ) and not verify_issues:
                             gf.write_text(verified_code)
+                            verify_diffs[gfname] = _generate_diff(
+                                pre_verify_code, verified_code,
+                                f"{gfname} (pre-verification)",
+                                f"{gfname} (post-verification)",
+                            )
                             verification_reports.append(
                                 f"{gfname}: LLM verification applied corrections"
                             )
@@ -1425,6 +1699,11 @@ async def process(session_id: str):
                                 fixed_code, original_code, gfname
                             ) and not fixed_issues:
                                 gf.write_text(fixed_code)
+                                verify_diffs[gfname] = _generate_diff(
+                                    pre_verify_code, fixed_code,
+                                    f"{gfname} (pre-verification)",
+                                    f"{gfname} (post-verification)",
+                                )
                                 verification_reports.append(
                                     f"{gfname}: LLM verification applied targeted fix pass"
                                 )
@@ -1460,16 +1739,65 @@ async def process(session_id: str):
                     verification_reports.append(f"{gfname}: all structural checks passed")
 
             report_path = gen_dir / "verification_report.txt"
-            report_path.write_text(
-                "Verification completed for all generated files.\n"
-                "Each file was checked against:\n"
-                "  - Structural integrity (braces, comments, guards)\n"
-                "  - #include paths resolved against repository\n"
-                "  - Function presence compared to original\n"
-                "  - ICD change specification compliance (LLM)\n"
-                "  - Repository naming/type compatibility (LLM)\n\n"
-                "Results:\n" + "\n".join(f"  {r}" for r in verification_reports) + "\n"
-            )
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            report_lines = [
+                "=" * 65,
+                "VERIFICATION REPORT",
+                "=" * 65,
+                f"\nGenerated: {now}",
+                "Round: Initial Generation",
+                "",
+                "-" * 65,
+                "CHECKS PERFORMED",
+                "-" * 65,
+                "1. Structural integrity (matching braces, block comments, header guards)",
+                "2. #include path resolution against repository codebase",
+                "3. Function/symbol presence compared to original source files",
+                "4. ICD change specification compliance (LLM-verified)",
+                "5. Repository naming and type compatibility (LLM-verified)",
+                "6. Variable inventory of generated code files",
+                "",
+                "-" * 65,
+                "RESULTS",
+                "-" * 65,
+            ]
+            for gf_r in gen_files:
+                gfn = gf_r.name
+                report_lines.append(f"\n### {gfn}\n")
+                issues = structural_results.get(gfn, [])
+                report_lines.append("Structural Checks:")
+                if not issues:
+                    report_lines.append("  [PASS] All structural checks passed")
+                else:
+                    for iss in issues:
+                        report_lines.append(f"  [ISSUE] {iss}")
+                status_line = next(
+                    (r for r in verification_reports if r.startswith(gfn + ":")), ""
+                )
+                if status_line:
+                    summary = status_line.split(": ", 1)[1] if ": " in status_line else status_line
+                    report_lines.append(f"\nVerification Outcome: {summary}")
+                diff_text = verify_diffs.get(gfn)
+                if diff_text and diff_text != "(no changes)\n":
+                    report_lines.append("\nChanges applied during verification:")
+                    report_lines.append(diff_text)
+                else:
+                    report_lines.append("\nNo changes applied during verification.")
+
+            report_lines.extend([
+                "",
+                "-" * 65,
+                "VARIABLE INVENTORY",
+                "-" * 65,
+            ])
+            for gf_r in gen_files:
+                gfn = gf_r.name
+                final_code = gf_r.read_text()
+                variables = _extract_c_variables(final_code, gfn)
+                report_lines.append(f"\n### {gfn}\n")
+                report_lines.append(_format_variable_inventory(variables, gfn))
+
+            report_path.write_text("\n".join(report_lines) + "\n")
             yield _sse({"type": "stage_complete", "stage": "verification"})
 
         # ---- Done -----------------------------------------------------
@@ -1554,3 +1882,624 @@ async def delete_session(session_id: str):
     if session_dir.exists():
         shutil.rmtree(session_dir)
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Conversation endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/conversation/{session_id}")
+async def add_conversation_message(session_id: str, msg: ChatMessage):
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not msg.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    conv_path = session_dir / "conversation.json"
+    conversation = json.loads(conv_path.read_text()) if conv_path.exists() else []
+    conversation.append({
+        "role": "user",
+        "content": msg.message.strip(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    conv_path.write_text(json.dumps(conversation, indent=2))
+    return {"messages": conversation}
+
+
+@app.get("/api/conversation/{session_id}")
+async def get_conversation(session_id: str):
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    conv_path = session_dir / "conversation.json"
+    if not conv_path.exists():
+        return {"messages": []}
+    return {"messages": json.loads(conv_path.read_text())}
+
+
+# ---------------------------------------------------------------------------
+# Re-generation endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/regenerate/{session_id}")
+async def regenerate(session_id: str):
+    """Re-generate code incorporating conversation feedback. Returns SSE stream."""
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    status = json.loads((session_dir / "status.json").read_text())
+    if status.get("state") != "completed":
+        raise HTTPException(status_code=400, detail="Initial processing must complete first")
+
+    conv_path = session_dir / "conversation.json"
+    conversation = json.loads(conv_path.read_text()) if conv_path.exists() else []
+    if not conversation:
+        raise HTTPException(status_code=400, detail="No feedback messages to incorporate")
+
+    change_spec = (session_dir / "change_spec.txt").read_text()
+    code_dir = session_dir / "original_code"
+    gen_dir = session_dir / "generated_code"
+    code_files = sorted(p for p in code_dir.iterdir() if p.is_file())
+
+    repo_dir = session_dir / "repo_contents"
+    has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
+    uploaded_names = {p.name for p in code_files}
+
+    regen_count = status.get("regeneration_count", 0) + 1
+
+    target_summary_path = session_dir / "target_summary.txt"
+    target_summary = (
+        target_summary_path.read_text() if target_summary_path.exists()
+        else _truncate_text(
+            (session_dir / "target_icd.txt").read_text(), 12_000, "target_icd"
+        )
+    )
+
+    repo_knowledge_path = session_dir / "repo_knowledge.txt"
+    repo_knowledge = repo_knowledge_path.read_text() if repo_knowledge_path.exists() else ""
+    if not repo_knowledge and has_repo:
+        repo_knowledge = _build_repo_knowledge(repo_dir)
+        repo_knowledge_path.write_text(repo_knowledge)
+
+    prev_dir = session_dir / f"generated_code_v{regen_count - 1}"
+    if not prev_dir.exists():
+        shutil.copytree(gen_dir, prev_dir)
+
+    conversation_ctx = _build_conversation_context(conversation)
+
+    log.info(
+        "Regenerate %s: round %d, %d code files, %d conversation messages",
+        session_id[:8], regen_count, len(code_files), len(conversation),
+    )
+
+    def event_stream():
+        yield _sse({
+            "type": "stage",
+            "stage": "regeneration",
+            "message": f"Re-generating code (round {regen_count}) incorporating user feedback\u2026",
+        })
+
+        yield _sse({
+            "type": "info",
+            "stage": "regeneration",
+            "message": "Checking llama-server availability\u2026",
+        })
+        try:
+            _wait_for_llm_ready(timeout_s=300)
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+            return
+
+        yield _sse({
+            "type": "info",
+            "stage": "regeneration",
+            "message": f"Incorporating {len(conversation)} feedback message(s) into re-generation\u2026",
+        })
+
+        all_code_ctx = ""
+        for cf in code_files:
+            all_code_ctx += f"\n### File: {cf.name}\n```c\n{cf.read_text()}\n```\n"
+        all_code_ctx = _truncate_text(all_code_ctx, MAX_CODE_CONTEXT_CHARS, "all_code_ctx")
+
+        regen_diffs: dict[str, str] = {}
+
+        for i, code_file in enumerate(code_files):
+            fname = code_file.name
+            original = code_file.read_text()
+
+            prev_gen_path = prev_dir / fname
+            prev_generated = prev_gen_path.read_text() if prev_gen_path.exists() else ""
+
+            yield _sse({
+                "type": "stage",
+                "stage": "transform",
+                "file": fname,
+                "index": i,
+                "total": len(code_files),
+                "message": f"Re-generating {fname} with user feedback\u2026",
+            })
+
+            transform_system = (
+                "You are an expert C programmer specializing in embedded systems "
+                "and interface implementations governed by Interface Control Documents.\n\n"
+                "The user has previously generated code that had issues (build errors, "
+                "warnings, or other problems). You must re-generate the code fixing ALL "
+                "reported issues while maintaining full ICD compliance.\n\n"
+                "CRITICAL: You must consider ALL provided context HOLISTICALLY — the "
+                "ICD change specification, repository codebase knowledge, dependency "
+                "headers, AND user feedback — to produce correct code. Do NOT focus "
+                "solely on user-reported errors at the expense of ICD compliance or "
+                "repository compatibility. Fixing one error must not introduce "
+                "regressions elsewhere. Use the repository's actual type names, "
+                "function signatures, macros, and variable conventions as ground truth.\n\n"
+                "RULES:\n"
+                "1. Output ONLY the complete, transformed C source code\n"
+                "2. Fix ALL issues described in the user feedback/error logs\n"
+                "3. Apply ALL changes required by the target ICD per the change specification\n"
+                "4. Preserve the overall code architecture, style, and conventions\n"
+                "5. Ensure type correctness and compilability\n"
+                "6. Keep header/source consistency across the project\n"
+                "7. Do NOT add prose explanations — only output C code\n"
+                "8. Wrap the entire output in ```c ... ``` fences\n"
+                "9. Match naming conventions from the repository codebase\n"
+                "10. Ensure #include directives reference correct repository headers\n"
+                "11. Maintain compatibility with all dependent modules in the repository\n"
+                "12. Cross-check every fix against the change spec and repo headers "
+                "to prevent error loops"
+            )
+
+            file_repo_ctx = ""
+            if has_repo:
+                file_repo_ctx = _build_file_repo_context(
+                    repo_dir, original, uploaded_names,
+                    max_chars=MAX_REPO_CONTEXT_CHARS,
+                )
+                if not file_repo_ctx:
+                    file_repo_ctx = _build_repo_context(
+                        repo_dir, exclude_names=uploaded_names,
+                    )
+
+            sec_conv = conversation_ctx
+            sec_prev = ""
+            if prev_generated:
+                sec_prev = (
+                    f"## Previously Generated Code ({fname}) \u2014 HAS ISSUES\n"
+                    f"```c\n{prev_generated}\n```\n"
+                )
+            sec_change = f"## Change Specification (Source ICD -> Target ICD)\n\n{change_spec}"
+            sec_target_v = f"## Target ICD Consolidated Summary\n\n{target_summary}"
+            sec_repo = ""
+            if file_repo_ctx:
+                sec_repo = (
+                    f"## Repository Dependency Context\n"
+                    f"Use exact type names, function signatures, macros, and naming "
+                    f"conventions from these files.\n\n{file_repo_ctx}"
+                )
+            sec_knowledge = ""
+            if repo_knowledge:
+                sec_knowledge = (
+                    f"## Repository Codebase Knowledge\n"
+                    f"Detailed inventory of types, functions, variables, and macros "
+                    f"from the repository. Use these as ground truth for naming, "
+                    f"types, and conventions.\n\n{repo_knowledge}"
+                )
+            sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
+            sec_file = (
+                f"## Original File: {fname}\n\n```c\n{original}\n```\n\n"
+                "Re-generate this file to conform to the Target ICD while fixing "
+                "ALL issues from the user feedback. Use the change specification "
+                "and repository knowledge as ground truth — do not introduce "
+                "regressions. Output the complete file in "
+                "```c fences. Do not omit any sections."
+            )
+
+            system_tokens = _estimate_tokens(transform_system)
+            transform_prompt = _assemble_prompt(
+                [
+                    ("file_to_transform", sec_file, 0),
+                    ("user_feedback", sec_conv, 0),
+                    ("change_spec", sec_change, 1),
+                    ("previous_generated", sec_prev, 1),
+                    ("repo_dependencies", sec_repo, 2),
+                    ("repo_knowledge", sec_knowledge, 2),
+                    ("target_summary", sec_target_v, 3),
+                    ("cross_file_ctx", sec_code, 4),
+                ],
+                max_input_tokens=MAX_INPUT_TOKENS - system_tokens,
+            )
+            log.info("Regen prompt for %s: %d chars (%d est. tokens)",
+                     fname, len(transform_prompt), _estimate_tokens(transform_prompt))
+
+            clean = ""
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                file_parts: list[str] = []
+                attempt_prompt = transform_prompt
+                if attempt > 1:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "transform",
+                        "file": fname,
+                        "message": f"Incomplete output; continuation pass {attempt}/{max_attempts}.",
+                    })
+                    attempt_prompt = (
+                        f"{transform_prompt}\n\n"
+                        "The previous output was incomplete/truncated. "
+                        "Continue from the exact point where it stopped, output ONLY "
+                        "the missing remainder, and ensure braces/comments/preprocessor "
+                        "blocks are closed.\n\n"
+                        f"Previous partial output:\n```c\n{clean}\n```"
+                    )
+                try:
+                    for chunk in _call_llm_stream(
+                        transform_system, attempt_prompt, max_tokens=4096,
+                    ):
+                        file_parts.append(chunk)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "transform",
+                            "file": fname,
+                            "token": chunk,
+                        })
+                except Exception as e:
+                    yield _sse({
+                        "type": "error",
+                        "message": f"Error re-generating {fname}: {e}",
+                        "file": fname,
+                    })
+                    break
+
+                last_chunk = _extract_fenced("".join(file_parts), "c").strip()
+                if attempt == 1:
+                    clean = last_chunk
+                else:
+                    clean = (clean.rstrip() + "\n" + last_chunk.lstrip()).strip()
+
+                if _looks_complete_c_file(clean, original, fname):
+                    break
+
+            if not _looks_complete_c_file(clean, original, fname):
+                yield _sse({
+                    "type": "error",
+                    "file": fname,
+                    "message": (
+                        f"{fname} still appears incomplete after retries. "
+                        "Try with smaller ICD PDFs or a GPU-enabled llama runtime."
+                    ),
+                })
+                continue
+
+            (gen_dir / fname).write_text(clean)
+
+            if prev_generated:
+                regen_diffs[fname] = _generate_diff(
+                    prev_generated, clean,
+                    f"{fname} (round {regen_count - 1})",
+                    f"{fname} (round {regen_count})",
+                )
+
+            yield _sse({
+                "type": "file_complete",
+                "file": fname,
+                "size": len(clean),
+            })
+
+        # ---- Verification of re-generated code -------------------------
+        gen_files = sorted(
+            p for p in gen_dir.iterdir()
+            if p.is_file() and p.suffix in ('.c', '.h')
+        )
+        if gen_files:
+            yield _sse({
+                "type": "stage",
+                "stage": "verification",
+                "message": "Verifying re-generated code\u2026",
+            })
+
+            verification_reports: list[str] = []
+            verify_diffs: dict[str, str] = {}
+            structural_results: dict[str, list[str]] = {}
+
+            for gf in gen_files:
+                gfname = gf.name
+                generated_code = gf.read_text()
+                pre_verify_code = generated_code
+                orig_path = code_dir / gfname
+                original_code = orig_path.read_text() if orig_path.exists() else ""
+
+                yield _sse({
+                    "type": "info",
+                    "stage": "verification",
+                    "file": gfname,
+                    "message": f"Structural checks on {gfname}\u2026",
+                })
+
+                structural_issues = _structural_verify(
+                    generated_code,
+                    repo_dir if has_repo else None,
+                    original_code,
+                    gfname,
+                )
+                structural_results[gfname] = structural_issues
+
+                if structural_issues:
+                    issue_text = "\n".join(f"  - {si}" for si in structural_issues)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "verification",
+                        "file": gfname,
+                        "token": f"\nStructural issues in {gfname}:\n{issue_text}\n",
+                    })
+                else:
+                    yield _sse({
+                        "type": "token",
+                        "stage": "verification",
+                        "file": gfname,
+                        "token": f"\n{gfname}: structural checks passed.\n",
+                    })
+
+                needs_llm = bool(structural_issues) or has_repo
+                if needs_llm:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "verification",
+                        "file": gfname,
+                        "message": f"LLM verification pass on {gfname}\u2026",
+                    })
+
+                    issue_guidance = ""
+                    if structural_issues:
+                        issue_guidance = (
+                            "\n\nThe following structural issues were detected \u2014 "
+                            "you MUST fix these:\n"
+                            + "\n".join(f"- {si}" for si in structural_issues)
+                            + "\n"
+                        )
+
+                    verify_repo = ""
+                    if has_repo:
+                        verify_repo = _build_file_repo_context(
+                            repo_dir, original_code, uploaded_names,
+                            max_chars=MAX_REPO_CONTEXT_CHARS,
+                        )
+                        if not verify_repo:
+                            verify_repo = _build_repo_context(
+                                repo_dir, exclude_names=uploaded_names,
+                            )
+
+                    verify_system = (
+                        "You are a code verification expert. Fix structural issues "
+                        "and ensure compatibility with the repository headers. "
+                        "The user has reported specific build errors/issues \u2014 ensure "
+                        "the code fixes those problems as well. "
+                        "Output ONLY the corrected complete C file in ```c fences. "
+                        "Before the code, write a one-line summary starting with "
+                        "'FIXES:' listing corrections made, or 'NO FIXES NEEDED' "
+                        "if the code is correct. "
+                        "The output MUST include a complete fenced C file."
+                    )
+
+                    sec_issues = f"## Issues to Fix{issue_guidance}" if issue_guidance else ""
+                    sec_repo_v = (
+                        f"## Repository Headers (must be compatible)\n{verify_repo}"
+                        if verify_repo else ""
+                    )
+                    sec_spec_v = f"## Change Specification (must be applied)\n{change_spec}"
+                    sec_conv_v = conversation_ctx
+                    sec_code_v = (
+                        f"## Code to Verify ({gfname})\n```c\n{generated_code}\n```\n\n"
+                        "Output the verified/corrected file."
+                    )
+
+                    v_sys_tokens = _estimate_tokens(verify_system)
+                    verify_prompt = _assemble_prompt(
+                        [
+                            ("code_to_verify", sec_code_v, 0),
+                            ("issues", sec_issues, 1),
+                            ("user_feedback", sec_conv_v, 1),
+                            ("repo_headers", sec_repo_v, 2),
+                            ("change_spec", sec_spec_v, 3),
+                        ],
+                        max_input_tokens=MAX_INPUT_TOKENS - v_sys_tokens,
+                    )
+
+                    try:
+                        verify_pieces: list[str] = []
+                        verify_output = _call_llm_complete(
+                            verify_system,
+                            verify_prompt,
+                            max_tokens=MAX_OUTPUT_TOKENS,
+                            max_passes=4,
+                            on_chunk=lambda c: verify_pieces.append(c),
+                        )
+                        for piece in verify_pieces:
+                            yield _sse({
+                                "type": "token",
+                                "stage": "verification",
+                                "file": gfname,
+                                "token": piece,
+                            })
+                        verified_code = _extract_fenced(verify_output, "c").strip()
+                        v_issues = (
+                            _structural_verify(
+                                verified_code, repo_dir if has_repo else None,
+                                original_code, gfname,
+                            ) if verified_code else ["empty verification output"]
+                        )
+
+                        if verified_code and _looks_complete_c_file(
+                            verified_code, original_code, gfname
+                        ) and not v_issues:
+                            gf.write_text(verified_code)
+                            verify_diffs[gfname] = _generate_diff(
+                                pre_verify_code, verified_code,
+                                f"{gfname} (pre-verification)",
+                                f"{gfname} (post-verification)",
+                            )
+                            verification_reports.append(
+                                f"{gfname}: LLM verification applied corrections"
+                            )
+                        else:
+                            fix_prompt = (
+                                f"## Structural issues to fix\n"
+                                + "\n".join(f"- {fi}" for fi in v_issues[:12])
+                                + "\n\n"
+                                + f"## Repository dependency headers\n{verify_repo}\n\n"
+                                + f"## Current code ({gfname})\n```c\n{generated_code}\n```\n\n"
+                                + "Rewrite this file to fix the listed issues while preserving "
+                                  "ICD-required behavior. Output only one complete ```c fenced file."
+                            )
+                            fix_output = _call_llm_complete(
+                                verify_system, fix_prompt,
+                                max_tokens=MAX_OUTPUT_TOKENS, max_passes=3,
+                            )
+                            fixed_code = _extract_fenced(fix_output, "c").strip()
+                            fixed_issues = (
+                                _structural_verify(
+                                    fixed_code, repo_dir if has_repo else None,
+                                    original_code, gfname,
+                                ) if fixed_code else ["empty targeted-fix output"]
+                            )
+                            if fixed_code and _looks_complete_c_file(
+                                fixed_code, original_code, gfname
+                            ) and not fixed_issues:
+                                gf.write_text(fixed_code)
+                                verify_diffs[gfname] = _generate_diff(
+                                    pre_verify_code, fixed_code,
+                                    f"{gfname} (pre-verification)",
+                                    f"{gfname} (post-verification)",
+                                )
+                                verification_reports.append(
+                                    f"{gfname}: LLM verification applied targeted fix pass"
+                                )
+                            else:
+                                verification_reports.append(
+                                    f"{gfname}: verification could not produce a complete compilable correction"
+                                )
+                    except Exception as e:
+                        log.warning("Verification failed for %s: %s", gfname, e)
+                        verification_reports.append(f"{gfname}: error \u2014 {e}")
+                else:
+                    verification_reports.append(f"{gfname}: all structural checks passed")
+
+            # ---- Build comprehensive report ----
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            report_lines = [
+                "=" * 65,
+                "VERIFICATION REPORT",
+                "=" * 65,
+                f"\nGenerated: {now}",
+                f"Re-generation Round: {regen_count}",
+                "",
+                "-" * 65,
+                "CHECKS PERFORMED",
+                "-" * 65,
+                "1. Structural integrity (matching braces, block comments, header guards)",
+                "2. #include path resolution against repository codebase",
+                "3. Function/symbol presence compared to original source files",
+                "4. ICD change specification compliance (LLM-verified)",
+                "5. Repository naming and type compatibility (LLM-verified)",
+                "6. Variable inventory of generated code files",
+                "",
+            ]
+
+            if regen_diffs:
+                report_lines.extend([
+                    "-" * 65,
+                    f"CHANGES FROM USER FEEDBACK (Round {regen_count})",
+                    "-" * 65,
+                    "",
+                    "User provided the following feedback:",
+                ])
+                for cmsg in conversation:
+                    if cmsg.get("role") == "user":
+                        content_preview = cmsg.get("content", "")[:2000]
+                        report_lines.append(f"\n> {content_preview}")
+                report_lines.append("")
+
+                for rd_fname in sorted(regen_diffs):
+                    report_lines.extend([
+                        f"\n### {rd_fname}",
+                        "\nChanges applied based on user feedback:",
+                        regen_diffs[rd_fname],
+                    ])
+                report_lines.append("")
+
+            report_lines.extend([
+                "-" * 65,
+                "VERIFICATION RESULTS",
+                "-" * 65,
+            ])
+            for gf_r in gen_files:
+                gfn = gf_r.name
+                report_lines.append(f"\n### {gfn}\n")
+                issues = structural_results.get(gfn, [])
+                report_lines.append("Structural Checks:")
+                if not issues:
+                    report_lines.append("  [PASS] All structural checks passed")
+                else:
+                    for iss in issues:
+                        report_lines.append(f"  [ISSUE] {iss}")
+                status_line = next(
+                    (r for r in verification_reports if r.startswith(gfn + ":")), ""
+                )
+                if status_line:
+                    summary = status_line.split(": ", 1)[1] if ": " in status_line else status_line
+                    report_lines.append(f"\nVerification Outcome: {summary}")
+                diff_text = verify_diffs.get(gfn)
+                if diff_text and diff_text != "(no changes)\n":
+                    report_lines.append("\nChanges applied during verification:")
+                    report_lines.append(diff_text)
+                else:
+                    report_lines.append("\nNo changes applied during verification.")
+
+            report_lines.extend([
+                "",
+                "-" * 65,
+                "VARIABLE INVENTORY",
+                "-" * 65,
+            ])
+            for gf_r in gen_files:
+                gfn = gf_r.name
+                final_code = gf_r.read_text()
+                variables = _extract_c_variables(final_code, gfn)
+                report_lines.append(f"\n### {gfn}\n")
+                report_lines.append(_format_variable_inventory(variables, gfn))
+
+            (gen_dir / "verification_report.txt").write_text(
+                "\n".join(report_lines) + "\n"
+            )
+            yield _sse({"type": "stage_complete", "stage": "verification"})
+
+        # ---- Done ----
+        conv_updated = json.loads(conv_path.read_text()) if conv_path.exists() else []
+        conv_updated.append({
+            "role": "system",
+            "content": (
+                f"Re-generation round {regen_count} completed. "
+                f"{len(status.get('generated_files', []))} files processed. "
+                "See verification report for detailed changes."
+            ),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        conv_path.write_text(json.dumps(conv_updated, indent=2))
+
+        status["state"] = "completed"
+        status["regeneration_count"] = regen_count
+        status["generated_files"] = sorted(
+            p.name for p in gen_dir.iterdir() if p.is_file()
+        )
+        (session_dir / "status.json").write_text(json.dumps(status))
+        yield _sse({"type": "complete", "files": status["generated_files"]})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
