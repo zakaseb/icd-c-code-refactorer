@@ -1,14 +1,34 @@
+**This project follows the [Project Structure Guidelines](https://hal-confluence.edgegroup.ae/spaces/AIENG/pages/409174019/Project+Structure+Guidelines)**
+
 # ICD C Code Refactorer
 
-Transform C source code between Interface Control Document (ICD) versions using AI-powered **fully local** inference. No data ever leaves your machine.
+Transform C source code between Interface Control Document (ICD) versions using AI-powered fully local LLM inference.
 
-## Overview
 
-When the ICD governing your embedded C codebase changes between versions, every struct, enum, message format, constant, and function signature potentially needs updating. Doing this by hand is tedious and error-prone.
+# Table of Contents
 
-This tool automates the entire workflow. You upload your existing C files, both ICD PDFs, and optionally a ZIP of the surrounding repository. The AI then analyzes the differences, generates conforming code, verifies it, and lets you iterate through a conversational feedback loop until the output builds cleanly.
+* [Project Overview](#project-overview)
+* [Hardware](#hardware)
+* [Prerequisites](#prerequisites)
+* [Installation](#installation)
+* [Repository Layout](#repository-layout)
+* [Usage](#usage)
+* [Model / Data Card & Licenses](#model--data-card--licenses)
+* [Testing](#testing)
+* [Serving & Deployment](#serving--deployment)
+* [Support](#support)
+* [Contributing](#contributing)
+* [Authors and Acknowledgment](#authors-and-acknowledgment)
+* [License](#license)
+* [Project Status](#project-status)
 
-### Key Features
+
+
+# Project Overview
+
+* **Problem:** When the ICD governing your embedded C codebase changes between versions, every struct, enum, message format, constant, and function signature potentially needs updating. Doing this by hand is tedious and error-prone.
+* **Approach:** Local LLM inference pipeline tool that automates the entire workflow. You upload your existing C files, both ICD PDFs, and optionally a ZIP of the surrounding repository. The AI then analyzes the differences, generates conforming code, verifies it, and lets you iterate through a conversational feedback loop until the output builds cleanly.
+* **Features:**
 
 - **ICD Delta Analysis** — Automatically extracts and compares two ICD PDFs to produce an exhaustive, structured change specification covering structs, enums, constants, function signatures, protocol changes, and more.
 - **Repository-Aware Code Generation** — When a repository ZIP is provided, the tool extracts detailed codebase knowledge (types, function signatures, macros, naming conventions) and uses it as ground truth during transformation.
@@ -19,36 +39,107 @@ This tool automates the entire workflow. You upload your existing C files, both 
 - **Real-Time Streaming** — All pipeline stages stream progress via Server-Sent Events so you see analysis, transformation, and verification happen token by token.
 - **Fully Local** — Runs Qwen3-Coder-30B via llama.cpp on your own GPU. No cloud APIs, no data exfiltration.
 
-## Quick Start
 
-### Prerequisites
+# Hardware
 
-| Requirement | Notes |
-|---|---|
-| Docker with NVIDIA GPU support | `nvidia-container-toolkit` installed and configured |
-| NVIDIA GPU | 24 GB+ VRAM recommended for full GPU offload |
-| ~20 GB disk space | For the quantised GGUF model (auto-downloaded on first run) |
+Device: `Workstation`, `AI-Laptop-Dell`, `AI-Laptop-MSI`
 
-### Build and Run
+Requires an NVIDIA GPU with 24 GB+ VRAM for full GPU offload of the Qwen3-Coder-30B-A3B model. The number of GPU layers offloaded is controlled by `LLAMA_ARG_N_GPU_LAYERS` (default: `auto`). CPU-only fallback is available but significantly slower.
+
+Please refer to [Reproducible Experiments](https://hal-confluence.edgegroup.ae/spaces/AIENG/pages/424772002/Reproducible+Experiments+in+PyTorch) for settings on reproducible results.
+
+
+# Prerequisites
+
+* Docker with NVIDIA GPU support (`nvidia-container-toolkit` installed and configured)
+* NVIDIA GPU with 24 GB+ VRAM recommended
+* ~20 GB free disk space for the quantised GGUF model (auto-downloaded on first run)
+* Tools:
+  * Docker + NVIDIA Container Toolkit
+  * `nvidia-smi` accessible on the host
+
+
+# Installation
+
+## Option 1: Docker (recommended)
 
 ```bash
 # Make scripts executable
-chmod +x build.sh run.sh run_web.sh entrypoint.sh
+chmod +x deployments/docker/build.sh deployments/docker/entrypoint.sh scripts/serve.sh scripts/serve_web.sh
 
-# Build the Docker image (bakes in app code and dependencies)
-./build.sh
+# Create the models directory (downloaded automatically on first run)
+mkdir -p models
 
-# Launch the container (downloads model on first run, starts all services)
-./run_web.sh
+# Build the Docker image
+./deployments/docker/build.sh
+
+# Launch the container
+./scripts/serve_web.sh
 ```
 
 Open **[http://localhost:8081](http://localhost:8081)** in your browser once the container finishes starting up.
 
+> On first run, `entrypoint.sh` downloads the Qwen3-Coder-30B-A3B-Instruct GGUF model (~20 GB) into `models/`. Subsequent starts are fast as the model is cached.
+
 > `run_web.sh` runs a GPU preflight check, reserves CPU cores for the host, and validates port 8081 is free before starting. If the GPU is unavailable it offers a CPU-only fallback (significantly slower).
 
-## How to Use
+## Option 2: Local Python (advanced)
 
-### 1. Upload Files
+```bash
+pip install -r requirements.txt
+cd api && uvicorn app:app --host 0.0.0.0 --port 8081
+```
+
+> You will also need to run `llama-server` and `litellm` separately. Docker is strongly recommended.
+
+
+# Repository Layout
+
+```text
+icd-c-code-refactorer/
+│
+├── api/                               # FastAPI backend
+│   ├── app.py                         # All endpoints and LLM orchestration
+│   └── static/
+│       ├── index.html                 # Single-page application
+│       ├── app.js                     # Uploads, SSE streaming, conversation UI
+│       └── style.css                  # Dark-themed responsive styles
+│
+├── src/
+│   └── utils/
+│       └── hf_download.py             # Hugging Face model downloader
+│
+├── tests/
+│   └── development/
+│       └── test_codebase_context.py   # Unit tests for context-building helpers
+│
+├── scripts/
+│   ├── serve.sh                       # Minimal container launch
+│   └── serve_web.sh                   # Launch with GPU preflight and port checks
+│
+├── deployments/
+│   ├── docker/
+│   │   ├── Dockerfile                 # Multi-layer image: llama.cpp CUDA + Python + app
+│   │   ├── build.sh                   # Build the Docker image
+│   │   ├── entrypoint.sh              # Model download + tmux services startup
+│   │   └── .dockerignore
+│   ├── edge_device/
+│   └── k8s/
+│
+├── models/                            # GGUF model storage (gitignored, ~20 GB)
+├── workspace/                         # Runtime session data (gitignored)
+│
+├── .gitignore
+├── .gitattributes
+├── requirements.txt
+├── README.md
+└── pyproject.toml
+```
+
+
+# Usage
+
+## 1. Upload Files
 
 | Upload Zone | What to Provide | Required? |
 |---|---|---|
@@ -59,7 +150,7 @@ Open **[http://localhost:8081](http://localhost:8081)** in your browser once the
 
 All upload zones support drag-and-drop and file picker dialogs.
 
-### 2. Transform Code
+## 2. Transform Code
 
 Click **Transform Code** to start the pipeline. Progress streams in real time:
 
@@ -67,12 +158,12 @@ Click **Transform Code** to start the pipeline. Progress streams in real time:
 2. **Code Transformation** — Each uploaded file is transformed against the target ICD, using the change specification, repository dependency headers, and codebase knowledge as context. Incomplete outputs are automatically continued.
 3. **Verification** — Each generated file undergoes structural checks and an LLM verification pass. Corrections are applied automatically when possible.
 
-### 3. Review Results
+## 3. Review & Download
 
 - **Preview** each generated file in the browser using the tab strip.
 - **Download All** as a ZIP containing the transformed `.c`/`.h` files, the ICD analysis report (with repository codebase knowledge), and the verification report (with variable inventory).
 
-### 4. Conversational Feedback (Iterate)
+## 4. Conversational Feedback (Iterate)
 
 After the initial generation, a **conversation panel** appears below the results:
 
@@ -83,7 +174,16 @@ After the initial generation, a **conversation panel** appears below the results
 
 You can repeat this cycle as many times as needed.
 
-## Processing Pipeline
+## 5. Verification Report Contents
+
+Each run produces a `verification_report.txt` included in the download ZIP:
+
+1. **Checks Performed** — lists all checks run: structural integrity, include resolution, function presence, ICD compliance, repo compatibility, and variable inventory.
+2. **Results per File** — structural check pass/fail with specific issues, verification outcome, and unified diffs of any corrections applied automatically.
+3. **Changes from User Feedback** *(regeneration rounds only)* — diffs showing what changed between rounds, with the user feedback quoted.
+4. **Variable Inventory** — complete listing of all variables extracted from each generated file, organised by scope (global, local, parameter, macro) with types and initialiser values.
+
+# Processing Pipeline
 
 ```
                         ┌──────────────────────────────────────────────┐
@@ -141,7 +241,7 @@ You can repeat this cycle as many times as needed.
                            └───────────────────────────────────┘
 ```
 
-## Architecture
+# Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -184,130 +284,50 @@ You can repeat this cycle as many times as needed.
 | **LLM Proxy** | LiteLLM | Anthropic-compatible API proxy (for Claude Code tooling) |
 | **Container** | Docker + NVIDIA Container Toolkit | Reproducible deployment with GPU passthrough |
 
-## API Reference
+# Model / Data Card & Licenses
 
-All endpoints are served by the FastAPI backend on port **8081**.
+| | Details |
+|---|---|
+| **Model** | Qwen3-Coder-30B-A3B-Instruct (GGUF Q4_K_XL) |
+| **Version** | `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` |
+| **Source** | [Hugging Face — unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF) |
+| **License** | Apache 2.0 |
+| **Usage restrictions** | No PII or sensitive data should be included in uploaded ICD PDFs or source files if operating under data residency constraints. All inference is local — no data leaves the machine. |
 
-### Session Management
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/session/create` | Create a new session, returns `{ session_id }` |
-| `GET` | `/api/status/{session_id}` | Get session status (uploaded files, state) |
-| `DELETE` | `/api/session/{session_id}` | Delete a session and all its data |
+# Testing
 
-### File Upload
+Run the development test suite (no Docker or live LLM required):
 
-| Method | Endpoint | Accepts | Description |
-|---|---|---|---|
-| `POST` | `/api/upload/code/{session_id}` | `.c`, `.h` (multipart) | Upload source code files |
-| `POST` | `/api/upload/source-icd/{session_id}` | `.pdf` (multipart) | Upload source ICD PDF |
-| `POST` | `/api/upload/target-icd/{session_id}` | `.pdf` (multipart) | Upload target ICD PDF |
-| `POST` | `/api/upload/repo-zip/{session_id}` | `.zip` (multipart) | Upload repository ZIP for context |
-
-### Processing
-
-| Method | Endpoint | Response | Description |
-|---|---|---|---|
-| `GET` | `/api/process/{session_id}` | SSE stream | Run the full pipeline (analysis → transform → verify) |
-| `GET` | `/api/regenerate/{session_id}` | SSE stream | Re-generate with conversation feedback |
-
-SSE events use JSON payloads with a `type` field: `stage`, `token`, `info`, `file_complete`, `stage_complete`, `error`, `complete`.
-
-### Results
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/preview/{session_id}/{filename}` | Preview a single generated file |
-| `GET` | `/api/download/{session_id}` | Download all generated files as ZIP |
-
-### Conversation
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/conversation/{session_id}` | Send feedback message (`{ "message": "..." }`) |
-| `GET` | `/api/conversation/{session_id}` | Retrieve conversation history |
-
-## Session Data Layout
-
-Each session creates a directory under `workspace/sessions/<uuid>/`:
-
-```
-workspace/sessions/<uuid>/
-├── status.json                 # Session state, file lists, regeneration count
-├── original_code/              # Uploaded .c and .h files (untouched)
-├── generated_code/             # Latest generated files + reports
-│   ├── *.c / *.h               # Transformed source files
-│   ├── icd_analysis.txt        # ICD change spec + repository codebase knowledge
-│   └── verification_report.txt # Structural checks, diffs, variable inventory
-├── source_icd.pdf / .txt       # Source ICD (PDF and extracted text)
-├── target_icd.pdf / .txt       # Target ICD (PDF and extracted text)
-├── repo.zip                    # Uploaded repository archive (if provided)
-├── repo_contents/              # Extracted repository files
-├── change_spec.txt             # Raw ICD change specification
-├── target_summary.txt          # Consolidated target ICD summary
-├── repo_knowledge.txt          # Extracted codebase knowledge (high + low level)
-├── conversation.json           # Feedback messages and system responses
-├── generated_code_v0/          # Archive of round 0 output (created on first regen)
-├── generated_code_v1/          # Archive of round 1 output (created on second regen)
-└── ...
+```bash
+pytest tests/development/
 ```
 
-## Project Structure
+Or run directly:
 
-```
-icd-c-code-refactorer/
-├── webapp/
-│   ├── app.py                  # FastAPI backend (all endpoints and LLM orchestration)
-│   ├── requirements.txt        # Python dependencies (for local development)
-│   └── static/
-│       ├── index.html          # Single-page application HTML
-│       ├── app.js              # Client-side JavaScript (uploads, SSE, conversation)
-│       └── style.css           # Dark-themed responsive styles
-├── Dockerfile                  # Multi-layer image: llama.cpp CUDA + Python + app
-├── build.sh                    # Build the Docker image
-├── run_web.sh                  # Launch container with GPU preflight and port checks
-├── run.sh                      # Minimal container launch (no preflight)
-├── entrypoint.sh               # Container entrypoint: model download + tmux services
-├── hf_download.py              # Hugging Face model downloader
-├── test_codebase_context.py    # Unit tests for context-building helpers
-├── models/                     # Model storage (symlink or directory, gitignored)
-├── workspace/                  # Runtime session data (gitignored)
-├── LICENSE                     # MIT License
-└── README.md                   # This file
+```bash
+python tests/development/test_codebase_context.py
 ```
 
-## Configuration
+The test suite covers session creation, repo ZIP upload, include extraction, structural verification, prompt budget enforcement, and static file integrity across 14 test groups.
 
-### Application Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_BASE_URL` | `http://127.0.0.1:24000` | llama.cpp server URL (direct, bypasses proxy) |
-| `OPENAI_API_KEY` | `sk-1234-miaw` | API key for llama-server authentication |
-| `LITELLM_BASE_URL` | `http://127.0.0.1:4000` | LiteLLM proxy URL |
-| `HF_MODEL` | `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf` | GGUF model filename |
-| `WORKSPACE_DIR` | `./workspace` | Root directory for session storage |
+# Serving & Deployment
 
-### GPU / llama.cpp Environment Variables
+* **API:** FastAPI + uvicorn on port 8081
+* **LLM Inference:** llama.cpp `llama-server` on port 24000 (CUDA-accelerated)
+* **Proxy:** LiteLLM on port 4000 (Anthropic-compatible API)
+* **Container:** Docker + NVIDIA Container Toolkit
 
-These are read by `llama-server` inside the container. Defaults favour fast GPU inference with VRAM headroom on shared machines.
+The container runs all three services inside a tmux session. To attach for debugging:
 
-| Variable | Default | Description |
-|---|---|---|
-| `LLAMA_ARG_N_GPU_LAYERS` | `auto` | GPU layer offload — `auto` fits to available VRAM. Set a number (e.g. `40`) to cap. |
-| `LLAMA_ARG_FLASH_ATTN` | `on` | Flash attention on GPU (CUDA). |
-| `LLAMA_ARG_CTX_SIZE` | `98274` (image) / `32768` (run scripts) | Context window size. Affects KV cache VRAM usage. |
-| `LLAMA_ARG_N_PREDICT` | Same as `CTX_SIZE` | Maximum tokens per generation. |
-| `LLAMA_ARG_THREADS` | `nproc - 2` (set by run scripts) | CPU threads. Scripts reserve 2 cores for the host. |
-| `LLAMA_ARG_CACHE_TYPE_K` | `q8_0` | KV cache key quantisation (reduces VRAM). |
-| `LLAMA_ARG_CACHE_TYPE_V` | `q8_0` | KV cache value quantisation (reduces VRAM). |
-| `LLAMA_ARG_SPLIT_MODE` | `none` | Single GPU. Use `row` or `layer` for multi-GPU setups. |
-| `LLAMA_ARG_MAIN_GPU` | `0` | Primary GPU index for multi-GPU configurations. |
+```bash
+docker exec -it icd-c-code-refactorer tmux attach -t llama-server
+```
 
-### Troubleshooting VRAM Issues
+### GPU Troubleshooting
 
-If you encounter out-of-memory errors, reduce context size or GPU layers:
+If you hit VRAM errors, reduce context size or GPU layers:
 
 ```bash
 docker run -ti --rm --network=host --gpus all \
@@ -319,35 +339,33 @@ docker run -ti --rm --network=host --gpus all \
   icd-c-code-refactorer:llama.cpp
 ```
 
-## Container Services
 
-The `entrypoint.sh` starts three services inside a tmux session:
+# Support
 
-| Pane | Service | Port | Purpose |
-|---|---|---|---|
-| 1 | `llama-server` | 24000 | LLM inference engine (CUDA-accelerated) |
-| 2 | `litellm` | 4000 | Anthropic-compatible API proxy |
-| 3 | `uvicorn` (FastAPI) | 8081 | Web application backend |
+* Open an issue on the repository
+* Contact the maintainers directly
 
-You can attach to the tmux session inside the running container for debugging:
+
+# Contributing
 
 ```bash
-docker exec -it icd-c-code-refactorer tmux attach -t llama-server
+git clone <repo>
+git checkout -b feature/your-feature
 ```
 
-## Verification Report Contents
+Kindly refer to [Git Guidelines](https://hal-confluence.edgegroup.ae/x/AwEwE)
 
-Each run produces a `verification_report.txt` included in the download ZIP:
 
-1. **Checks Performed** — Lists all checks (structural integrity, include resolution, function presence, ICD compliance, repo compatibility, variable inventory).
-2. **Results per File** — Structural check pass/fail with specific issues, verification outcome, and unified diffs of any corrections applied.
-3. **Changes from User Feedback** (regeneration only) — Diffs showing what changed between rounds, with user feedback quoted.
-4. **Variable Inventory** — Complete listing of all variables extracted from each generated file, organised by scope (global, local, parameter, macro) with types and initialiser values.
+# Authors and Acknowledgment
 
-## Derived From
+Built on top of [qwen-claude-code-sw2](https://github.com/zakaseb/qwen-claude-code-sw2) which provides the local LLM inference infrastructure (Docker + llama.cpp + LiteLLM).
 
-This project is forked from [qwen-claude-code-sw2](https://github.com/zakaseb/qwen-claude-code-sw2), which provides the local LLM inference infrastructure (Docker + llama.cpp + LiteLLM).
 
-## License
+# License
 
 MIT License — see [LICENSE](LICENSE) for details.
+
+
+# Project Status
+
+`Active`
