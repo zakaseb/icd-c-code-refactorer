@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 import shutil
+import subprocess
 import zipfile
 import io
 from datetime import datetime, timezone
@@ -70,6 +71,9 @@ CHARS_PER_TOKEN = 4
 CTX_SIZE_TOKENS = int(os.environ.get("LLAMA_ARG_CTX_SIZE", "32768"))
 MAX_OUTPUT_TOKENS = 4096
 MAX_INPUT_TOKENS = CTX_SIZE_TOKENS - MAX_OUTPUT_TOKENS
+
+MAX_SANDBOX_ITERATIONS = 5
+SANDBOX_BUILD_TIMEOUT = 120
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +814,385 @@ def _structural_verify(generated: str, repo_dir: Path | None,
         issues.append(f"Functions from original not in generated: {', '.join(sorted(missing))}")
 
     return issues
+
+
+# ---------------------------------------------------------------------------
+# Sandbox build helpers
+# ---------------------------------------------------------------------------
+
+def _detect_build_system(repo_dir: Path) -> dict:
+    """Detect the build system used by a repository.
+
+    Walks the tree looking for Makefile / CMakeLists.txt.  Returns a dict
+    with keys ``type`` (``"make"`` | ``"cmake"`` | ``"none"``), ``path``
+    (the build file found), and ``build_dir`` (directory containing it).
+    Prefers Makefile at the shallowest depth, then CMakeLists.txt.
+    """
+    candidates: list[tuple[int, str, Path]] = []
+    for p in repo_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        depth = len(p.relative_to(repo_dir).parts)
+        if p.name == "Makefile":
+            candidates.append((depth, "make", p))
+        elif p.name == "CMakeLists.txt":
+            candidates.append((depth, "cmake", p))
+        elif p.suffix in _BUILD_EXTS:
+            btype = "cmake" if p.suffix == ".cmake" else "make"
+            candidates.append((depth + 100, btype, p))
+
+    if not candidates:
+        return {"type": "none", "path": None, "build_dir": repo_dir}
+
+    type_priority = {"make": 0, "cmake": 1}
+    candidates.sort(key=lambda c: (type_priority.get(c[1], 99), c[0]))
+    _, btype, bpath = candidates[0]
+    return {"type": btype, "path": bpath, "build_dir": bpath.parent}
+
+
+def _find_file_in_repo(repo_dir: Path, filename: str) -> list[Path]:
+    """Find all files in *repo_dir* whose basename matches *filename*.
+
+    Results are sorted by depth (shallowest first) so callers can prefer
+    the most likely match.
+    """
+    matches = [
+        p for p in repo_dir.rglob(filename)
+        if p.is_file() and p.name == filename
+    ]
+    matches.sort(key=lambda p: len(p.relative_to(repo_dir).parts))
+    return matches
+
+
+def _run_sandbox_build(
+    sandbox_dir: Path,
+    build_info: dict,
+    timeout: int = SANDBOX_BUILD_TIMEOUT,
+) -> tuple[bool, str]:
+    """Execute the build command inside *sandbox_dir*.
+
+    Returns ``(success, combined_output)`` where *combined_output* contains
+    both stdout and stderr from the build.
+    """
+    btype = build_info["type"]
+    bdir = build_info["build_dir"]
+
+    if btype == "make":
+        cmd = f"make -C {bdir} clean 2>/dev/null; make -C {bdir} 2>&1"
+    elif btype == "cmake":
+        cmake_build = bdir / "_cmake_build"
+        cmd = (
+            f"cmake -S {bdir} -B {cmake_build} 2>&1 && "
+            f"cmake --build {cmake_build} 2>&1"
+        )
+    else:
+        return False, "No supported build system detected in repository."
+
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(sandbox_dir),
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.returncode == 0, output.strip()
+    except subprocess.TimeoutExpired:
+        return False, f"Build timed out after {timeout} seconds."
+    except Exception as e:
+        return False, f"Build execution error: {e}"
+
+
+def _parse_error_files(build_output: str, gen_filenames: set[str]) -> dict[str, str]:
+    """Extract per-file error sections from compiler output.
+
+    Returns a mapping ``{filename: relevant_error_lines}`` for files that
+    appear in *gen_filenames*.  If no file-specific errors are found, returns
+    a single entry keyed to the first generated filename with the full output.
+    """
+    file_errors: dict[str, list[str]] = {f: [] for f in gen_filenames}
+    for line in build_output.splitlines():
+        for fname in gen_filenames:
+            if fname in line:
+                file_errors[fname].append(line)
+
+    result = {f: "\n".join(lines) for f, lines in file_errors.items() if lines}
+    if not result and gen_filenames:
+        first = sorted(gen_filenames)[0]
+        result[first] = build_output
+    return result
+
+
+def _sandbox_build_iterate(
+    session_dir: Path,
+    gen_dir: Path,
+    repo_dir: Path,
+    change_spec: str,
+    uploaded_names: set[str],
+    has_repo: bool,
+    repo_knowledge: str = "",
+):
+    """Generator that yields SSE dicts for the sandbox build loop.
+
+    Copies the repo, injects generated files, builds, and iteratively fixes
+    compiler errors via the LLM until the build succeeds or the iteration
+    limit is reached.
+    """
+    sandbox_dir = session_dir / "sandbox"
+    if sandbox_dir.exists():
+        shutil.rmtree(sandbox_dir)
+    shutil.copytree(repo_dir, sandbox_dir)
+
+    gen_files = sorted(
+        p for p in gen_dir.iterdir()
+        if p.is_file() and p.suffix in ('.c', '.h')
+    )
+    if not gen_files:
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": "No generated .c/.h files to inject — skipping sandbox build.",
+        })
+        return
+
+    gen_filenames = {gf.name for gf in gen_files}
+    replacement_map: dict[str, Path] = {}
+    for gf in gen_files:
+        matches = _find_file_in_repo(sandbox_dir, gf.name)
+        if matches:
+            replacement_map[gf.name] = matches[0]
+            matches[0].write_text(gf.read_text())
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"Replaced {matches[0].relative_to(sandbox_dir)} "
+                    f"with generated {gf.name}"
+                ),
+            })
+        else:
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"Warning: {gf.name} not found in repository — "
+                    "copying to sandbox root."
+                ),
+            })
+            (sandbox_dir / gf.name).write_text(gf.read_text())
+            replacement_map[gf.name] = sandbox_dir / gf.name
+
+    build_info = _detect_build_system(sandbox_dir)
+    yield _sse({
+        "type": "info",
+        "stage": "sandbox_build",
+        "message": (
+            f"Detected build system: {build_info['type']}"
+            + (f" ({build_info['path'].relative_to(sandbox_dir)})"
+               if build_info['path'] else "")
+        ),
+    })
+
+    if build_info["type"] == "none":
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": (
+                "No Makefile or CMakeLists.txt found — "
+                "skipping compilation loop. Repository packaged as-is."
+            ),
+        })
+        _package_sandbox_zip(session_dir, sandbox_dir)
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": "Repository ZIP packaged (no build verification).",
+        })
+        return
+
+    build_success = False
+    last_output = ""
+    for iteration in range(1, MAX_SANDBOX_ITERATIONS + 1):
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": f"Build attempt {iteration}/{MAX_SANDBOX_ITERATIONS}…",
+        })
+
+        success, output = _run_sandbox_build(sandbox_dir, build_info)
+        last_output = output
+
+        yield _sse({
+            "type": "token",
+            "stage": "sandbox_build",
+            "token": f"\n--- Build output (attempt {iteration}) ---\n{output}\n",
+        })
+
+        if success:
+            build_success = True
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": f"Build succeeded on attempt {iteration}.",
+            })
+            break
+
+        if iteration >= MAX_SANDBOX_ITERATIONS:
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"Build still failing after {MAX_SANDBOX_ITERATIONS} attempts. "
+                    "Packaging best attempt."
+                ),
+            })
+            break
+
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": f"Build failed — feeding errors to LLM for iteration {iteration + 1}…",
+        })
+
+        file_errors = _parse_error_files(output, gen_filenames)
+        for fname, errors in file_errors.items():
+            current_code = (gen_dir / fname).read_text()
+
+            file_repo_ctx = ""
+            if has_repo:
+                file_repo_ctx = _build_file_repo_context(
+                    repo_dir, current_code, uploaded_names,
+                    max_chars=MAX_REPO_CONTEXT_CHARS,
+                )
+                if not file_repo_ctx:
+                    file_repo_ctx = _build_repo_context(
+                        repo_dir, exclude_names=uploaded_names,
+                    )
+
+            fix_system = (
+                "You are an expert C programmer. The code below failed to compile "
+                "inside its repository. Fix ALL compiler errors while maintaining "
+                "full ICD compliance and repository compatibility.\n\n"
+                "RULES:\n"
+                "1. Output ONLY the complete, corrected C source file\n"
+                "2. Fix every error shown in the compiler output\n"
+                "3. Do NOT remove or stub out functionality\n"
+                "4. Preserve the code's architecture and naming conventions\n"
+                "5. Ensure #include paths are correct for the repository\n"
+                "6. Wrap the output in ```c ... ``` fences"
+            )
+
+            sec_errors = (
+                f"## Compiler Errors\n```\n"
+                f"{_truncate_text(errors, 6000, 'compiler_errors')}\n```"
+            )
+            sec_repo_ctx = (
+                f"## Repository Dependency Context\n{file_repo_ctx}"
+                if file_repo_ctx else ""
+            )
+            sec_knowledge = (
+                f"## Repository Codebase Knowledge\n{repo_knowledge}"
+                if repo_knowledge else ""
+            )
+            sec_change = f"## Change Specification\n{change_spec}"
+            sec_code = (
+                f"## Current Code ({fname})\n```c\n{current_code}\n```\n\n"
+                "Fix all compiler errors and output the complete corrected file."
+            )
+
+            fix_sections = [
+                ("code", sec_code, 0),
+                ("errors", sec_errors, 0),
+                ("repo_ctx", sec_repo_ctx, 1),
+                ("knowledge", sec_knowledge, 2),
+                ("change_spec", sec_change, 3),
+            ]
+            sys_tokens = _estimate_tokens(fix_system)
+            fix_prompt = _assemble_prompt(
+                fix_sections,
+                max_input_tokens=MAX_INPUT_TOKENS - sys_tokens,
+            )
+
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": f"LLM fixing {fname}…",
+            })
+
+            try:
+                fix_pieces: list[str] = []
+                fix_output = _call_llm_complete(
+                    fix_system,
+                    fix_prompt,
+                    max_tokens=MAX_OUTPUT_TOKENS,
+                    max_passes=4,
+                    on_chunk=lambda c: fix_pieces.append(c),
+                )
+                for piece in fix_pieces:
+                    yield _sse({
+                        "type": "token",
+                        "stage": "sandbox_build",
+                        "token": piece,
+                    })
+
+                fixed_code = _extract_fenced(fix_output, "c").strip()
+                if fixed_code and _looks_complete_c_file(
+                    fixed_code, current_code, fname
+                ):
+                    (gen_dir / fname).write_text(fixed_code)
+                    if fname in replacement_map:
+                        replacement_map[fname].write_text(fixed_code)
+                    yield _sse({
+                        "type": "info",
+                        "stage": "sandbox_build",
+                        "message": f"Updated {fname} with LLM fix.",
+                    })
+                else:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "sandbox_build",
+                        "message": (
+                            f"LLM fix for {fname} was incomplete — "
+                            "keeping previous version for next attempt."
+                        ),
+                    })
+            except Exception as e:
+                log.warning("Sandbox LLM fix failed for %s: %s", fname, e)
+                yield _sse({
+                    "type": "info",
+                    "stage": "sandbox_build",
+                    "message": f"LLM fix error for {fname}: {e}",
+                })
+
+    _package_sandbox_zip(session_dir, sandbox_dir)
+
+    build_log_path = session_dir / "sandbox_build_log.txt"
+    build_log_path.write_text(last_output)
+
+    yield _sse({
+        "type": "sandbox_build_result",
+        "stage": "sandbox_build",
+        "success": build_success,
+        "message": (
+            "Sandbox build succeeded — repository packaged."
+            if build_success
+            else "Sandbox build did not fully succeed — best attempt packaged."
+        ),
+    })
+
+
+def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
+    """Write the sandbox directory to ``session_dir/built_repo.zip``."""
+    zip_path = session_dir / "built_repo.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fpath in sorted(sandbox_dir.rglob("*")):
+            if fpath.is_file():
+                arcname = str(fpath.relative_to(sandbox_dir))
+                zf.write(fpath, arcname)
+    log.info("Packaged sandbox as %s (%d bytes)", zip_path, zip_path.stat().st_size)
+    return zip_path
 
 
 def _assemble_prompt(
@@ -1800,13 +2183,47 @@ async def process(session_id: str):
             report_path.write_text("\n".join(report_lines) + "\n")
             yield _sse({"type": "stage_complete", "stage": "verification"})
 
+        # ---- Step 4: Sandbox build ------------------------------------
+        sandbox_build_success = None
+        if has_repo:
+            yield _sse({
+                "type": "stage",
+                "stage": "sandbox_build",
+                "message": "Building generated code inside repository sandbox\u2026",
+            })
+            for evt in _sandbox_build_iterate(
+                session_dir=session_dir,
+                gen_dir=gen_dir,
+                repo_dir=repo_dir,
+                change_spec=change_spec,
+                uploaded_names=uploaded_names,
+                has_repo=has_repo,
+                repo_knowledge=repo_knowledge,
+            ):
+                yield evt
+                try:
+                    payload = json.loads(
+                        evt.split("data: ", 1)[1].split("\n", 1)[0]
+                    )
+                    if payload.get("type") == "sandbox_build_result":
+                        sandbox_build_success = payload.get("success", False)
+                except Exception:
+                    pass
+            yield _sse({"type": "stage_complete", "stage": "sandbox_build"})
+
+            status["sandbox_build_success"] = sandbox_build_success
+            (session_dir / "status.json").write_text(json.dumps(status))
+
         # ---- Done -----------------------------------------------------
         status["state"] = "completed"
         status["generated_files"] = sorted(
             p.name for p in gen_dir.iterdir() if p.is_file()
         )
         (session_dir / "status.json").write_text(json.dumps(status))
-        yield _sse({"type": "complete", "files": status["generated_files"]})
+        complete_payload = {"type": "complete", "files": status["generated_files"]}
+        if sandbox_build_success is not None:
+            complete_payload["sandbox_build"] = sandbox_build_success
+        yield _sse(complete_payload)
 
     return StreamingResponse(
         event_stream(),
@@ -1848,6 +2265,14 @@ async def download_all(session_id: str):
         if vr.exists():
             zf.write(vr, "verification_report.txt")
             log.info("Added verification_report.txt")
+        built_repo = session_dir / "built_repo.zip"
+        if built_repo.exists():
+            zf.write(built_repo, "built_repo.zip")
+            log.info("Added built_repo.zip")
+        build_log = session_dir / "sandbox_build_log.txt"
+        if build_log.exists():
+            zf.write(build_log, "sandbox_build_log.txt")
+            log.info("Added sandbox_build_log.txt")
     buf.seek(0)
 
     return StreamingResponse(
@@ -1856,6 +2281,32 @@ async def download_all(session_id: str):
         headers={
             "Content-Disposition": (
                 f"attachment; filename=refactored_code_{session_id[:8]}.zip"
+            )
+        },
+    )
+
+
+@app.get("/api/download-repo/{session_id}")
+async def download_repo(session_id: str):
+    """Download just the built repository ZIP (sandbox output)."""
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    built_repo = session_dir / "built_repo.zip"
+    if not built_repo.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="No built repository available (sandbox build may not have run)",
+        )
+
+    buf = io.BytesIO(built_repo.read_bytes())
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=built_repo_{session_id[:8]}.zip"
             )
         },
     )
@@ -2473,6 +2924,37 @@ async def regenerate(session_id: str):
             )
             yield _sse({"type": "stage_complete", "stage": "verification"})
 
+        # ---- Sandbox build (re-generation) ----
+        sandbox_build_success = None
+        if has_repo:
+            yield _sse({
+                "type": "stage",
+                "stage": "sandbox_build",
+                "message": "Building re-generated code inside repository sandbox\u2026",
+            })
+            for evt in _sandbox_build_iterate(
+                session_dir=session_dir,
+                gen_dir=gen_dir,
+                repo_dir=repo_dir,
+                change_spec=change_spec,
+                uploaded_names=uploaded_names,
+                has_repo=has_repo,
+                repo_knowledge=repo_knowledge,
+            ):
+                yield evt
+                try:
+                    payload = json.loads(
+                        evt.split("data: ", 1)[1].split("\n", 1)[0]
+                    )
+                    if payload.get("type") == "sandbox_build_result":
+                        sandbox_build_success = payload.get("success", False)
+                except Exception:
+                    pass
+            yield _sse({"type": "stage_complete", "stage": "sandbox_build"})
+
+            status["sandbox_build_success"] = sandbox_build_success
+            (session_dir / "status.json").write_text(json.dumps(status))
+
         # ---- Done ----
         conv_updated = json.loads(conv_path.read_text()) if conv_path.exists() else []
         conv_updated.append({
@@ -2492,7 +2974,10 @@ async def regenerate(session_id: str):
             p.name for p in gen_dir.iterdir() if p.is_file()
         )
         (session_dir / "status.json").write_text(json.dumps(status))
-        yield _sse({"type": "complete", "files": status["generated_files"]})
+        complete_payload = {"type": "complete", "files": status["generated_files"]}
+        if sandbox_build_success is not None:
+            complete_payload["sandbox_build"] = sandbox_build_success
+        yield _sse(complete_payload)
 
     return StreamingResponse(
         event_stream(),
