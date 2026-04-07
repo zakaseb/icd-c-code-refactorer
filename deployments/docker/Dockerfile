@@ -11,9 +11,8 @@ RUN apt-get update \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
 
-RUN python3 -m pip install --no-cache-dir -U --break-system-packages \
-huggingface_hub hf_transfer 'litellm[proxy]' \
-fastapi 'uvicorn[standard]' httpx PyMuPDF python-multipart
+RUN python3 -m pip install --no-cache-dir -U huggingface_hub hf_transfer 'litellm[proxy]' \
+    fastapi 'uvicorn[standard]' httpx PyMuPDF python-multipart
 
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y nodejs \
