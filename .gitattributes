@@ -1,0 +1,23 @@
+#  Refer to the https://git-scm.com/docs/gitattributes page for help with attributes.
+# Word documents
+*.doc filter=lfs diff=lfs merge=lfs -text lockable
+*.docx filter=lfs diff=lfs merge=lfs -text lockable
+# Pdf documents
+*.pdf filter=lfs diff=lfs merge=lfs -text lockable
+# Powerpoint presentations
+*.pptx filter=lfs diff=lfs merge=lfs -text lockable
+# Excel workbooks
+*.xlsx filter=lfs diff=lfs merge=lfs -text lockable
+*.csv filter=lfs diff=lfs merge=lfs -text lockable
+# Simulink models
+*.slx filter=lfs diff=lfs merge=lfs -text lockable
+*.mdl filter=lfs diff=lfs merge=lfs text
+# Matlab data files
+*.mat filter=lfs diff=lfs merge=lfs -text
+## Python COde
+*.ipynb filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+## Dll file
+*.dll filter=lfs diff=lfs merge=lfs -text

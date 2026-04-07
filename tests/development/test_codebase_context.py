@@ -11,7 +11,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "webapp"))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "api"))
 
 os.environ["WORKSPACE_DIR"] = tempfile.mkdtemp(prefix="icd_test_")
 

@@ -77,8 +77,8 @@ ENV ANTHROPIC_MODEL="openai/$HF_MODEL"
 ENV ANTHROPIC_SMALL_FAST_MODEL="openai/$HF_MODEL"
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
-COPY --chown=developer:developer entrypoint.sh /home/developer/entrypoint.sh
-COPY --chown=developer:developer hf_download.py /home/developer/hf_download.py
-COPY --chown=developer:developer webapp /home/developer/webapp
+COPY --chown=developer:developer deployments/docker/entrypoint.sh /home/developer/entrypoint.sh
+COPY --chown=developer:developer src/utils/hf_download.py /home/developer/hf_download.py
+COPY --chown=developer:developer api /home/developer/webapp
 
 ENTRYPOINT [ "/home/developer/entrypoint.sh" ]
