@@ -4,7 +4,7 @@ ARG USER_ID=1000
 ARG GROUP_ID=1000
 
 RUN apt-get update \
-    && apt-get install -y vim git curl tmux python3 python3-pip sudo \
+    && apt-get install -y vim git curl tmux python3 python3-pip sudo build-essential cmake \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \

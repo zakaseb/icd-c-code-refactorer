@@ -28,6 +28,7 @@
   const resultTabs     = document.getElementById('result-tabs');
   const codePreview    = document.getElementById('code-preview');
   const downloadBtn    = document.getElementById('download-btn');
+  const downloadRepoBtn = document.getElementById('download-repo-btn');
   const convSection    = document.getElementById('conversation-section');
   const convMessages   = document.getElementById('conversation-messages');
   const convInput      = document.getElementById('conversation-input');
@@ -234,6 +235,8 @@
     const fileSteps = {};
     let generatedFiles = [];
     let verificationStep = null;
+    let sandboxStep = null;
+    let hasSandboxBuild = false;
 
     const es = new EventSource('/api/process/' + sessionId);
 
@@ -245,6 +248,7 @@
           let step;
           if (msg.stage === 'analysis') step = analysisStep;
           else if (msg.stage === 'verification') step = verificationStep;
+          else if (msg.stage === 'sandbox_build') step = sandboxStep;
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
             const o = step.querySelector('.step-output');
@@ -268,6 +272,12 @@
             pipelineSteps.appendChild(verificationStep);
             setStepStatus(verificationStep, 'running');
             verificationStep.querySelector('.step-output').classList.add('visible');
+          } else if (msg.stage === 'sandbox_build' && !sandboxStep) {
+            sandboxStep = createStep('sandbox-build',
+              'Building generated code in sandbox environment\u2026');
+            pipelineSteps.appendChild(sandboxStep);
+            setStepStatus(sandboxStep, 'running');
+            sandboxStep.querySelector('.step-output').classList.add('visible');
           }
           break;
 
@@ -278,6 +288,9 @@
           } else if (msg.stage === 'verification' && verificationStep) {
             setStepStatus(verificationStep, 'complete');
             verificationStep.querySelector('.step-label').textContent = 'Verification complete';
+          } else if (msg.stage === 'sandbox_build' && sandboxStep) {
+            setStepStatus(sandboxStep, 'complete');
+            sandboxStep.querySelector('.step-label').textContent = 'Sandbox build complete';
           }
           break;
 
@@ -289,6 +302,19 @@
           }
           break;
 
+        case 'sandbox_build_result':
+          if (sandboxStep) {
+            hasSandboxBuild = true;
+            if (msg.success) {
+              sandboxStep.querySelector('.step-label').textContent =
+                'Sandbox build succeeded \u2014 repository packaged';
+            } else {
+              sandboxStep.querySelector('.step-label').textContent =
+                'Sandbox build incomplete \u2014 best attempt packaged';
+            }
+          }
+          break;
+
         case 'info': {
           if (msg.stage === 'analysis') {
             const out = analysisStep.querySelector('.step-output');
@@ -297,6 +323,10 @@
             out.scrollTop = out.scrollHeight;
           } else if (msg.stage === 'verification' && verificationStep) {
             const out = verificationStep.querySelector('.step-output');
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+          } else if (msg.stage === 'sandbox_build' && sandboxStep) {
+            const out = sandboxStep.querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
           } else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
@@ -329,7 +359,8 @@
         case 'complete':
           es.close();
           generatedFiles = msg.files || [];
-          showResults(generatedFiles);
+          if (msg.sandbox_build !== undefined) hasSandboxBuild = true;
+          showResults(generatedFiles, hasSandboxBuild);
           break;
       }
     };
@@ -352,7 +383,7 @@
 
   /* ----- Results ------------------------------------------------- */
 
-  function showResults(files) {
+  function showResults(files, sandboxBuild) {
     if (!files.length) return;
     resultsSection.classList.remove('hidden');
     convSection.classList.remove('hidden');
@@ -366,6 +397,13 @@
       resultTabs.appendChild(tab);
     });
     loadPreview(files[0]);
+    if (downloadRepoBtn) {
+      if (sandboxBuild) {
+        downloadRepoBtn.classList.remove('hidden');
+      } else {
+        downloadRepoBtn.classList.add('hidden');
+      }
+    }
   }
 
   async function loadPreview(filename) {
@@ -400,6 +438,7 @@
     regenerateBtn.disabled = true;
     pipelineSteps.innerHTML = '';
     resetBtn.style.display = 'none';
+    if (downloadRepoBtn) downloadRepoBtn.classList.add('hidden');
     inputCode.value = '';
     inputSourceIcd.value = '';
     inputTargetIcd.value = '';
@@ -473,6 +512,8 @@
     var generatedFiles = [];
     var verificationStep = null;
     var regenInfoDone = false;
+    var sandboxStep = null;
+    var hasSandboxBuild = false;
 
     var es = new EventSource('/api/regenerate/' + sessionId);
 
@@ -484,6 +525,7 @@
           var step;
           if (msg.stage === 'regeneration') step = regenStep;
           else if (msg.stage === 'verification') step = verificationStep;
+          else if (msg.stage === 'sandbox_build') step = sandboxStep;
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
             var o = step.querySelector('.step-output');
@@ -510,6 +552,12 @@
             pipelineSteps.appendChild(verificationStep);
             setStepStatus(verificationStep, 'running');
             verificationStep.querySelector('.step-output').classList.add('visible');
+          } else if (msg.stage === 'sandbox_build' && !sandboxStep) {
+            sandboxStep = createStep('sandbox-build',
+              'Building re-generated code in sandbox environment\u2026');
+            pipelineSteps.appendChild(sandboxStep);
+            setStepStatus(sandboxStep, 'running');
+            sandboxStep.querySelector('.step-output').classList.add('visible');
           }
           break;
 
@@ -517,6 +565,9 @@
           if (msg.stage === 'verification' && verificationStep) {
             setStepStatus(verificationStep, 'complete');
             verificationStep.querySelector('.step-label').textContent = 'Verification complete';
+          } else if (msg.stage === 'sandbox_build' && sandboxStep) {
+            setStepStatus(sandboxStep, 'complete');
+            sandboxStep.querySelector('.step-label').textContent = 'Sandbox build complete';
           }
           break;
 
@@ -528,10 +579,24 @@
           }
           break;
 
+        case 'sandbox_build_result':
+          if (sandboxStep) {
+            hasSandboxBuild = true;
+            if (msg.success) {
+              sandboxStep.querySelector('.step-label').textContent =
+                'Sandbox build succeeded \u2014 repository packaged';
+            } else {
+              sandboxStep.querySelector('.step-label').textContent =
+                'Sandbox build incomplete \u2014 best attempt packaged';
+            }
+          }
+          break;
+
         case 'info': {
           var target;
           if (msg.stage === 'regeneration') target = regenStep;
           else if (msg.stage === 'verification' && verificationStep) target = verificationStep;
+          else if (msg.stage === 'sandbox_build' && sandboxStep) target = sandboxStep;
           else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) target = fileSteps[msg.file];
           if (target) {
             var out = target.querySelector('.step-output');
@@ -563,7 +628,8 @@
         case 'complete':
           es.close();
           generatedFiles = msg.files || [];
-          showResults(generatedFiles);
+          if (msg.sandbox_build !== undefined) hasSandboxBuild = true;
+          showResults(generatedFiles, hasSandboxBuild);
           regenerateBtn.disabled = true;
           sendMsgBtn.disabled = false;
           refreshConversation();
@@ -630,6 +696,11 @@
   downloadBtn.addEventListener('click', () => {
     if (sessionId) window.location.href = '/api/download/' + sessionId;
   });
+  if (downloadRepoBtn) {
+    downloadRepoBtn.addEventListener('click', () => {
+      if (sessionId) window.location.href = '/api/download-repo/' + sessionId;
+    });
+  }
   sendMsgBtn.addEventListener('click', sendMessage);
   regenerateBtn.addEventListener('click', runRegenerate);
   convInput.addEventListener('keydown', function (e) {

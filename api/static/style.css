@@ -343,6 +343,13 @@ main {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 1rem;
+  flex-wrap: wrap;
+  gap: .75rem;
+}
+.download-buttons {
+  display: flex;
+  gap: .5rem;
+  flex-wrap: wrap;
 }
 .results-header h2 {
   font-size: 1.2rem;
