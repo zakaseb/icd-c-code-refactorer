@@ -105,10 +105,18 @@ PY
   echo "Continuing without GPU acceleration (inference will be slow)."
 fi
 
-docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
+GPU_DOCKER_ARGS="--gpus all"
+GPU_ENV_ARGS=""
+if [ "$GPU_OK" -ne 1 ]; then
+  GPU_DOCKER_ARGS=""
+  GPU_ENV_ARGS="-e LLAMA_ARG_N_GPU_LAYERS=0"
+fi
+
+docker run -ti --rm --name icd-c-code-refactorer --network=host $GPU_DOCKER_ARGS \
   -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
   -e LLAMA_ARG_CTX_SIZE=32768 \
   -e LLAMA_ARG_N_PREDICT=32768 \
+  $GPU_ENV_ARGS \
   -v "$PROJECT_ROOT/models":/home/developer/models \
   -v "$PROJECT_ROOT/workspace":/home/developer/workspace \
   icd-c-code-refactorer:llama.cpp
