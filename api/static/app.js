@@ -306,8 +306,13 @@
           if (sandboxStep) {
             hasSandboxBuild = true;
             const attempts = msg.iterations ? ` in ${msg.iterations} attempt${msg.iterations > 1 ? 's' : ''}` : '';
-            sandboxStep.querySelector('.step-label').textContent =
-              `Sandbox build succeeded${attempts} \u2014 repository packaged`;
+            if (msg.success) {
+              sandboxStep.querySelector('.step-label').textContent =
+                `Sandbox build succeeded${attempts} \u2014 repository packaged`;
+            } else {
+              sandboxStep.querySelector('.step-label').textContent =
+                `Sandbox build stalled${attempts} \u2014 best attempt packaged`;
+            }
           }
           break;
 
@@ -579,8 +584,13 @@
           if (sandboxStep) {
             hasSandboxBuild = true;
             var reAttempts = msg.iterations ? ` in ${msg.iterations} attempt${msg.iterations > 1 ? 's' : ''}` : '';
-            sandboxStep.querySelector('.step-label').textContent =
-              `Sandbox build succeeded${reAttempts} \u2014 repository packaged`;
+            if (msg.success) {
+              sandboxStep.querySelector('.step-label').textContent =
+                `Sandbox build succeeded${reAttempts} \u2014 repository packaged`;
+            } else {
+              sandboxStep.querySelector('.step-label').textContent =
+                `Sandbox build stalled${reAttempts} \u2014 best attempt packaged`;
+            }
           }
           break;
 
