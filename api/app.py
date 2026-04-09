@@ -863,12 +863,20 @@ def _find_file_in_repo(repo_dir: Path, filename: str) -> list[Path]:
     return matches
 
 
+SANDBOX_CC = "gcc -std=c99 -pedantic"
+
 def _run_sandbox_build(
     sandbox_dir: Path,
     build_info: dict,
     timeout: int = SANDBOX_BUILD_TIMEOUT,
 ) -> tuple[bool, str]:
     """Execute the build command inside *sandbox_dir*.
+
+    Builds are run with ``CC="gcc -std=c99 -pedantic"`` so the sandbox
+    approximates GCC 7.3.1 / Xilinx SDK 2018.x constraints even though
+    the host has a newer GCC.  The ``-std=c99`` acts as a floor; if the
+    project's own Makefile/CMakeLists specifies a different standard via
+    CFLAGS it will take precedence (the last ``-std=`` wins).
 
     Returns ``(success, combined_output)`` where *combined_output* contains
     both stdout and stderr from the build.
@@ -877,11 +885,16 @@ def _run_sandbox_build(
     bdir = build_info["build_dir"]
 
     if btype == "make":
-        cmd = f"make -C {bdir} clean 2>/dev/null; make -C {bdir} 2>&1"
+        cmd = (
+            f"make -C {bdir} CC='{SANDBOX_CC}' clean 2>/dev/null; "
+            f"make -C {bdir} CC='{SANDBOX_CC}' 2>&1"
+        )
     elif btype == "cmake":
         cmake_build = bdir / "_cmake_build"
         cmd = (
-            f"cmake -S {bdir} -B {cmake_build} 2>&1 && "
+            f"cmake -S {bdir} -B {cmake_build} "
+            f'-DCMAKE_C_COMPILER=gcc '
+            f'-DCMAKE_C_FLAGS="-std=c99 -pedantic" 2>&1 && '
             f"cmake --build {cmake_build} 2>&1"
         )
     else:
@@ -1082,13 +1095,22 @@ def _sandbox_build_iterate(
                 "You are an expert C programmer. The code below failed to compile "
                 "inside its repository. Fix ALL compiler errors while maintaining "
                 "full ICD compliance and repository compatibility.\n\n"
+                "TARGET TOOLCHAIN:\n"
+                "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
+                "- C standard: C99 (use -std=c99 compatible constructs only)\n"
+                "- C library: newlib (NOT glibc) — no asprintf, getline, strdup, "
+                "strndup, vasprintf or other glibc-specific functions\n"
+                "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
+                "- No POSIX headers — embedded freestanding environment\n"
+                "- Avoid GCC extensions added after GCC 7\n\n"
                 "RULES:\n"
                 "1. Output ONLY the complete, corrected C source file\n"
                 "2. Fix every error shown in the compiler output\n"
                 "3. Do NOT remove or stub out functionality\n"
                 "4. Preserve the code's architecture and naming conventions\n"
                 "5. Ensure #include paths are correct for the repository\n"
-                "6. Wrap the output in ```c ... ``` fences"
+                "6. Ensure the code compiles cleanly with GCC 7.3.1 -std=c99\n"
+                "7. Wrap the output in ```c ... ``` fences"
             )
 
             sec_errors = (
@@ -1768,6 +1790,15 @@ async def process(session_id: str):
                 "You are an expert C programmer specializing in embedded systems "
                 "and interface implementations governed by Interface Control "
                 "Documents.\n\n"
+                "TARGET TOOLCHAIN:\n"
+                "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
+                "- C standard: C99 (use -std=c99 compatible constructs only)\n"
+                "- C library: newlib (NOT glibc) — do NOT use glibc-specific "
+                "functions (e.g. asprintf, getline, strdup, strndup, vasprintf)\n"
+                "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
+                "- No POSIX headers (unistd.h, sys/*.h) — embedded freestanding\n"
+                "- Avoid GCC extensions added after GCC 7 (no __attribute__((access)), "
+                "no __builtin_expect_with_probability, etc.)\n\n"
                 "RULES:\n"
                 "1. Output ONLY the complete, transformed C source code\n"
                 "2. Preserve the overall code architecture, style, and conventions\n"
@@ -1776,7 +1807,7 @@ async def process(session_id: str):
                 "4. Update data structures, function signatures, constants, enums, "
                 "macros\n"
                 "5. Update comments/doc-strings to reflect the new ICD version\n"
-                "6. Ensure type correctness and compilability\n"
+                "6. Ensure type correctness and compilability with GCC 7.3.1\n"
                 "7. Keep header/source consistency across the project\n"
                 "8. Do NOT add prose explanations — only output C code\n"
                 "9. Wrap the entire output in ```c ... ``` fences\n"
@@ -2494,6 +2525,15 @@ async def regenerate(session_id: str):
             transform_system = (
                 "You are an expert C programmer specializing in embedded systems "
                 "and interface implementations governed by Interface Control Documents.\n\n"
+                "TARGET TOOLCHAIN:\n"
+                "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
+                "- C standard: C99 (use -std=c99 compatible constructs only)\n"
+                "- C library: newlib (NOT glibc) — do NOT use glibc-specific "
+                "functions (e.g. asprintf, getline, strdup, strndup, vasprintf)\n"
+                "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
+                "- No POSIX headers (unistd.h, sys/*.h) — embedded freestanding\n"
+                "- Avoid GCC extensions added after GCC 7 (no __attribute__((access)), "
+                "no __builtin_expect_with_probability, etc.)\n\n"
                 "The user has previously generated code that had issues (build errors, "
                 "warnings, or other problems). You must re-generate the code fixing ALL "
                 "reported issues while maintaining full ICD compliance.\n\n"
@@ -2509,7 +2549,7 @@ async def regenerate(session_id: str):
                 "2. Fix ALL issues described in the user feedback/error logs\n"
                 "3. Apply ALL changes required by the target ICD per the change specification\n"
                 "4. Preserve the overall code architecture, style, and conventions\n"
-                "5. Ensure type correctness and compilability\n"
+                "5. Ensure type correctness and compilability with GCC 7.3.1\n"
                 "6. Keep header/source consistency across the project\n"
                 "7. Do NOT add prose explanations — only output C code\n"
                 "8. Wrap the entire output in ```c ... ``` fences\n"
