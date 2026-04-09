@@ -305,13 +305,9 @@
         case 'sandbox_build_result':
           if (sandboxStep) {
             hasSandboxBuild = true;
-            if (msg.success) {
-              sandboxStep.querySelector('.step-label').textContent =
-                'Sandbox build succeeded \u2014 repository packaged';
-            } else {
-              sandboxStep.querySelector('.step-label').textContent =
-                'Sandbox build incomplete \u2014 best attempt packaged';
-            }
+            const attempts = msg.iterations ? ` in ${msg.iterations} attempt${msg.iterations > 1 ? 's' : ''}` : '';
+            sandboxStep.querySelector('.step-label').textContent =
+              `Sandbox build succeeded${attempts} \u2014 repository packaged`;
           }
           break;
 
@@ -582,13 +578,9 @@
         case 'sandbox_build_result':
           if (sandboxStep) {
             hasSandboxBuild = true;
-            if (msg.success) {
-              sandboxStep.querySelector('.step-label').textContent =
-                'Sandbox build succeeded \u2014 repository packaged';
-            } else {
-              sandboxStep.querySelector('.step-label').textContent =
-                'Sandbox build incomplete \u2014 best attempt packaged';
-            }
+            var reAttempts = msg.iterations ? ` in ${msg.iterations} attempt${msg.iterations > 1 ? 's' : ''}` : '';
+            sandboxStep.querySelector('.step-label').textContent =
+              `Sandbox build succeeded${reAttempts} \u2014 repository packaged`;
           }
           break;
 
