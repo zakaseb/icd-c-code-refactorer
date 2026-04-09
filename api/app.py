@@ -72,7 +72,6 @@ CTX_SIZE_TOKENS = int(os.environ.get("LLAMA_ARG_CTX_SIZE", "32768"))
 MAX_OUTPUT_TOKENS = 4096
 MAX_INPUT_TOKENS = CTX_SIZE_TOKENS - MAX_OUTPUT_TOKENS
 
-MAX_SANDBOX_ITERATIONS = 5
 SANDBOX_BUILD_TIMEOUT = 120
 
 
@@ -937,8 +936,8 @@ def _sandbox_build_iterate(
     """Generator that yields SSE dicts for the sandbox build loop.
 
     Copies the repo, injects generated files, builds, and iteratively fixes
-    compiler errors via the LLM until the build succeeds or the iteration
-    limit is reached.
+    compiler errors via the LLM until the build succeeds.  There is no
+    iteration limit — the loop runs until compilation passes.
     """
     sandbox_dir = session_dir / "sandbox"
     if sandbox_dir.exists():
@@ -1012,17 +1011,32 @@ def _sandbox_build_iterate(
         })
         return
 
-    build_success = False
-    last_output = ""
-    for iteration in range(1, MAX_SANDBOX_ITERATIONS + 1):
+    build_log_lines: list[str] = [
+        "=" * 65,
+        "SANDBOX BUILD LOG",
+        "=" * 65,
+        f"\nBuild system: {build_info['type']}",
+        f"Build file:   {build_info['path'].relative_to(sandbox_dir) if build_info['path'] else 'N/A'}",
+        f"Files injected: {', '.join(sorted(gen_filenames))}",
+        "",
+    ]
+
+    iteration = 0
+    while True:
+        iteration += 1
         yield _sse({
             "type": "info",
             "stage": "sandbox_build",
-            "message": f"Build attempt {iteration}/{MAX_SANDBOX_ITERATIONS}…",
+            "message": f"Build attempt {iteration}…",
         })
 
+        build_log_lines.append("-" * 65)
+        build_log_lines.append(f"BUILD ATTEMPT {iteration}")
+        build_log_lines.append("-" * 65)
+
         success, output = _run_sandbox_build(sandbox_dir, build_info)
-        last_output = output
+
+        build_log_lines.append(f"\n{output}\n")
 
         yield _sse({
             "type": "token",
@@ -1031,7 +1045,7 @@ def _sandbox_build_iterate(
         })
 
         if success:
-            build_success = True
+            build_log_lines.append(f"\n>>> BUILD SUCCEEDED on attempt {iteration}\n")
             yield _sse({
                 "type": "info",
                 "stage": "sandbox_build",
@@ -1039,26 +1053,19 @@ def _sandbox_build_iterate(
             })
             break
 
-        if iteration >= MAX_SANDBOX_ITERATIONS:
-            yield _sse({
-                "type": "info",
-                "stage": "sandbox_build",
-                "message": (
-                    f"Build still failing after {MAX_SANDBOX_ITERATIONS} attempts. "
-                    "Packaging best attempt."
-                ),
-            })
-            break
+        build_log_lines.append(f"\n>>> BUILD FAILED on attempt {iteration}\n")
 
         yield _sse({
             "type": "info",
             "stage": "sandbox_build",
-            "message": f"Build failed — feeding errors to LLM for iteration {iteration + 1}…",
+            "message": f"Build failed — feeding errors to LLM for attempt {iteration + 1}…",
         })
 
         file_errors = _parse_error_files(output, gen_filenames)
         for fname, errors in file_errors.items():
             current_code = (gen_dir / fname).read_text()
+
+            build_log_lines.append(f"\n--- LLM fix: {fname} (after attempt {iteration}) ---")
 
             file_repo_ctx = ""
             if has_repo:
@@ -1144,12 +1151,16 @@ def _sandbox_build_iterate(
                     (gen_dir / fname).write_text(fixed_code)
                     if fname in replacement_map:
                         replacement_map[fname].write_text(fixed_code)
+                    build_log_lines.append(f"Applied LLM fix to {fname}")
                     yield _sse({
                         "type": "info",
                         "stage": "sandbox_build",
                         "message": f"Updated {fname} with LLM fix.",
                     })
                 else:
+                    build_log_lines.append(
+                        f"LLM fix for {fname} was incomplete — kept previous version"
+                    )
                     yield _sse({
                         "type": "info",
                         "stage": "sandbox_build",
@@ -1160,26 +1171,34 @@ def _sandbox_build_iterate(
                     })
             except Exception as e:
                 log.warning("Sandbox LLM fix failed for %s: %s", fname, e)
+                build_log_lines.append(f"LLM fix error for {fname}: {e}")
                 yield _sse({
                     "type": "info",
                     "stage": "sandbox_build",
                     "message": f"LLM fix error for {fname}: {e}",
                 })
 
+    build_log_lines.extend([
+        "",
+        "=" * 65,
+        "SUMMARY",
+        "=" * 65,
+        f"Total build attempts: {iteration}",
+        f"Result: BUILD SUCCEEDED",
+        "",
+    ])
+
     _package_sandbox_zip(session_dir, sandbox_dir)
 
     build_log_path = session_dir / "sandbox_build_log.txt"
-    build_log_path.write_text(last_output)
+    build_log_path.write_text("\n".join(build_log_lines) + "\n")
 
     yield _sse({
         "type": "sandbox_build_result",
         "stage": "sandbox_build",
-        "success": build_success,
-        "message": (
-            "Sandbox build succeeded — repository packaged."
-            if build_success
-            else "Sandbox build did not fully succeed — best attempt packaged."
-        ),
+        "success": True,
+        "iterations": iteration,
+        "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
 
 
