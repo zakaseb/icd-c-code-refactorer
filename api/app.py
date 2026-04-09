@@ -937,6 +937,19 @@ def _parse_error_files(build_output: str, gen_filenames: set[str]) -> dict[str, 
     return result
 
 
+_ERROR_LINE_RE = re.compile(r"^(.+?:\d+:\d+:\s*(?:error|warning):\s*)(.+)$", re.MULTILINE)
+
+def _normalise_error_signature(build_output: str) -> str:
+    """Produce a stable fingerprint of compiler errors in *build_output*.
+
+    Strips line numbers and paths so that the same logical errors across
+    different iterations (where line numbers may shift due to code edits)
+    still compare as equal.  Returns an empty string if no errors found.
+    """
+    msgs = sorted({m.group(2).strip() for m in _ERROR_LINE_RE.finditer(build_output)})
+    return "\n".join(msgs)
+
+
 def _sandbox_build_iterate(
     session_dir: Path,
     gen_dir: Path,
@@ -1034,6 +1047,32 @@ def _sandbox_build_iterate(
         "",
     ]
 
+    fix_system = (
+        "You are an expert C programmer. The code below failed to compile "
+        "inside its repository. Fix ALL compiler errors while maintaining "
+        "full ICD compliance and repository compatibility.\n\n"
+        "TARGET TOOLCHAIN:\n"
+        "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
+        "- C standard: C99 (use -std=c99 compatible constructs only)\n"
+        "- C library: newlib (NOT glibc) — no asprintf, getline, strdup, "
+        "strndup, vasprintf or other glibc-specific functions\n"
+        "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
+        "- No POSIX headers — embedded freestanding environment\n"
+        "- Avoid GCC extensions added after GCC 7\n\n"
+        "RULES:\n"
+        "1. Output ONLY the complete, corrected C source file\n"
+        "2. Fix every error shown in the compiler output\n"
+        "3. Do NOT remove or stub out functionality\n"
+        "4. Preserve the code's architecture and naming conventions\n"
+        "5. Ensure #include paths are correct for the repository\n"
+        "6. Ensure the code compiles cleanly with GCC 7.3.1 -std=c99\n"
+        "7. Wrap the output in ```c ... ``` fences"
+    )
+
+    MAX_STALL_REPEATS = 3
+    prev_error_sig: str | None = None
+    stall_count = 0
+
     iteration = 0
     while True:
         iteration += 1
@@ -1068,6 +1107,30 @@ def _sandbox_build_iterate(
 
         build_log_lines.append(f"\n>>> BUILD FAILED on attempt {iteration}\n")
 
+        error_sig = _normalise_error_signature(output)
+        if error_sig and error_sig == prev_error_sig:
+            stall_count += 1
+        else:
+            stall_count = 0
+        prev_error_sig = error_sig
+
+        if stall_count >= MAX_STALL_REPEATS:
+            build_log_lines.append(
+                f"\n>>> STALL DETECTED: identical errors for "
+                f"{MAX_STALL_REPEATS + 1} consecutive attempts — stopping.\n"
+            )
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"Identical compiler errors repeated for "
+                    f"{MAX_STALL_REPEATS + 1} consecutive attempts — "
+                    "stopping to avoid an infinite loop. "
+                    "Use 'Regenerate' with feedback describing the issue."
+                ),
+            })
+            break
+
         yield _sse({
             "type": "info",
             "stage": "sandbox_build",
@@ -1090,28 +1153,6 @@ def _sandbox_build_iterate(
                     file_repo_ctx = _build_repo_context(
                         repo_dir, exclude_names=uploaded_names,
                     )
-
-            fix_system = (
-                "You are an expert C programmer. The code below failed to compile "
-                "inside its repository. Fix ALL compiler errors while maintaining "
-                "full ICD compliance and repository compatibility.\n\n"
-                "TARGET TOOLCHAIN:\n"
-                "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
-                "- C standard: C99 (use -std=c99 compatible constructs only)\n"
-                "- C library: newlib (NOT glibc) — no asprintf, getline, strdup, "
-                "strndup, vasprintf or other glibc-specific functions\n"
-                "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
-                "- No POSIX headers — embedded freestanding environment\n"
-                "- Avoid GCC extensions added after GCC 7\n\n"
-                "RULES:\n"
-                "1. Output ONLY the complete, corrected C source file\n"
-                "2. Fix every error shown in the compiler output\n"
-                "3. Do NOT remove or stub out functionality\n"
-                "4. Preserve the code's architecture and naming conventions\n"
-                "5. Ensure #include paths are correct for the repository\n"
-                "6. Ensure the code compiles cleanly with GCC 7.3.1 -std=c99\n"
-                "7. Wrap the output in ```c ... ``` fences"
-            )
 
             sec_errors = (
                 f"## Compiler Errors\n```\n"
@@ -1151,20 +1192,50 @@ def _sandbox_build_iterate(
             })
 
             try:
-                fix_pieces: list[str] = []
-                fix_output = _call_llm_complete(
-                    fix_system,
-                    fix_prompt,
-                    max_tokens=MAX_OUTPUT_TOKENS,
-                    max_passes=4,
-                    on_chunk=lambda c: fix_pieces.append(c),
-                )
-                for piece in fix_pieces:
+                fix_parts: list[str] = []
+                meta: dict = {}
+                for chunk in _call_llm_stream(
+                    fix_system, fix_prompt,
+                    max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
+                ):
+                    fix_parts.append(chunk)
                     yield _sse({
                         "type": "token",
                         "stage": "sandbox_build",
-                        "token": piece,
+                        "token": chunk,
                     })
+                fix_output = "".join(fix_parts).strip()
+
+                for cont_pass in range(1, 4):
+                    if meta.get("finish_reason") != "length":
+                        break
+                    log.info("Sandbox LLM fix for %s: pass %d truncated, continuing…",
+                             fname, cont_pass)
+                    yield _sse({
+                        "type": "info",
+                        "stage": "sandbox_build",
+                        "message": f"Response truncated — continuing pass {cont_pass + 1}…",
+                    })
+                    tail = fix_output[-2000:] if len(fix_output) > 2000 else fix_output
+                    cont_prompt = (
+                        "Your previous response was cut off due to length limits. "
+                        "Here is the end of what you wrote:\n\n"
+                        f"---\n{tail}\n---\n\n"
+                        "Continue EXACTLY from where you left off. "
+                        "Do not repeat already-written content."
+                    )
+                    meta = {}
+                    for chunk in _call_llm_stream(
+                        fix_system, cont_prompt,
+                        max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
+                    ):
+                        fix_parts.append(chunk)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": chunk,
+                        })
+                    fix_output = "".join(fix_parts).strip()
 
                 fixed_code = _extract_fenced(fix_output, "c").strip()
                 if fixed_code and _looks_complete_c_file(
@@ -1200,13 +1271,16 @@ def _sandbox_build_iterate(
                     "message": f"LLM fix error for {fname}: {e}",
                 })
 
+    build_success = success
+
+    result_label = "BUILD SUCCEEDED" if build_success else "STALLED (identical errors)"
     build_log_lines.extend([
         "",
         "=" * 65,
         "SUMMARY",
         "=" * 65,
         f"Total build attempts: {iteration}",
-        f"Result: BUILD SUCCEEDED",
+        f"Result: {result_label}",
         "",
     ])
 
@@ -1218,9 +1292,16 @@ def _sandbox_build_iterate(
     yield _sse({
         "type": "sandbox_build_result",
         "stage": "sandbox_build",
-        "success": True,
+        "success": build_success,
         "iterations": iteration,
-        "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
+        "message": (
+            f"Sandbox build succeeded on attempt {iteration} — repository packaged."
+            if build_success
+            else (
+                f"Sandbox build stalled after {iteration} attempts "
+                "(identical errors repeating) — best attempt packaged."
+            )
+        ),
     })
 
 
