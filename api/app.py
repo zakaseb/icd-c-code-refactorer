@@ -1069,9 +1069,11 @@ def _sandbox_build_iterate(
         "7. Wrap the output in ```c ... ``` fences"
     )
 
-    MAX_STALL_REPEATS = 3
+    STALL_THRESHOLD = 3
     prev_error_sig: str | None = None
     stall_count = 0
+    escalation_level = 0
+    error_history: list[str] = []
 
     iteration = 0
     while True:
@@ -1114,22 +1116,29 @@ def _sandbox_build_iterate(
             stall_count = 0
         prev_error_sig = error_sig
 
-        if stall_count >= MAX_STALL_REPEATS:
+        escalated = False
+        if stall_count >= STALL_THRESHOLD:
+            escalation_level += 1
+            stall_count = 0
+
+            error_history.append(
+                f"[Escalation {escalation_level}] Errors persisting after "
+                f"attempt {iteration}:\n{_truncate_text(output, 3000, 'build_output')}"
+            )
+
             build_log_lines.append(
-                f"\n>>> STALL DETECTED: identical errors for "
-                f"{MAX_STALL_REPEATS + 1} consecutive attempts — stopping.\n"
+                f"\n>>> STALL DETECTED — escalating fix strategy "
+                f"(escalation {escalation_level})\n"
             )
             yield _sse({
                 "type": "info",
                 "stage": "sandbox_build",
                 "message": (
-                    f"Identical compiler errors repeated for "
-                    f"{MAX_STALL_REPEATS + 1} consecutive attempts — "
-                    "stopping to avoid an infinite loop. "
-                    "Use 'Regenerate' with feedback describing the issue."
+                    f"Same errors repeated {STALL_THRESHOLD + 1} times — "
+                    f"escalating fix strategy (level {escalation_level})…"
                 ),
             })
-            break
+            escalated = True
 
         yield _sse({
             "type": "info",
@@ -1167,6 +1176,26 @@ def _sandbox_build_iterate(
                 if repo_knowledge else ""
             )
             sec_change = f"## Change Specification\n{change_spec}"
+
+            sec_escalation = ""
+            if escalated and error_history:
+                history_text = "\n\n".join(error_history[-3:])
+                sec_escalation = (
+                    f"## CRITICAL — Previous Fix Attempts Failed\n"
+                    f"The following errors have persisted across multiple fix "
+                    f"attempts (escalation level {escalation_level}). Your "
+                    f"previous approaches did NOT work. You MUST try a "
+                    f"fundamentally different strategy:\n"
+                    f"- Re-examine ALL #include paths and header dependencies\n"
+                    f"- Check whether types, macros, or function signatures "
+                    f"match the repository headers exactly\n"
+                    f"- Consider if a struct/union layout or typedef needs "
+                    f"to change\n"
+                    f"- Verify that every function used is actually declared "
+                    f"in an included header\n\n"
+                    f"### Error History\n{history_text}"
+                )
+
             sec_code = (
                 f"## Current Code ({fname})\n```c\n{current_code}\n```\n\n"
                 "Fix all compiler errors and output the complete corrected file."
@@ -1175,6 +1204,7 @@ def _sandbox_build_iterate(
             fix_sections = [
                 ("code", sec_code, 0),
                 ("errors", sec_errors, 0),
+                ("escalation", sec_escalation, 0) if sec_escalation else ("escalation", "", 99),
                 ("repo_ctx", sec_repo_ctx, 1),
                 ("knowledge", sec_knowledge, 2),
                 ("change_spec", sec_change, 3),
@@ -1271,16 +1301,14 @@ def _sandbox_build_iterate(
                     "message": f"LLM fix error for {fname}: {e}",
                 })
 
-    build_success = success
-
-    result_label = "BUILD SUCCEEDED" if build_success else "STALLED (identical errors)"
     build_log_lines.extend([
         "",
         "=" * 65,
         "SUMMARY",
         "=" * 65,
         f"Total build attempts: {iteration}",
-        f"Result: {result_label}",
+        f"Escalations triggered: {escalation_level}",
+        f"Result: BUILD SUCCEEDED",
         "",
     ])
 
@@ -1292,16 +1320,9 @@ def _sandbox_build_iterate(
     yield _sse({
         "type": "sandbox_build_result",
         "stage": "sandbox_build",
-        "success": build_success,
+        "success": True,
         "iterations": iteration,
-        "message": (
-            f"Sandbox build succeeded on attempt {iteration} — repository packaged."
-            if build_success
-            else (
-                f"Sandbox build stalled after {iteration} attempts "
-                "(identical errors repeating) — best attempt packaged."
-            )
-        ),
+        "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
 
 
