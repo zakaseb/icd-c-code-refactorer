@@ -917,13 +917,44 @@ def _run_sandbox_build(
         return False, f"Build execution error: {e}"
 
 
-def _parse_error_files(build_output: str, gen_filenames: set[str]) -> dict[str, str]:
-    """Extract per-file error sections from compiler output.
+_GCC_FILE_RE = re.compile(r"^(\S+?\.[ch]):\d+:\d+:\s*(?:error|warning)", re.MULTILINE)
 
-    Returns a mapping ``{filename: relevant_error_lines}`` for files that
-    appear in *gen_filenames*.  If no file-specific errors are found, returns
-    a single entry keyed to the first generated filename with the full output.
+def _parse_all_build_errors(
+    build_output: str,
+    sandbox_dir: Path,
+) -> dict[Path, str]:
+    """Extract per-file error sections from compiler output for ALL files.
+
+    Returns ``{absolute_path: relevant_error_lines}`` for every ``.c``/``.h``
+    file mentioned in the compiler output.  Paths are resolved relative to
+    *sandbox_dir*.
     """
+    mentioned: set[str] = set()
+    for m in _GCC_FILE_RE.finditer(build_output):
+        mentioned.add(m.group(1))
+
+    file_errors: dict[Path, list[str]] = {}
+    for rel in mentioned:
+        abs_path = (sandbox_dir / rel).resolve()
+        if not abs_path.exists():
+            candidates = list(sandbox_dir.rglob(Path(rel).name))
+            abs_path = candidates[0] if candidates else abs_path
+        file_errors[abs_path] = []
+
+    for line in build_output.splitlines():
+        for rel in mentioned:
+            if rel in line:
+                abs_path = (sandbox_dir / rel).resolve()
+                if abs_path not in file_errors:
+                    candidates = list(sandbox_dir.rglob(Path(rel).name))
+                    abs_path = candidates[0] if candidates else abs_path
+                file_errors.setdefault(abs_path, []).append(line)
+
+    return {p: "\n".join(lines) for p, lines in file_errors.items() if lines}
+
+
+def _parse_error_files(build_output: str, gen_filenames: set[str]) -> dict[str, str]:
+    """Backwards-compatible wrapper: errors keyed by generated filename only."""
     file_errors: dict[str, list[str]] = {f: [] for f in gen_filenames}
     for line in build_output.splitlines():
         for fname in gen_filenames:
@@ -962,8 +993,16 @@ def _sandbox_build_iterate(
     """Generator that yields SSE dicts for the sandbox build loop.
 
     Copies the repo, injects generated files, builds, and iteratively fixes
-    compiler errors via the LLM until the build succeeds.  There is no
-    iteration limit — the loop runs until compilation passes.
+    compiler errors via the LLM until the build succeeds.
+
+    Key convergence strategies:
+    - Generated files are fixed using the original working code as a reference,
+      preventing error drift.
+    - Non-generated repo files that fail to compile (due to API changes from
+      the ICD transformation) are also patched with a minimal-change prompt.
+    - On stall (same errors repeating), all files are reset to their initial
+      state and the LLM is given accumulated error history to force a
+      different approach.
     """
     sandbox_dir = session_dir / "sandbox"
     if sandbox_dir.exists():
@@ -983,12 +1022,19 @@ def _sandbox_build_iterate(
         return
 
     gen_filenames = {gf.name for gf in gen_files}
+
+    # --- Map generated files to their sandbox locations and inject -----------
     replacement_map: dict[str, Path] = {}
+    original_repo_code: dict[str, str] = {}
+    initial_gen_code: dict[str, str] = {}
+
     for gf in gen_files:
+        initial_gen_code[gf.name] = gf.read_text()
         matches = _find_file_in_repo(sandbox_dir, gf.name)
         if matches:
             replacement_map[gf.name] = matches[0]
-            matches[0].write_text(gf.read_text())
+            original_repo_code[gf.name] = matches[0].read_text()
+            matches[0].write_text(initial_gen_code[gf.name])
             yield _sse({
                 "type": "info",
                 "stage": "sandbox_build",
@@ -1006,8 +1052,14 @@ def _sandbox_build_iterate(
                     "copying to sandbox root."
                 ),
             })
-            (sandbox_dir / gf.name).write_text(gf.read_text())
+            (sandbox_dir / gf.name).write_text(initial_gen_code[gf.name])
             replacement_map[gf.name] = sandbox_dir / gf.name
+
+    # --- Save original code of ALL repo .c files for later reset ------------
+    original_repo_files: dict[Path, str] = {}
+    for p in sandbox_dir.rglob("*.[ch]"):
+        if p.is_file():
+            original_repo_files[p] = p.read_text()
 
     build_info = _detect_build_system(sandbox_dir)
     yield _sse({
@@ -1047,26 +1099,50 @@ def _sandbox_build_iterate(
         "",
     ]
 
-    fix_system = (
-        "You are an expert C programmer. The code below failed to compile "
-        "inside its repository. Fix ALL compiler errors while maintaining "
-        "full ICD compliance and repository compatibility.\n\n"
+    # --- System prompts for generated-file fixes and repo-file patches ------
+    gen_fix_system = (
+        "You are an expert C programmer. You are transforming C code to "
+        "comply with a new ICD (Interface Control Document) version. The "
+        "transformed code failed to compile inside its repository.\n\n"
+        "You will receive:\n"
+        "- The ORIGINAL working code (compiled successfully before ICD changes)\n"
+        "- The current transformed code that failed to compile\n"
+        "- The compiler errors\n"
+        "- The ICD change specification\n\n"
+        "Your job: produce a corrected version that applies ALL ICD changes "
+        "from the change specification AND compiles cleanly.\n\n"
         "TARGET TOOLCHAIN:\n"
         "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
-        "- C standard: C99 (use -std=c99 compatible constructs only)\n"
-        "- C library: newlib (NOT glibc) — no asprintf, getline, strdup, "
-        "strndup, vasprintf or other glibc-specific functions\n"
-        "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
-        "- No POSIX headers — embedded freestanding environment\n"
-        "- Avoid GCC extensions added after GCC 7\n\n"
+        "- C standard: C99 (-std=c99 compatible constructs only)\n"
+        "- C library: newlib (NOT glibc)\n"
+        "- Use <stdint.h> fixed-width types\n"
+        "- No POSIX headers — embedded freestanding\n\n"
         "RULES:\n"
         "1. Output ONLY the complete, corrected C source file\n"
-        "2. Fix every error shown in the compiler output\n"
-        "3. Do NOT remove or stub out functionality\n"
+        "2. Start from the ORIGINAL working code and apply ICD changes\n"
+        "3. Fix every compiler error — do NOT reproduce the same mistakes\n"
         "4. Preserve the code's architecture and naming conventions\n"
-        "5. Ensure #include paths are correct for the repository\n"
-        "6. Ensure the code compiles cleanly with GCC 7.3.1 -std=c99\n"
-        "7. Wrap the output in ```c ... ``` fences"
+        "5. Ensure #include paths match the repository\n"
+        "6. Wrap the output in ```c ... ``` fences"
+    )
+
+    repo_fix_system = (
+        "You are an expert C programmer. A repository's API headers were "
+        "updated for a new ICD version. Some repository source files that "
+        "depend on these headers now fail to compile.\n\n"
+        "Your job: make MINIMAL changes to the given source file so it "
+        "compiles with the updated headers. Do NOT change the program's "
+        "logic — only adapt it to use the new types, struct fields, "
+        "function signatures, enum values, and macros from the new headers.\n\n"
+        "TARGET TOOLCHAIN:\n"
+        "- Xilinx SDK 2018.x with GCC 7.3.1\n"
+        "- C standard: C99\n\n"
+        "RULES:\n"
+        "1. Output ONLY the complete, corrected source file\n"
+        "2. Change ONLY what is necessary to fix compiler errors\n"
+        "3. Initialise any new required struct fields to sensible defaults\n"
+        "4. Preserve all existing program logic and behaviour\n"
+        "5. Wrap the output in ```c ... ``` fences"
     )
 
     STALL_THRESHOLD = 3
@@ -1074,6 +1150,7 @@ def _sandbox_build_iterate(
     stall_count = 0
     escalation_level = 0
     error_history: list[str] = []
+    repo_files_patched: dict[Path, str] = {}
 
     iteration = 0
     while True:
@@ -1109,6 +1186,7 @@ def _sandbox_build_iterate(
 
         build_log_lines.append(f"\n>>> BUILD FAILED on attempt {iteration}\n")
 
+        # --- Stall detection & escalation -----------------------------------
         error_sig = _normalise_error_signature(output)
         if error_sig and error_sig == prev_error_sig:
             stall_count += 1
@@ -1140,17 +1218,64 @@ def _sandbox_build_iterate(
             })
             escalated = True
 
+            # Reset generated files to the initial transform output so the
+            # LLM starts fresh without accumulated drift.
+            for fname in gen_filenames:
+                if fname in initial_gen_code:
+                    (gen_dir / fname).write_text(initial_gen_code[fname])
+                    if fname in replacement_map:
+                        replacement_map[fname].write_text(initial_gen_code[fname])
+
+            # Reset non-generated repo files to originals so stale patches
+            # don't compound.
+            for rpath, orig_content in original_repo_files.items():
+                if rpath.name not in gen_filenames:
+                    rpath.write_text(orig_content)
+            repo_files_patched.clear()
+
+            build_log_lines.append(
+                "   Reset all files to initial state for fresh approach.\n"
+            )
+
         yield _sse({
             "type": "info",
             "stage": "sandbox_build",
             "message": f"Build failed — feeding errors to LLM for attempt {iteration + 1}…",
         })
 
-        file_errors = _parse_error_files(output, gen_filenames)
-        for fname, errors in file_errors.items():
-            current_code = (gen_dir / fname).read_text()
+        # --- Parse errors for ALL files -------------------------------------
+        all_errors = _parse_all_build_errors(output, sandbox_dir)
 
-            build_log_lines.append(f"\n--- LLM fix: {fname} (after attempt {iteration}) ---")
+        gen_errors: dict[str, str] = {}
+        repo_errors: dict[Path, str] = {}
+        for fpath, err_text in all_errors.items():
+            if fpath.name in gen_filenames:
+                gen_errors[fpath.name] = err_text
+            else:
+                repo_errors[fpath] = err_text
+
+        if not gen_errors and not repo_errors:
+            first = sorted(gen_filenames)[0]
+            gen_errors[first] = output
+
+        # Collect the current generated headers to show repo-file fixer
+        current_gen_headers = ""
+        for fname in sorted(gen_filenames):
+            if fname.endswith(".h"):
+                hpath = replacement_map.get(fname)
+                if hpath and hpath.exists():
+                    current_gen_headers += (
+                        f"### {fname}\n```c\n{hpath.read_text()}\n```\n\n"
+                    )
+
+        # --- Fix generated files (ICD re-transform with error feedback) -----
+        for fname, errors in gen_errors.items():
+            current_code = (gen_dir / fname).read_text()
+            orig_code = original_repo_code.get(fname, "")
+
+            build_log_lines.append(
+                f"\n--- LLM fix (generated): {fname} (after attempt {iteration}) ---"
+            )
 
             file_repo_ctx = ""
             if has_repo:
@@ -1163,6 +1288,19 @@ def _sandbox_build_iterate(
                         repo_dir, exclude_names=uploaded_names,
                     )
 
+            sec_original = (
+                f"## Original Working Code ({fname})\n"
+                f"This code compiled successfully before ICD changes:\n"
+                f"```c\n{orig_code}\n```"
+                if orig_code else ""
+            )
+            sec_current = (
+                f"## Current Transformed Code ({fname})\n"
+                f"This version failed to compile:\n"
+                f"```c\n{current_code}\n```\n\n"
+                "Produce a corrected version that applies ALL ICD changes "
+                "and compiles cleanly."
+            )
             sec_errors = (
                 f"## Compiler Errors\n```\n"
                 f"{_truncate_text(errors, 6000, 'compiler_errors')}\n```"
@@ -1183,33 +1321,21 @@ def _sandbox_build_iterate(
                 sec_escalation = (
                     f"## CRITICAL — Previous Fix Attempts Failed\n"
                     f"The following errors have persisted across multiple fix "
-                    f"attempts (escalation level {escalation_level}). Your "
-                    f"previous approaches did NOT work. You MUST try a "
-                    f"fundamentally different strategy:\n"
-                    f"- Re-examine ALL #include paths and header dependencies\n"
-                    f"- Check whether types, macros, or function signatures "
-                    f"match the repository headers exactly\n"
-                    f"- Consider if a struct/union layout or typedef needs "
-                    f"to change\n"
-                    f"- Verify that every function used is actually declared "
-                    f"in an included header\n\n"
+                    f"attempts (escalation {escalation_level}). You MUST try "
+                    f"a fundamentally different strategy.\n\n"
                     f"### Error History\n{history_text}"
                 )
 
-            sec_code = (
-                f"## Current Code ({fname})\n```c\n{current_code}\n```\n\n"
-                "Fix all compiler errors and output the complete corrected file."
-            )
-
             fix_sections = [
-                ("code", sec_code, 0),
+                ("original", sec_original, 0),
+                ("current", sec_current, 0),
                 ("errors", sec_errors, 0),
                 ("escalation", sec_escalation, 0) if sec_escalation else ("escalation", "", 99),
                 ("repo_ctx", sec_repo_ctx, 1),
                 ("knowledge", sec_knowledge, 2),
                 ("change_spec", sec_change, 3),
             ]
-            sys_tokens = _estimate_tokens(fix_system)
+            sys_tokens = _estimate_tokens(gen_fix_system)
             fix_prompt = _assemble_prompt(
                 fix_sections,
                 max_input_tokens=MAX_INPUT_TOKENS - sys_tokens,
@@ -1218,14 +1344,14 @@ def _sandbox_build_iterate(
             yield _sse({
                 "type": "info",
                 "stage": "sandbox_build",
-                "message": f"LLM fixing {fname}…",
+                "message": f"LLM fixing generated file {fname}…",
             })
 
             try:
                 fix_parts: list[str] = []
                 meta: dict = {}
                 for chunk in _call_llm_stream(
-                    fix_system, fix_prompt,
+                    gen_fix_system, fix_prompt,
                     max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
                 ):
                     fix_parts.append(chunk)
@@ -1239,7 +1365,7 @@ def _sandbox_build_iterate(
                 for cont_pass in range(1, 4):
                     if meta.get("finish_reason") != "length":
                         break
-                    log.info("Sandbox LLM fix for %s: pass %d truncated, continuing…",
+                    log.info("Sandbox fix for %s: pass %d truncated, continuing…",
                              fname, cont_pass)
                     yield _sse({
                         "type": "info",
@@ -1248,15 +1374,13 @@ def _sandbox_build_iterate(
                     })
                     tail = fix_output[-2000:] if len(fix_output) > 2000 else fix_output
                     cont_prompt = (
-                        "Your previous response was cut off due to length limits. "
-                        "Here is the end of what you wrote:\n\n"
-                        f"---\n{tail}\n---\n\n"
-                        "Continue EXACTLY from where you left off. "
-                        "Do not repeat already-written content."
+                        "Your previous response was cut off. "
+                        f"End of what you wrote:\n---\n{tail}\n---\n\n"
+                        "Continue EXACTLY from where you left off."
                     )
                     meta = {}
                     for chunk in _call_llm_stream(
-                        fix_system, cont_prompt,
+                        gen_fix_system, cont_prompt,
                         max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
                     ):
                         fix_parts.append(chunk)
@@ -1268,8 +1392,9 @@ def _sandbox_build_iterate(
                     fix_output = "".join(fix_parts).strip()
 
                 fixed_code = _extract_fenced(fix_output, "c").strip()
+                ref_code = orig_code if orig_code else current_code
                 if fixed_code and _looks_complete_c_file(
-                    fixed_code, current_code, fname
+                    fixed_code, ref_code, fname
                 ):
                     (gen_dir / fname).write_text(fixed_code)
                     if fname in replacement_map:
@@ -1299,6 +1424,110 @@ def _sandbox_build_iterate(
                     "type": "info",
                     "stage": "sandbox_build",
                     "message": f"LLM fix error for {fname}: {e}",
+                })
+
+        # --- Fix non-generated repo files (API adaptation) ------------------
+        for fpath, errors in repo_errors.items():
+            rel_name = str(fpath.relative_to(sandbox_dir))
+            current_code = fpath.read_text()
+
+            build_log_lines.append(
+                f"\n--- LLM fix (repo): {rel_name} (after attempt {iteration}) ---"
+            )
+
+            sec_file = (
+                f"## Source File ({rel_name})\n```c\n{current_code}\n```\n\n"
+                "Make MINIMAL changes so this file compiles with the updated headers."
+            )
+            sec_headers = (
+                f"## Updated Headers\n{current_gen_headers}"
+                if current_gen_headers else ""
+            )
+            sec_errors_r = (
+                f"## Compiler Errors\n```\n"
+                f"{_truncate_text(errors, 6000, 'compiler_errors')}\n```"
+            )
+
+            repo_fix_sections = [
+                ("file", sec_file, 0),
+                ("errors", sec_errors_r, 0),
+                ("headers", sec_headers, 0),
+            ]
+            sys_tokens = _estimate_tokens(repo_fix_system)
+            repo_fix_prompt = _assemble_prompt(
+                repo_fix_sections,
+                max_input_tokens=MAX_INPUT_TOKENS - sys_tokens,
+            )
+
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": f"LLM patching repo file {rel_name}…",
+            })
+
+            try:
+                rfix_parts: list[str] = []
+                rmeta: dict = {}
+                for chunk in _call_llm_stream(
+                    repo_fix_system, repo_fix_prompt,
+                    max_tokens=MAX_OUTPUT_TOKENS, meta=rmeta,
+                ):
+                    rfix_parts.append(chunk)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "sandbox_build",
+                        "token": chunk,
+                    })
+                rfix_output = "".join(rfix_parts).strip()
+
+                for cont_pass in range(1, 4):
+                    if rmeta.get("finish_reason") != "length":
+                        break
+                    tail = rfix_output[-2000:] if len(rfix_output) > 2000 else rfix_output
+                    cont_prompt = (
+                        "Your previous response was cut off. "
+                        f"End of what you wrote:\n---\n{tail}\n---\n\n"
+                        "Continue EXACTLY from where you left off."
+                    )
+                    rmeta = {}
+                    for chunk in _call_llm_stream(
+                        repo_fix_system, cont_prompt,
+                        max_tokens=MAX_OUTPUT_TOKENS, meta=rmeta,
+                    ):
+                        rfix_parts.append(chunk)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": chunk,
+                        })
+                    rfix_output = "".join(rfix_parts).strip()
+
+                fixed_repo_code = _extract_fenced(rfix_output, "c").strip()
+                if fixed_repo_code and len(fixed_repo_code) > 20:
+                    fpath.write_text(fixed_repo_code)
+                    repo_files_patched[fpath] = fixed_repo_code
+                    build_log_lines.append(f"Applied repo patch to {rel_name}")
+                    yield _sse({
+                        "type": "info",
+                        "stage": "sandbox_build",
+                        "message": f"Patched repo file {rel_name}.",
+                    })
+                else:
+                    build_log_lines.append(
+                        f"Repo patch for {rel_name} was incomplete — skipped"
+                    )
+                    yield _sse({
+                        "type": "info",
+                        "stage": "sandbox_build",
+                        "message": f"Repo patch for {rel_name} incomplete — skipped.",
+                    })
+            except Exception as e:
+                log.warning("Sandbox repo fix failed for %s: %s", rel_name, e)
+                build_log_lines.append(f"Repo fix error for {rel_name}: {e}")
+                yield _sse({
+                    "type": "info",
+                    "stage": "sandbox_build",
+                    "message": f"Repo fix error for {rel_name}: {e}",
                 })
 
     build_log_lines.extend([
