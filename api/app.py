@@ -863,7 +863,67 @@ def _find_file_in_repo(repo_dir: Path, filename: str) -> list[Path]:
     return matches
 
 
-SANDBOX_CC = "gcc -std=c99 -pedantic"
+SANDBOX_CC_NATIVE = "gcc -std=c99 -pedantic"
+SANDBOX_CC_ARM = "arm-none-eabi-gcc -std=c99 -pedantic"
+
+_CC_RE = re.compile(
+    r"^\s*CC\s*[:?]?=\s*(.+?)\s*$", re.MULTILINE,
+)
+_CROSS_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"arm-none-eabi-gcc", re.I), SANDBOX_CC_ARM),
+    (re.compile(r"arm-xilinx-eabi-gcc", re.I), SANDBOX_CC_ARM),
+    (re.compile(r"aarch64-none-elf-gcc", re.I), SANDBOX_CC_ARM),
+    (re.compile(r"mb-gcc|microblaze.*gcc", re.I), SANDBOX_CC_ARM),
+]
+_LINKER_ERROR_RE = re.compile(
+    r"undefined reference to|"
+    r"cannot find -l|"
+    r"ld returned \d+ exit status|"
+    r"cannot open output file|"
+    r"collect2: error",
+    re.I,
+)
+
+
+def _detect_cross_compiler(build_info: dict) -> str:
+    """Detect whether the project needs a cross-compiler.
+
+    Reads the Makefile (or CMakeLists.txt) and checks the ``CC`` variable
+    for known cross-compiler prefixes.  Returns the sandbox ``CC`` string
+    to use (cross or native).
+    """
+    bpath = build_info.get("path")
+    if not bpath or not bpath.exists():
+        return SANDBOX_CC_NATIVE
+
+    try:
+        content = bpath.read_text(errors="replace")
+    except OSError:
+        return SANDBOX_CC_NATIVE
+
+    for m in _CC_RE.finditer(content):
+        cc_val = m.group(1)
+        for pattern, sandbox_cc in _CROSS_PATTERNS:
+            if pattern.search(cc_val):
+                return sandbox_cc
+
+    for pattern, sandbox_cc in _CROSS_PATTERNS:
+        if pattern.search(content):
+            return sandbox_cc
+
+    return SANDBOX_CC_NATIVE
+
+
+def _is_linker_only_failure(build_output: str) -> bool:
+    """Return True if the build output contains only linker errors (no
+    compile errors).  This means the source code is valid but linking
+    failed because of missing BSP libraries / linker scripts."""
+    has_linker = bool(_LINKER_ERROR_RE.search(build_output))
+    has_compile = bool(re.search(
+        r":\d+:\d+:\s*error:", build_output,
+    ))
+    return has_linker and not has_compile
+
 
 def _run_sandbox_build(
     sandbox_dir: Path,
@@ -872,29 +932,34 @@ def _run_sandbox_build(
 ) -> tuple[bool, str]:
     """Execute the build command inside *sandbox_dir*.
 
-    Builds are run with ``CC="gcc -std=c99 -pedantic"`` so the sandbox
-    approximates GCC 7.3.1 / Xilinx SDK 2018.x constraints even though
-    the host has a newer GCC.  The ``-std=c99`` acts as a floor; if the
-    project's own Makefile/CMakeLists specifies a different standard via
-    CFLAGS it will take precedence (the last ``-std=`` wins).
+    Automatically detects whether the project uses a cross-compiler
+    (arm-none-eabi-gcc, mb-gcc, etc.) and uses the matching toolchain.
 
-    Returns ``(success, combined_output)`` where *combined_output* contains
-    both stdout and stderr from the build.
+    If a full build fails with only linker errors (missing BSP libraries
+    / linker scripts), a compile-only pass (``-c``) is attempted.  When
+    all source files compile to object files successfully, the build is
+    considered a pass — linking requires BSP artifacts that may not be in
+    the uploaded repository.
+
+    Returns ``(success, combined_output)``.
     """
     btype = build_info["type"]
     bdir = build_info["build_dir"]
+    sandbox_cc = _detect_cross_compiler(build_info)
 
     if btype == "make":
-        cmd = (
-            f"make -C {bdir} CC='{SANDBOX_CC}' clean 2>/dev/null; "
-            f"make -C {bdir} CC='{SANDBOX_CC}' 2>&1"
+        full_cmd = (
+            f"make -C {bdir} CC='{sandbox_cc}' clean 2>/dev/null; "
+            f"make -C {bdir} CC='{sandbox_cc}' 2>&1"
         )
     elif btype == "cmake":
         cmake_build = bdir / "_cmake_build"
-        cmd = (
+        cc_bin = sandbox_cc.split()[0]
+        cc_flags = " ".join(sandbox_cc.split()[1:])
+        full_cmd = (
             f"cmake -S {bdir} -B {cmake_build} "
-            f'-DCMAKE_C_COMPILER=gcc '
-            f'-DCMAKE_C_FLAGS="-std=c99 -pedantic" 2>&1 && '
+            f"-DCMAKE_C_COMPILER={cc_bin} "
+            f'-DCMAKE_C_FLAGS="{cc_flags}" 2>&1 && '
             f"cmake --build {cmake_build} 2>&1"
         )
     else:
@@ -902,15 +967,70 @@ def _run_sandbox_build(
 
     try:
         result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(sandbox_dir),
+            full_cmd, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=str(sandbox_dir),
         )
         output = (result.stdout or "") + (result.stderr or "")
-        return result.returncode == 0, output.strip()
+
+        if result.returncode == 0:
+            return True, output.strip()
+
+        if not _is_linker_only_failure(output):
+            return False, output.strip()
+
+        log.info("Full build had only linker errors — attempting compile-only pass")
+        compile_output = output + "\n\n--- Linker errors detected; retrying compile-only ---\n"
+
+        if btype == "make":
+            c_sources = sorted(bdir.rglob("*.c"))
+            if not c_sources:
+                return False, output.strip()
+
+            include_dirs = set()
+            for inc in bdir.rglob("*.h"):
+                include_dirs.add(str(inc.parent))
+            inc_flags = " ".join(f"-I{d}" for d in sorted(include_dirs))
+
+            obj_cmds = []
+            for src in c_sources:
+                obj = src.with_suffix(".o")
+                obj_cmds.append(
+                    f"{sandbox_cc} {inc_flags} -c -o {obj} {src} 2>&1"
+                )
+            compile_cmd = " && ".join(obj_cmds)
+        elif btype == "cmake":
+            c_sources = sorted(bdir.rglob("*.c"))
+            if not c_sources:
+                return False, output.strip()
+            inc_dirs = set()
+            for inc in bdir.rglob("*.h"):
+                inc_dirs.add(str(inc.parent))
+            inc_flags = " ".join(f"-I{d}" for d in sorted(inc_dirs))
+            obj_cmds = []
+            for src in c_sources:
+                obj = src.with_suffix(".o")
+                obj_cmds.append(
+                    f"{sandbox_cc} {inc_flags} -c -o {obj} {src} 2>&1"
+                )
+            compile_cmd = " && ".join(obj_cmds)
+        else:
+            return False, output.strip()
+
+        result2 = subprocess.run(
+            compile_cmd, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=str(sandbox_dir),
+        )
+        compile_output += (result2.stdout or "") + (result2.stderr or "")
+
+        if result2.returncode == 0:
+            compile_output += (
+                "\n\n--- Compile-only PASSED (all .c → .o succeeded) ---\n"
+                "Linking skipped: BSP libraries/linker scripts not in repository.\n"
+            )
+            return True, compile_output.strip()
+
+        return False, compile_output.strip()
+
     except subprocess.TimeoutExpired:
         return False, f"Build timed out after {timeout} seconds."
     except Exception as e:
@@ -1062,6 +1182,10 @@ def _sandbox_build_iterate(
             original_repo_files[p] = p.read_text()
 
     build_info = _detect_build_system(sandbox_dir)
+    sandbox_cc = _detect_cross_compiler(build_info)
+    is_cross = sandbox_cc != SANDBOX_CC_NATIVE
+    cc_label = sandbox_cc.split()[0]
+
     yield _sse({
         "type": "info",
         "stage": "sandbox_build",
@@ -1069,6 +1193,7 @@ def _sandbox_build_iterate(
             f"Detected build system: {build_info['type']}"
             + (f" ({build_info['path'].relative_to(sandbox_dir)})"
                if build_info['path'] else "")
+            + (f" | cross-compiler: {cc_label}" if is_cross else "")
         ),
     })
 
@@ -1093,13 +1218,24 @@ def _sandbox_build_iterate(
         "=" * 65,
         "SANDBOX BUILD LOG",
         "=" * 65,
-        f"\nBuild system: {build_info['type']}",
-        f"Build file:   {build_info['path'].relative_to(sandbox_dir) if build_info['path'] else 'N/A'}",
+        f"\nBuild system:  {build_info['type']}",
+        f"Build file:    {build_info['path'].relative_to(sandbox_dir) if build_info['path'] else 'N/A'}",
+        f"Compiler:      {sandbox_cc}",
+        f"Cross-compile: {'yes' if is_cross else 'no'}",
         f"Files injected: {', '.join(sorted(gen_filenames))}",
         "",
     ]
 
     # --- System prompts for generated-file fixes and repo-file patches ------
+    cross_note = (
+        f"The sandbox is cross-compiling with {cc_label}. "
+        "If you see linker errors about missing BSP symbols (Xil_*, "
+        "xil_printf, etc.) those are expected — the sandbox only "
+        "validates that source files compile to .o successfully. "
+        "Focus on fixing COMPILE errors, not link errors.\n"
+        if is_cross else ""
+    )
+
     gen_fix_system = (
         "You are an expert C programmer. You are transforming C code to "
         "comply with a new ICD (Interface Control Document) version. The "
@@ -1112,11 +1248,13 @@ def _sandbox_build_iterate(
         "Your job: produce a corrected version that applies ALL ICD changes "
         "from the change specification AND compiles cleanly.\n\n"
         "TARGET TOOLCHAIN:\n"
+        f"- Compiler: {sandbox_cc}\n"
         "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
         "- C standard: C99 (-std=c99 compatible constructs only)\n"
         "- C library: newlib (NOT glibc)\n"
         "- Use <stdint.h> fixed-width types\n"
-        "- No POSIX headers — embedded freestanding\n\n"
+        "- No POSIX headers — embedded freestanding\n"
+        f"{cross_note}\n"
         "RULES:\n"
         "1. Output ONLY the complete, corrected C source file\n"
         "2. Start from the ORIGINAL working code and apply ICD changes\n"
