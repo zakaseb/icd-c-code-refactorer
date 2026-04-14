@@ -819,14 +819,51 @@ def _structural_verify(generated: str, repo_dir: Path | None,
 # Sandbox build helpers
 # ---------------------------------------------------------------------------
 
-def _detect_build_system(repo_dir: Path) -> dict:
+def _detect_build_system(
+    repo_dir: Path,
+    injected_paths: list[Path] | None = None,
+) -> dict:
     """Detect the build system used by a repository.
 
-    Walks the tree looking for Makefile / CMakeLists.txt.  Returns a dict
-    with keys ``type`` (``"make"`` | ``"cmake"`` | ``"none"``), ``path``
-    (the build file found), and ``build_dir`` (directory containing it).
-    Prefers Makefile at the shallowest depth, then CMakeLists.txt.
+    When *injected_paths* is given, we first walk **up** from each injected
+    file's parent towards *repo_dir*, looking for Makefile / CMakeLists.txt in
+    a direct ancestor directory.  This ensures that for large repos with many
+    build files (e.g. BSP sub-projects) we pick the one that actually governs
+    the generated code.
+
+    Falls back to a global search (preferring shallowest depth) only when no
+    ancestor build file is found.
+
+    Returns a dict with keys ``type`` (``"make"`` | ``"cmake"`` | ``"none"``),
+    ``path`` (the build file found), and ``build_dir`` (directory containing
+    it).
     """
+    # -- Phase 1: ancestor walk from injected file locations -----------------
+    if injected_paths:
+        ancestor_hits: list[tuple[int, str, Path]] = []
+        seen: set[Path] = set()
+        for ip in injected_paths:
+            d = ip.parent if ip.is_file() else ip
+            while True:
+                if d in seen:
+                    break
+                seen.add(d)
+                for name in ("CMakeLists.txt", "Makefile"):
+                    cand = d / name
+                    if cand.is_file():
+                        depth = len(d.relative_to(repo_dir).parts) if d != repo_dir else 0
+                        btype = "cmake" if name == "CMakeLists.txt" else "make"
+                        ancestor_hits.append((depth, btype, cand))
+                if d == repo_dir:
+                    break
+                d = d.parent
+
+        if ancestor_hits:
+            ancestor_hits.sort(key=lambda c: (-c[0], c[1]))
+            _, btype, bpath = ancestor_hits[0]
+            return {"type": btype, "path": bpath, "build_dir": bpath.parent}
+
+    # -- Phase 2: global scan (original behaviour) ---------------------------
     candidates: list[tuple[int, str, Path]] = []
     for p in repo_dir.rglob("*"):
         if not p.is_file():
@@ -981,43 +1018,28 @@ def _run_sandbox_build(
         log.info("Full build had only linker errors — attempting compile-only pass")
         compile_output = output + "\n\n--- Linker errors detected; retrying compile-only ---\n"
 
-        if btype == "make":
-            c_sources = sorted(bdir.rglob("*.c"))
-            if not c_sources:
-                return False, output.strip()
-
-            include_dirs = set()
-            for inc in bdir.rglob("*.h"):
-                include_dirs.add(str(inc.parent))
-            inc_flags = " ".join(f"-I{d}" for d in sorted(include_dirs))
-
-            obj_cmds = []
-            for src in c_sources:
-                obj = src.with_suffix(".o")
-                obj_cmds.append(
-                    f"{sandbox_cc} {inc_flags} -c -o {obj} {src} 2>&1"
-                )
-            compile_cmd = " && ".join(obj_cmds)
-        elif btype == "cmake":
-            c_sources = sorted(bdir.rglob("*.c"))
-            if not c_sources:
-                return False, output.strip()
-            inc_dirs = set()
-            for inc in bdir.rglob("*.h"):
-                inc_dirs.add(str(inc.parent))
-            inc_flags = " ".join(f"-I{d}" for d in sorted(inc_dirs))
-            obj_cmds = []
-            for src in c_sources:
-                obj = src.with_suffix(".o")
-                obj_cmds.append(
-                    f"{sandbox_cc} {inc_flags} -c -o {obj} {src} 2>&1"
-                )
-            compile_cmd = " && ".join(obj_cmds)
-        else:
+        c_sources = sorted(bdir.rglob("*.c"))
+        if not c_sources:
             return False, output.strip()
 
+        include_dirs: set[str] = set()
+        for inc in bdir.rglob("*.h"):
+            include_dirs.add(str(inc.parent))
+
+        # Write a shell script to compile each source individually,
+        # avoiding shell argument-length limits on large repos.
+        script = bdir / "_sandbox_compile.sh"
+        lines = ["#!/bin/sh", "set -e", f'CC="{sandbox_cc}"']
+        inc_args = " ".join(f'"-I{d}"' for d in sorted(include_dirs))
+        lines.append(f"INC={inc_args}")
+        for src in c_sources:
+            obj = src.with_suffix(".o")
+            lines.append(f'$CC $INC -c -o "{obj}" "{src}" 2>&1')
+        script.write_text("\n".join(lines) + "\n")
+        script.chmod(0o755)
+
         result2 = subprocess.run(
-            compile_cmd, shell=True, capture_output=True, text=True,
+            ["sh", str(script)], capture_output=True, text=True,
             timeout=timeout, cwd=str(sandbox_dir),
         )
         compile_output += (result2.stdout or "") + (result2.stderr or "")
@@ -1042,33 +1064,38 @@ _GCC_FILE_RE = re.compile(r"^(\S+?\.[ch]):\d+:\d+:\s*(?:error|warning)", re.MULT
 def _parse_all_build_errors(
     build_output: str,
     sandbox_dir: Path,
+    file_index: dict[str, list[Path]] | None = None,
 ) -> dict[Path, str]:
     """Extract per-file error sections from compiler output for ALL files.
 
     Returns ``{absolute_path: relevant_error_lines}`` for every ``.c``/``.h``
     file mentioned in the compiler output.  Paths are resolved relative to
     *sandbox_dir*.
+
+    When *file_index* (``{basename: [abs_paths]}``) is provided, it is used
+    for fast name-based lookup instead of ``rglob`` (critical for large repos).
     """
     mentioned: set[str] = set()
     for m in _GCC_FILE_RE.finditer(build_output):
         mentioned.add(m.group(1))
 
+    def _resolve(rel: str) -> Path:
+        abs_path = (sandbox_dir / rel).resolve()
+        if abs_path.exists():
+            return abs_path
+        basename = Path(rel).name
+        if file_index and basename in file_index:
+            return file_index[basename][0]
+        return abs_path
+
     file_errors: dict[Path, list[str]] = {}
     for rel in mentioned:
-        abs_path = (sandbox_dir / rel).resolve()
-        if not abs_path.exists():
-            candidates = list(sandbox_dir.rglob(Path(rel).name))
-            abs_path = candidates[0] if candidates else abs_path
-        file_errors[abs_path] = []
+        file_errors[_resolve(rel)] = []
 
     for line in build_output.splitlines():
         for rel in mentioned:
             if rel in line:
-                abs_path = (sandbox_dir / rel).resolve()
-                if abs_path not in file_errors:
-                    candidates = list(sandbox_dir.rglob(Path(rel).name))
-                    abs_path = candidates[0] if candidates else abs_path
-                file_errors.setdefault(abs_path, []).append(line)
+                file_errors.setdefault(_resolve(rel), []).append(line)
 
     return {p: "\n".join(lines) for p, lines in file_errors.items() if lines}
 
@@ -1127,6 +1154,11 @@ def _sandbox_build_iterate(
     sandbox_dir = session_dir / "sandbox"
     if sandbox_dir.exists():
         shutil.rmtree(sandbox_dir)
+    yield _sse({
+        "type": "info",
+        "stage": "sandbox_build",
+        "message": "Copying repository into sandbox…",
+    })
     shutil.copytree(repo_dir, sandbox_dir)
 
     gen_files = sorted(
@@ -1175,13 +1207,14 @@ def _sandbox_build_iterate(
             (sandbox_dir / gf.name).write_text(initial_gen_code[gf.name])
             replacement_map[gf.name] = sandbox_dir / gf.name
 
-    # --- Save original code of ALL repo .c files for later reset ------------
-    original_repo_files: dict[Path, str] = {}
-    for p in sandbox_dir.rglob("*.[ch]"):
-        if p.is_file():
-            original_repo_files[p] = p.read_text()
-
-    build_info = _detect_build_system(sandbox_dir)
+    # --- Detect build system relative to injected file locations -------------
+    injected_locations = [p for p in replacement_map.values()]
+    yield _sse({
+        "type": "info",
+        "stage": "sandbox_build",
+        "message": "Detecting build system…",
+    })
+    build_info = _detect_build_system(sandbox_dir, injected_paths=injected_locations)
     sandbox_cc = _detect_cross_compiler(build_info)
     is_cross = sandbox_cc != SANDBOX_CC_NATIVE
     cc_label = sandbox_cc.split()[0]
@@ -1196,6 +1229,24 @@ def _sandbox_build_iterate(
             + (f" | cross-compiler: {cc_label}" if is_cross else "")
         ),
     })
+
+    # --- Scope: only track .c/.h files under the build directory tree -------
+    build_root = build_info["build_dir"] if build_info["type"] != "none" else sandbox_dir
+    yield _sse({
+        "type": "info",
+        "stage": "sandbox_build",
+        "message": (
+            f"Indexing source files under "
+            f"{build_root.relative_to(sandbox_dir) or '.'}…"
+        ),
+    })
+
+    original_repo_files: dict[Path, str] = {}
+    _file_index: dict[str, list[Path]] = {}
+    for p in build_root.rglob("*.[ch]"):
+        if p.is_file():
+            original_repo_files[p] = p.read_text(errors="replace")
+            _file_index.setdefault(p.name, []).append(p)
 
     if build_info["type"] == "none":
         yield _sse({
@@ -1382,7 +1433,7 @@ def _sandbox_build_iterate(
         })
 
         # --- Parse errors for ALL files -------------------------------------
-        all_errors = _parse_all_build_errors(output, sandbox_dir)
+        all_errors = _parse_all_build_errors(output, sandbox_dir, file_index=_file_index)
 
         gen_errors: dict[str, str] = {}
         repo_errors: dict[Path, str] = {}
@@ -1679,6 +1730,11 @@ def _sandbox_build_iterate(
         "",
     ])
 
+    yield _sse({
+        "type": "info",
+        "stage": "sandbox_build",
+        "message": "Packaging built repository…",
+    })
     _package_sandbox_zip(session_dir, sandbox_dir)
 
     build_log_path = session_dir / "sandbox_build_log.txt"
