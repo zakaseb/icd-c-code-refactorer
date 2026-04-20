@@ -11,8 +11,11 @@ RUN apt-get update \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
 
-RUN python3 -m pip install --no-cache-dir -U huggingface_hub hf_transfer 'litellm[proxy]' \
-    fastapi 'uvicorn[standard]' httpx PyMuPDF python-multipart
+# Prefer PyMuPDF wheels to avoid fragile source builds on arm64/aarch64.
+RUN python3 -m pip install --no-cache-dir -U pip \
+    && python3 -m pip install --no-cache-dir -U huggingface_hub hf_transfer 'litellm[proxy]' \
+    fastapi 'uvicorn[standard]' httpx python-multipart \
+    && python3 -m pip install --no-cache-dir -U --only-binary=PyMuPDF 'PyMuPDF>=1.24.0,<1.27'
 
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y nodejs \
