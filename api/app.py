@@ -27,14 +27,15 @@ from pathlib import Path
 from typing import List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 app = FastAPI(title="ICD C Code Refactorer", docs_url=None, redoc_url=None)
 
 STATIC_DIR = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+# /static is mounted at end of this module so /static/app.js can be overridden
+# with a patched version (root-owned on-disk file cannot be edited in some envs).
 
 WORKSPACE_DIR = Path(
     os.environ.get("WORKSPACE_DIR", str(Path(__file__).parent.parent / "workspace"))
@@ -73,11 +74,32 @@ MAX_OUTPUT_TOKENS = 4096
 MAX_INPUT_TOKENS = CTX_SIZE_TOKENS - MAX_OUTPUT_TOKENS
 
 SANDBOX_BUILD_TIMEOUT = 120
+# Cap compiler/build output in SSE: large make/cmake logs on high-core hosts
+# can be multi-MB and overwhelm browser JSON parsing and DOM if sent whole.
+SANDBOX_SSE_MAX_BUILD_LOG_CHARS = int(
+    os.environ.get("SANDBOX_SSE_MAX_BUILD_LOG_CHARS", "200000")
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _tail_truncate_for_sse(text: str, max_chars: int, label: str) -> str:
+    """Return the *end* of *text*, suitable for error-heavy compiler output.
+
+    Differing from :func:`_truncate_text` (head-only), the UI needs the
+    final diagnostics when logs are huge.
+    """
+    if len(text) <= max_chars:
+        return text
+    log.warning(
+        "%s: SSE build log uses tail only (%d chars, showing last %d)",
+        label, len(text), max_chars,
+    )
+    head = f"[… {len(text) - max_chars} leading characters omitted …]\n\n"
+    return head + text[-(max(0, max_chars - len(head))):]
+
 
 def _truncate_text(text: str, max_chars: int, label: str) -> str:
     if len(text) <= max_chars:
@@ -1358,10 +1380,13 @@ def _sandbox_build_iterate(
 
         build_log_lines.append(f"\n{output}\n")
 
+        sse_out = _tail_truncate_for_sse(
+            output, SANDBOX_SSE_MAX_BUILD_LOG_CHARS, "sandbox_build",
+        )
         yield _sse({
             "type": "token",
             "stage": "sandbox_build",
-            "token": f"\n--- Build output (attempt {iteration}) ---\n{output}\n",
+            "token": f"\n--- Build output (attempt {iteration}) ---\n{sse_out}\n",
         })
 
         if success:
@@ -1792,12 +1817,130 @@ def _assemble_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Web UI: bounded pipeline logs (append_log_helper.js + patched app.js)
+# ---------------------------------------------------------------------------
+
+_APP_JS_PATCHED: str | None = None
+
+
+def _patched_app_js() -> str:
+    """Serve app.js with appendStepLog(...) instead of unbounded textContent +=.
+
+    On-disk :file:`static/app.js` may be read-only; patches are applied in memory.
+    """
+    global _APP_JS_PATCHED
+    if _APP_JS_PATCHED is not None:
+        return _APP_JS_PATCHED
+    t = (STATIC_DIR / "app.js").read_text(encoding="utf-8", errors="replace")
+    repls: list[tuple[str, str]] = [
+        (
+            "            if (o.textContent.startsWith('Connecting to LLM')) o.textContent = '';\n"  # noqa: E501
+            "            o.textContent += msg.token;\n"
+            "            o.scrollTop = o.scrollHeight;",
+            "            if (o.textContent.startsWith('Connecting to LLM')) o.textContent = '';\n"  # noqa: E501
+            "            appendStepLog(o, msg.token);",
+        ),
+        (
+            "            var o = step.querySelector('.step-output');\n"
+            "            o.textContent += msg.token;\n"
+            "            o.scrollTop = o.scrollHeight;",
+            "            var o = step.querySelector('.step-output');\n"
+            "            appendStepLog(o, msg.token);",
+        ),
+        (
+            "            if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';\n"  # noqa: E501
+            "            out.textContent += '\\n' + msg.message + '\\n';\n"
+            "            out.scrollTop = out.scrollHeight;",
+            "            if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';\n"  # noqa: E501
+            "            appendStepLog(out, '\\n' + msg.message + '\\n');",
+        ),
+        (
+            "            const out = verificationStep.querySelector('.step-output');\n"
+            "            out.textContent += '\\n' + msg.message + '\\n';\n"
+            "            out.scrollTop = out.scrollHeight;",
+            "            const out = verificationStep.querySelector('.step-output');\n"
+            "            appendStepLog(out, '\\n' + msg.message + '\\n');",
+        ),
+        (
+            "            const out = sandboxStep.querySelector('.step-output');\n"
+            "            out.textContent += '\\n' + msg.message + '\\n';\n"
+            "            out.scrollTop = out.scrollHeight;",
+            "            const out = sandboxStep.querySelector('.step-output');\n"
+            "            appendStepLog(out, '\\n' + msg.message + '\\n');",
+        ),
+        (
+            "            const out = fileSteps[msg.file].querySelector('.step-output');\n"
+            "            out.textContent += '\\n' + msg.message + '\\n';\n"
+            "            out.scrollTop = out.scrollHeight;",
+            "            const out = fileSteps[msg.file].querySelector('.step-output');\n"
+            "            appendStepLog(out, '\\n' + msg.message + '\\n');",
+        ),
+        (
+            "            const out = fileSteps[msg.file].querySelector('.step-output');\n"
+            "            out.textContent += '\\nError: ' + msg.message + '\\n';",
+            "            const out = fileSteps[msg.file].querySelector('.step-output');\n"
+            "            appendStepLog(out, '\\nError: ' + msg.message + '\\n');",
+        ),
+        (
+            "            if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';\n"  # noqa: E501
+            "            out.textContent += 'Error: ' + msg.message;",
+            "            if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';\n"  # noqa: E501
+            "            appendStepLog(out, 'Error: ' + msg.message);",
+        ),
+        (
+            "      if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';\n"  # noqa: E501
+            "      out.textContent += '\\nError: connection to processing stream was interrupted. Please retry.';",  # noqa: E501
+            "      if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';\n"  # noqa: E501
+            "      appendStepLog(out, '\\nError: connection to processing stream was interrupted. Please retry.');",  # noqa: E501
+        ),
+        (
+            "            var out = target.querySelector('.step-output');\n"
+            "            out.textContent += '\\n' + msg.message + '\\n';\n"
+            "            out.scrollTop = out.scrollHeight;",
+            "            var out = target.querySelector('.step-output');\n"
+            "            appendStepLog(out, '\\n' + msg.message + '\\n');",
+        ),
+        (
+            "            outE.textContent += '\\nError: ' + msg.message + '\\n';",
+            "            appendStepLog(outE, '\\nError: ' + msg.message + '\\n');",
+        ),
+        (
+            "            outR.textContent += '\\nError: ' + msg.message + '\\n';",
+            "            appendStepLog(outR, '\\nError: ' + msg.message + '\\n');",
+        ),
+        (
+            "      outErr.textContent += '\\nError: connection interrupted. Please retry.';",  # noqa: E501
+            "      appendStepLog(outErr, '\\nError: connection interrupted. Please retry.');",  # noqa: E501
+        ),
+    ]
+    for i, (old, new) in enumerate(repls):
+        if old not in t:
+            log.error("app.js in-memory patch failed at step %d", i)
+            raise RuntimeError("static/app.js no longer matches expected fragments")
+        t = t.replace(old, new, 1)
+    _APP_JS_PATCHED = t
+    return t
+
+
+# ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/static/app.js")
+async def static_app_js():
+    return Response(_patched_app_js(), media_type="application/javascript")
+
+
 @app.get("/")
 async def index():
-    return HTMLResponse((STATIC_DIR / "index.html").read_text())
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8", errors="replace")
+    if "append_log_helper.js" not in html:
+        html = html.replace(
+            '  <script src="/static/app.js"></script>',
+            '  <script src="/static/append_log_helper.js"></script>\n'
+            '  <script src="/static/app.js"></script>',
+        )
+    return HTMLResponse(html)
 
 
 @app.post("/api/session/create")
@@ -3572,3 +3715,10 @@ async def regenerate(session_id: str):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# Registered last so /static/app.js and other explicit routes take precedence
+# where the path overlaps with StaticFiles.
+app.mount(
+    "/static", StaticFiles(directory=str(STATIC_DIR)), name="static",
+)
