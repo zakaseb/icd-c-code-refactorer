@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 import fitz  # PyMuPDF
 from pathlib import Path
-from typing import List
+from typing import Iterable, Iterator, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -78,6 +78,15 @@ SANDBOX_BUILD_TIMEOUT = 120
 # can be multi-MB and overwhelm browser JSON parsing and DOM if sent whole.
 SANDBOX_SSE_MAX_BUILD_LOG_CHARS = int(
     os.environ.get("SANDBOX_SSE_MAX_BUILD_LOG_CHARS", "200000")
+)
+# Coalesce tiny llama-server deltas into fewer SSE messages (less JSON.parse +
+# DOM pressure in the browser — important on unified-memory hosts).
+SSE_UI_TOKEN_BATCH_MIN_CHARS = int(os.environ.get("SSE_UI_TOKEN_BATCH_MIN_CHARS", "4096"))
+SSE_UI_TOKEN_BATCH_MAX_INTERVAL_S = float(
+    os.environ.get("SSE_UI_TOKEN_BATCH_MAX_INTERVAL_S", "0.12")
+)
+SSE_UI_TOKEN_BATCH_MAX_BURST_CHARS = int(
+    os.environ.get("SSE_UI_TOKEN_BATCH_MAX_BURST_CHARS", "98304")
 )
 
 
@@ -297,6 +306,44 @@ def _call_llm_stream(
         ) from last_err
     if not yielded:
         raise RuntimeError("LLM returned empty response from direct llama-server")
+
+
+def _batched_stream_text(
+    chunks: Iterable[str],
+    *,
+    min_chars: int | None = None,
+    max_interval_s: float | None = None,
+    max_burst_chars: int | None = None,
+) -> Iterator[str]:
+    """Merge many small strings from an LLM stream before sending to the UI.
+
+    llama-server often emits token-sized ``content`` deltas; forwarding each
+    as its own SSE event floods the browser's main thread (layout + JSON).
+    """
+    lo = SSE_UI_TOKEN_BATCH_MIN_CHARS if min_chars is None else min_chars
+    mx_iv = SSE_UI_TOKEN_BATCH_MAX_INTERVAL_S if max_interval_s is None else max_interval_s
+    mx_burst = SSE_UI_TOKEN_BATCH_MAX_BURST_CHARS if max_burst_chars is None else max_burst_chars
+
+    buf: list[str] = []
+    size = 0
+    t_flush = time.monotonic()
+    for chunk in chunks:
+        if not chunk:
+            continue
+        buf.append(chunk)
+        size += len(chunk)
+        now = time.monotonic()
+        if (
+            size >= mx_burst
+            or size >= lo
+            or (size > 0 and now - t_flush >= mx_iv)
+        ):
+            yield "".join(buf)
+            buf.clear()
+            size = 0
+            t_flush = now
+    if buf:
+        yield "".join(buf)
 
 
 def _wait_for_llm_ready(timeout_s: int = 300) -> None:
@@ -1564,15 +1611,17 @@ def _sandbox_build_iterate(
             try:
                 fix_parts: list[str] = []
                 meta: dict = {}
-                for chunk in _call_llm_stream(
-                    gen_fix_system, fix_prompt,
-                    max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
+                for batch in _batched_stream_text(
+                    _call_llm_stream(
+                        gen_fix_system, fix_prompt,
+                        max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
+                    )
                 ):
-                    fix_parts.append(chunk)
+                    fix_parts.append(batch)
                     yield _sse({
                         "type": "token",
                         "stage": "sandbox_build",
-                        "token": chunk,
+                        "token": batch,
                     })
                 fix_output = "".join(fix_parts).strip()
 
@@ -1593,15 +1642,17 @@ def _sandbox_build_iterate(
                         "Continue EXACTLY from where you left off."
                     )
                     meta = {}
-                    for chunk in _call_llm_stream(
-                        gen_fix_system, cont_prompt,
-                        max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
+                    for batch in _batched_stream_text(
+                        _call_llm_stream(
+                            gen_fix_system, cont_prompt,
+                            max_tokens=MAX_OUTPUT_TOKENS, meta=meta,
+                        )
                     ):
-                        fix_parts.append(chunk)
+                        fix_parts.append(batch)
                         yield _sse({
                             "type": "token",
                             "stage": "sandbox_build",
-                            "token": chunk,
+                            "token": batch,
                         })
                     fix_output = "".join(fix_parts).strip()
 
@@ -1682,15 +1733,17 @@ def _sandbox_build_iterate(
             try:
                 rfix_parts: list[str] = []
                 rmeta: dict = {}
-                for chunk in _call_llm_stream(
-                    repo_fix_system, repo_fix_prompt,
-                    max_tokens=MAX_OUTPUT_TOKENS, meta=rmeta,
+                for batch in _batched_stream_text(
+                    _call_llm_stream(
+                        repo_fix_system, repo_fix_prompt,
+                        max_tokens=MAX_OUTPUT_TOKENS, meta=rmeta,
+                    )
                 ):
-                    rfix_parts.append(chunk)
+                    rfix_parts.append(batch)
                     yield _sse({
                         "type": "token",
                         "stage": "sandbox_build",
-                        "token": chunk,
+                        "token": batch,
                     })
                 rfix_output = "".join(rfix_parts).strip()
 
@@ -1704,15 +1757,17 @@ def _sandbox_build_iterate(
                         "Continue EXACTLY from where you left off."
                     )
                     rmeta = {}
-                    for chunk in _call_llm_stream(
-                        repo_fix_system, cont_prompt,
-                        max_tokens=MAX_OUTPUT_TOKENS, meta=rmeta,
+                    for batch in _batched_stream_text(
+                        _call_llm_stream(
+                            repo_fix_system, cont_prompt,
+                            max_tokens=MAX_OUTPUT_TOKENS, meta=rmeta,
+                        )
                     ):
-                        rfix_parts.append(chunk)
+                        rfix_parts.append(batch)
                         yield _sse({
                             "type": "token",
                             "stage": "sandbox_build",
-                            "token": chunk,
+                            "token": batch,
                         })
                     rfix_output = "".join(rfix_parts).strip()
 
@@ -2374,15 +2429,17 @@ async def process(session_id: str):
                     )
 
                 pass_parts: list[str] = []
-                for piece in _call_llm_stream(
-                    compare_system, prompt,
-                    max_tokens=compare_max_tokens, meta=meta,
+                for batch in _batched_stream_text(
+                    _call_llm_stream(
+                        compare_system, prompt,
+                        max_tokens=compare_max_tokens, meta=meta,
+                    )
                 ):
-                    pass_parts.append(piece)
+                    pass_parts.append(batch)
                     yield _sse({
                         "type": "token",
                         "stage": "analysis",
-                        "token": piece,
+                        "token": batch,
                     })
 
                 pass_text = "".join(pass_parts)
@@ -2568,15 +2625,17 @@ async def process(session_id: str):
                         f"Previous partial output:\n```c\n{clean}\n```"
                     )
                 try:
-                    for chunk in _call_llm_stream(
-                        transform_system, attempt_prompt, max_tokens=4096
+                    for batch in _batched_stream_text(
+                        _call_llm_stream(
+                            transform_system, attempt_prompt, max_tokens=4096
+                        )
                     ):
-                        file_parts.append(chunk)
+                        file_parts.append(batch)
                         yield _sse({
                             "type": "token",
                             "stage": "transform",
                             "file": fname,
-                            "token": chunk,
+                            "token": batch,
                         })
                 except Exception as e:
                     yield _sse({
@@ -2739,12 +2798,12 @@ async def process(session_id: str):
                             max_passes=4,
                             on_chunk=lambda c: verify_pieces.append(c),
                         )
-                        for piece in verify_pieces:
+                        for batch in _batched_stream_text(verify_pieces):
                             yield _sse({
                                 "type": "token",
                                 "stage": "verification",
                                 "file": gfname,
-                                "token": piece,
+                                "token": batch,
                             })
                         verified_code = _extract_fenced(verify_output, "c").strip()
                         verify_issues = (
@@ -3311,15 +3370,17 @@ async def regenerate(session_id: str):
                         f"Previous partial output:\n```c\n{clean}\n```"
                     )
                 try:
-                    for chunk in _call_llm_stream(
-                        transform_system, attempt_prompt, max_tokens=4096,
+                    for batch in _batched_stream_text(
+                        _call_llm_stream(
+                            transform_system, attempt_prompt, max_tokens=4096,
+                        )
                     ):
-                        file_parts.append(chunk)
+                        file_parts.append(batch)
                         yield _sse({
                             "type": "token",
                             "stage": "transform",
                             "file": fname,
-                            "token": chunk,
+                            "token": batch,
                         })
                 except Exception as e:
                     yield _sse({
@@ -3492,12 +3553,12 @@ async def regenerate(session_id: str):
                             max_passes=4,
                             on_chunk=lambda c: verify_pieces.append(c),
                         )
-                        for piece in verify_pieces:
+                        for batch in _batched_stream_text(verify_pieces):
                             yield _sse({
                                 "type": "token",
                                 "stage": "verification",
                                 "file": gfname,
-                                "token": piece,
+                                "token": batch,
                             })
                         verified_code = _extract_fenced(verify_output, "c").strip()
                         v_issues = (
