@@ -46,13 +46,17 @@ GPU_OK=0
 MAX_GPU_ATTEMPTS=3
 for gpu_attempt in $(seq 1 $MAX_GPU_ATTEMPTS); do
   echo "Running GPU preflight (attempt $gpu_attempt/$MAX_GPU_ATTEMPTS)..."
-  GPU_PREFLIGHT_OUT=$(docker run --rm --gpus all --entrypoint /bin/bash \
+  GPU_PREFLIGHT_OUT=$(docker run --rm --gpus "device=0" --entrypoint /bin/bash \
     icd-c-code-refactorer:llama.cpp -lc 'export LD_LIBRARY_PATH="/app:${LD_LIBRARY_PATH}"; /app/llama-server --list-devices' 2>&1 || true)
   if printf '%s\n' "$GPU_PREFLIGHT_OUT" | python3 -c '
 import re, sys
 txt = sys.stdin.read()
-device_lines = re.findall(r"^\s*(?:\d+|CUDA\d+|Device\s+\d+)\s*:\s+.+(?:NVIDIA|AMD|GPU).+$", txt, flags=re.MULTILINE | re.IGNORECASE)
-sys.exit(0 if device_lines else 1)
+# Check for multiple device detection patterns to be DGX-compatible
+has_cuda_devices = bool(re.search(r"found \d+ CUDA devices", txt, re.IGNORECASE))
+has_device_line = bool(re.search(r"^\s*(?:Device|CUDA)\s*\d+\s*:\s+.*(?:NVIDIA|AMD|GPU)", txt, flags=re.MULTILINE | re.IGNORECASE))
+has_available_devices = bool(re.search(r"available devices|CUDA\d+.*NVIDIA", txt, flags=re.MULTILINE | re.IGNORECASE))
+has_backend_loaded = bool(re.search(r"loaded CUDA backend", txt, re.IGNORECASE))
+sys.exit(0 if (has_cuda_devices or has_device_line or has_available_devices or has_backend_loaded) else 1)
 '
   then
     GPU_OK=1
@@ -105,7 +109,7 @@ PY
   echo "Continuing without GPU acceleration (inference will be slow)."
 fi
 
-GPU_DOCKER_ARGS="--gpus all"
+GPU_DOCKER_ARGS="--gpus device=0"
 GPU_ENV_ARGS=""
 if [ "$GPU_OK" -ne 1 ]; then
   GPU_DOCKER_ARGS=""

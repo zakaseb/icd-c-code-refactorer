@@ -4,7 +4,7 @@ ARG USER_ID=1000
 ARG GROUP_ID=1000
 
 RUN apt-get update \
-    && apt-get install -y vim git curl tmux python3 python3-pip sudo \
+    && apt-get install -y vim git curl tmux python3 python3-pip python3.12-venv sudo \
        build-essential cmake \
        gcc-arm-none-eabi libnewlib-arm-none-eabi libnewlib-dev \
     && apt autoremove -y \
@@ -13,8 +13,9 @@ RUN apt-get update \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
 
-RUN python3 -m pip install --no-cache-dir -U huggingface_hub hf_transfer 'litellm[proxy]' \
-    fastapi 'uvicorn[standard]' httpx PyMuPDF python-multipart
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir -U huggingface_hub hf_transfer 'litellm[proxy]' \
+       fastapi 'uvicorn[standard]' httpx PyMuPDF python-multipart
 
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y nodejs \
@@ -25,11 +26,20 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
 
-RUN groupadd -g $GROUP_ID developer \
-    && useradd -u $USER_ID -g $GROUP_ID -m developer \
+RUN if getent group $GROUP_ID > /dev/null; then \
+        EXISTING_GROUP=$(getent group $GROUP_ID | cut -d: -f1); \
+        if [ "$EXISTING_GROUP" != "developer" ]; then \
+            groupmod -n developer $EXISTING_GROUP; \
+        fi; \
+    else \
+        groupadd -g $GROUP_ID developer; \
+    fi \
+    && useradd -u $USER_ID -g developer -m developer || (EXISTING_USER=$(getent passwd $USER_ID | cut -d: -f1) && usermod -l developer -d /home/developer -m $EXISTING_USER && usermod -g developer developer) \
     && echo developer ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/developer \
     && chmod 0440 /etc/sudoers.d/developer \
     && usermod -a -G video developer
+
+RUN chown -R developer:developer /opt/venv
 
 ENV HF_CHAT_TEMPLATE='/app/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.jinja'
 ADD --chown=developer:developer https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct/raw/main/chat_template.jinja $HF_CHAT_TEMPLATE
