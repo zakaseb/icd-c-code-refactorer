@@ -27,6 +27,11 @@ from pathlib import Path
 from typing import Iterable, Iterator, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+
+try:
+    from api.orchestrator import run_orchestrator as _run_orchestrator
+except ImportError:  # tolerate flat layout (uvicorn app.app:app)
+    from orchestrator import run_orchestrator as _run_orchestrator
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -78,6 +83,15 @@ SANDBOX_BUILD_TIMEOUT = 120
 # can be multi-MB and overwhelm browser JSON parsing and DOM if sent whole.
 SANDBOX_SSE_MAX_BUILD_LOG_CHARS = int(
     os.environ.get("SANDBOX_SSE_MAX_BUILD_LOG_CHARS", "200000")
+)
+# Orchestrator agent settings — drives the iterative debugging loop.
+SANDBOX_USE_ORCHESTRATOR = os.environ.get(
+    "SANDBOX_USE_ORCHESTRATOR", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+SANDBOX_ORCH_MAX_STEPS = int(os.environ.get("SANDBOX_ORCH_MAX_STEPS", "80"))
+SANDBOX_ORCH_MAX_BUILDS = int(os.environ.get("SANDBOX_ORCH_MAX_BUILDS", "25"))
+SANDBOX_ORCH_OUTER_ROUNDS = int(
+    os.environ.get("SANDBOX_ORCH_OUTER_ROUNDS", "4")
 )
 # Coalesce tiny llama-server deltas into fewer SSE messages (less JSON.parse +
 # DOM pressure in the browser — important on unified-memory hosts).
@@ -1410,6 +1424,321 @@ def _sandbox_build_iterate(
     error_history: list[str] = []
     repo_files_patched: dict[Path, str] = {}
 
+    # ---------------------------------------------------------------------
+    # Orchestrator-driven debugging loop
+    # ---------------------------------------------------------------------
+    if SANDBOX_USE_ORCHESTRATOR:
+        gen_files_brief = {}
+        for gname, gpath in replacement_map.items():
+            try:
+                rel = str(gpath.relative_to(sandbox_dir))
+            except ValueError:
+                rel = gname
+            gen_files_brief[rel] = gname
+
+        def _build_runner_factory(local_log: list[str]):
+            attempts = {"n": 0}
+
+            def _runner() -> tuple[bool, str]:
+                attempts["n"] += 1
+                local_log.append("-" * 65)
+                local_log.append(f"BUILD ATTEMPT {attempts['n']}")
+                local_log.append("-" * 65)
+                ok, out = _run_sandbox_build(sandbox_dir, build_info)
+                local_log.append(f"\n{out}\n")
+                local_log.append(
+                    f"\n>>> BUILD {'SUCCEEDED' if ok else 'FAILED'}"
+                    f" on attempt {attempts['n']}\n"
+                )
+                return ok, out
+            return _runner, attempts
+
+        success_via_orchestrator = False
+        orch_total_steps = 0
+        orch_total_builds = 0
+
+        for outer_round in range(1, SANDBOX_ORCH_OUTER_ROUNDS + 1):
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"Starting debugging orchestrator "
+                    f"(round {outer_round}/{SANDBOX_ORCH_OUTER_ROUNDS}) — "
+                    f"max {SANDBOX_ORCH_MAX_STEPS} steps, "
+                    f"{SANDBOX_ORCH_MAX_BUILDS} builds…"
+                ),
+            })
+            build_log_lines.append("=" * 65)
+            build_log_lines.append(
+                f"ORCHESTRATOR ROUND {outer_round}"
+            )
+            build_log_lines.append("=" * 65)
+
+            runner, attempts_state = _build_runner_factory(build_log_lines)
+
+            round_done_event: dict | None = None
+            try:
+                for evt in _run_orchestrator(
+                    sandbox_dir=sandbox_dir,
+                    build_info=build_info,
+                    sandbox_cc=sandbox_cc,
+                    is_cross=is_cross,
+                    gen_files=gen_files_brief,
+                    change_spec=change_spec,
+                    repo_knowledge=repo_knowledge,
+                    file_index=_file_index,
+                    snapshots=original_repo_files,
+                    build_runner=runner,
+                    llm_stream=_call_llm_stream,
+                    max_steps=SANDBOX_ORCH_MAX_STEPS,
+                    max_builds=SANDBOX_ORCH_MAX_BUILDS,
+                    max_input_tokens=MAX_INPUT_TOKENS,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                ):
+                    et = evt.get("type")
+                    if et == "step":
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": (
+                                f"orchestrator step {evt['step']}/"
+                                f"{SANDBOX_ORCH_MAX_STEPS}"
+                            ),
+                        })
+                    elif et == "thought":
+                        snippet = evt["text"]
+                        if len(snippet) > 800:
+                            snippet = snippet[:800] + " …"
+                        build_log_lines.append(
+                            f"[think:{evt['step']}] {snippet}"
+                        )
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": (
+                                f"\n--- think (step {evt['step']}) ---\n"
+                                f"{snippet}\n"
+                            ),
+                        })
+                    elif et == "action":
+                        try:
+                            args_summary = json.dumps(
+                                evt["args"], ensure_ascii=False,
+                            )
+                        except Exception:
+                            args_summary = str(evt["args"])
+                        if len(args_summary) > 600:
+                            args_summary = args_summary[:600] + " …"
+                        build_log_lines.append(
+                            f"[action:{evt['step']}] {evt['tool']} "
+                            f"{args_summary}"
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": (
+                                f"step {evt['step']}: {evt['tool']}"
+                            ),
+                        })
+                    elif et == "observation":
+                        otext = evt["text"]
+                        if len(otext) > 1500:
+                            otext = otext[:1500] + " …"
+                        build_log_lines.append(
+                            f"[obs:{evt['step']}{' ERR' if evt.get('error') else ''}] "
+                            f"{otext}"
+                        )
+                        sse_obs = _tail_truncate_for_sse(
+                            evt["text"],
+                            SANDBOX_SSE_MAX_BUILD_LOG_CHARS,
+                            "orchestrator_observation",
+                        )
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": (
+                                f"\n--- observation (step {evt['step']}) ---\n"
+                                f"{sse_obs}\n"
+                            ),
+                        })
+                    elif et == "build":
+                        build_log_lines.append(
+                            f"[build call #{evt['calls']}] "
+                            f"{'OK' if evt['success'] else 'FAIL'}"
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": (
+                                f"build call {evt['calls']}: "
+                                f"{'success' if evt['success'] else 'failed'}"
+                            ),
+                        })
+                    elif et == "raw_token":
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": evt["text"],
+                        })
+                    elif et == "warning":
+                        build_log_lines.append(
+                            f"[warning] {evt['message']}"
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": evt["message"],
+                        })
+                    elif et == "done":
+                        round_done_event = evt
+                        break
+            except Exception as e:
+                log.exception("Orchestrator round %d crashed", outer_round)
+                build_log_lines.append(f"[orchestrator crash] {e}")
+                yield _sse({
+                    "type": "info",
+                    "stage": "sandbox_build",
+                    "message": f"Orchestrator crashed: {e}",
+                })
+                round_done_event = {
+                    "type": "done",
+                    "success": False,
+                    "reason": f"crash: {e}",
+                    "steps": 0,
+                    "builds": attempts_state["n"],
+                }
+
+            if round_done_event is None:
+                round_done_event = {
+                    "type": "done",
+                    "success": False,
+                    "reason": "round ended without explicit done event",
+                    "steps": SANDBOX_ORCH_MAX_STEPS,
+                    "builds": attempts_state["n"],
+                }
+
+            orch_total_steps += int(round_done_event.get("steps", 0))
+            orch_total_builds += int(round_done_event.get("builds", 0))
+            build_log_lines.append(
+                f"\n>>> Round {outer_round} ended: "
+                f"{round_done_event['reason']}\n"
+            )
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"orchestrator round {outer_round} ended — "
+                    f"{round_done_event['reason']}"
+                ),
+            })
+
+            if round_done_event.get("success"):
+                success_via_orchestrator = True
+                break
+
+            # --- Round failed: reset and let next round try fresh -----------
+            if outer_round < SANDBOX_ORCH_OUTER_ROUNDS:
+                yield _sse({
+                    "type": "info",
+                    "stage": "sandbox_build",
+                    "message": (
+                        "Resetting all files to initial state for next round…"
+                    ),
+                })
+                for fname in gen_filenames:
+                    if fname in initial_gen_code:
+                        (gen_dir / fname).write_text(initial_gen_code[fname])
+                        if fname in replacement_map:
+                            replacement_map[fname].write_text(
+                                initial_gen_code[fname]
+                            )
+                for rpath, orig_content in original_repo_files.items():
+                    if rpath.name not in gen_filenames:
+                        try:
+                            rpath.write_text(orig_content)
+                        except OSError:
+                            pass
+                build_log_lines.append(
+                    "   Reset all files to initial snapshot before next round.\n"
+                )
+
+        iteration = max(1, orch_total_builds)
+        if not success_via_orchestrator:
+            build_log_lines.extend([
+                "",
+                "=" * 65,
+                "SUMMARY",
+                "=" * 65,
+                f"Orchestrator rounds: {SANDBOX_ORCH_OUTER_ROUNDS}",
+                f"Total agent steps: {orch_total_steps}",
+                f"Total build calls: {orch_total_builds}",
+                f"Result: BUILD STILL FAILING (best effort packaged)",
+                "",
+            ])
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    "Orchestrator did not converge — packaging best-effort "
+                    "version of the repository for download."
+                ),
+            })
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": "Packaging best-effort repository…",
+            })
+            _package_sandbox_zip(session_dir, sandbox_dir)
+            build_log_path = session_dir / "sandbox_build_log.txt"
+            build_log_path.write_text("\n".join(build_log_lines) + "\n")
+            yield _sse({
+                "type": "sandbox_build_result",
+                "stage": "sandbox_build",
+                "success": False,
+                "iterations": orch_total_builds,
+                "message": (
+                    "Sandbox build did not converge after "
+                    f"{SANDBOX_ORCH_OUTER_ROUNDS} orchestrator round(s); "
+                    "best-effort repository packaged."
+                ),
+            })
+            return
+
+        build_log_lines.extend([
+            "",
+            "=" * 65,
+            "SUMMARY",
+            "=" * 65,
+            f"Orchestrator rounds: {outer_round}",
+            f"Total agent steps: {orch_total_steps}",
+            f"Total build calls: {orch_total_builds}",
+            f"Result: BUILD SUCCEEDED",
+            "",
+        ])
+
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": "Packaging built repository…",
+        })
+        _package_sandbox_zip(session_dir, sandbox_dir)
+        build_log_path = session_dir / "sandbox_build_log.txt"
+        build_log_path.write_text("\n".join(build_log_lines) + "\n")
+        yield _sse({
+            "type": "sandbox_build_result",
+            "stage": "sandbox_build",
+            "success": True,
+            "iterations": orch_total_builds,
+            "message": (
+                f"Sandbox build succeeded after orchestrator round "
+                f"{outer_round} — repository packaged."
+            ),
+        })
+        return
+
+    # ---------------------------------------------------------------------
+    # Legacy per-file fix loop (set SANDBOX_USE_ORCHESTRATOR=0 to use it)
+    # ---------------------------------------------------------------------
     iteration = 0
     while True:
         iteration += 1
