@@ -1664,6 +1664,14 @@ def _sandbox_build_iterate(
 
         iteration = max(1, orch_total_builds)
         if not success_via_orchestrator:
+            synced_generated = _sync_generated_from_sandbox(
+                gen_dir, replacement_map, gen_filenames,
+            )
+            if synced_generated:
+                build_log_lines.append(
+                    "Synced orchestrator-updated generated files for download: "
+                    + ", ".join(synced_generated)
+                )
             build_log_lines.extend([
                 "",
                 "=" * 65,
@@ -1703,6 +1711,15 @@ def _sandbox_build_iterate(
                 ),
             })
             return
+
+        synced_generated = _sync_generated_from_sandbox(
+            gen_dir, replacement_map, gen_filenames,
+        )
+        if synced_generated:
+            build_log_lines.append(
+                "Synced orchestrator-updated generated files for download: "
+                + ", ".join(synced_generated)
+            )
 
         build_log_lines.extend([
             "",
@@ -2168,6 +2185,28 @@ def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
                 zf.write(fpath, arcname)
     log.info("Packaged sandbox as %s (%d bytes)", zip_path, zip_path.stat().st_size)
     return zip_path
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path,
+    replacement_map: dict[str, Path],
+    gen_filenames: set[str],
+) -> list[str]:
+    """Copy sandbox-updated generated files back to the session output dir."""
+    synced: list[str] = []
+    for fname in sorted(gen_filenames):
+        sandbox_path = replacement_map.get(fname)
+        if not sandbox_path or not sandbox_path.is_file():
+            continue
+        dest = gen_dir / fname
+        try:
+            text = sandbox_path.read_text(errors="replace")
+            if not dest.exists() or dest.read_text(errors="replace") != text:
+                dest.write_text(text)
+                synced.append(fname)
+        except OSError as e:
+            log.warning("Could not sync generated file %s from sandbox: %s", fname, e)
+    return synced
 
 
 def _assemble_prompt(
