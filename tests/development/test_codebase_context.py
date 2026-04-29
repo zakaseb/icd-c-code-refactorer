@@ -27,6 +27,7 @@ from app import (
     _structural_verify,
     _estimate_tokens,
     _assemble_prompt,
+    _sync_generated_from_sandbox,
     _extract_fenced,
     _looks_complete_c_file,
     MAX_REPO_CONTEXT_CHARS,
@@ -315,6 +316,28 @@ check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
 check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+
+# ---------------------------------------------------------------
+print("\n=== Test 15: Sandbox-generated sync updates downloads ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    root = Path(tmpdir)
+    gen_dir = root / "generated_code"
+    sandbox_src = root / "sandbox" / "src"
+    gen_dir.mkdir()
+    sandbox_src.mkdir(parents=True)
+
+    gen_file = gen_dir / "comm.c"
+    sandbox_file = sandbox_src / "comm.c"
+    gen_file.write_text("int COMM_Send(void) { return -1; }\n")
+    sandbox_file.write_text("int COMM_Send(void) { return 0; }\n")
+
+    synced = _sync_generated_from_sandbox(
+        gen_dir,
+        {"comm.c": sandbox_file},
+        {"comm.c"},
+    )
+    check("sync reports changed generated file", synced == ["comm.c"], str(synced))
+    check("generated output matches sandbox fix", gen_file.read_text() == sandbox_file.read_text())
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")
