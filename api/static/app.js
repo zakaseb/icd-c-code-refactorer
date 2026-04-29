@@ -29,11 +29,15 @@
   const codePreview    = document.getElementById('code-preview');
   const downloadBtn    = document.getElementById('download-btn');
   const downloadRepoBtn = document.getElementById('download-repo-btn');
+  const pauseBtn       = document.getElementById('pause-btn');
+  const resumeBtn      = document.getElementById('resume-btn');
   const convSection    = document.getElementById('conversation-section');
   const convMessages   = document.getElementById('conversation-messages');
   const convInput      = document.getElementById('conversation-input');
   const sendMsgBtn     = document.getElementById('send-msg-btn');
   const regenerateBtn  = document.getElementById('regenerate-btn');
+  let activeEventSource = null;
+  let resumeCurrentProcess = null;
 
   /* ----- Helpers ------------------------------------------------- */
 
@@ -194,6 +198,8 @@
   async function runProcess() {
     processBtn.disabled = true;
     resetBtn.style.display = '';
+    if (pauseBtn) pauseBtn.style.display = '';
+    if (resumeBtn) resumeBtn.style.display = 'none';
     procSection.classList.remove('hidden');
     resultsSection.classList.add('hidden');
     pipelineSteps.innerHTML = '';
@@ -238,7 +244,8 @@
     let sandboxStep = null;
     let hasSandboxBuild = false;
 
-    const es = new EventSource('/api/process/' + sessionId);
+    let es = new EventSource('/api/process/' + sessionId);
+    activeEventSource = es;
 
     es.onmessage = function (event) {
       const msg = JSON.parse(event.data);
@@ -335,6 +342,7 @@
 
         case 'error': {
           es.close();
+          activeEventSource = null;
           if (msg.file && fileSteps[msg.file]) {
             setStepStatus(fileSteps[msg.file], 'error');
             fileSteps[msg.file].querySelector('.step-label').textContent = msg.file + ' failed';
@@ -352,8 +360,28 @@
           processBtn.disabled = false;
           break;
         }
+        case 'paused': {
+          es.close();
+          activeEventSource = null;
+          if (pauseBtn) pauseBtn.style.display = 'none';
+          if (resumeBtn) resumeBtn.style.display = '';
+          processBtn.disabled = true;
+          const target = sandboxStep || verificationStep || analysisStep;
+          if (target) {
+            const out = target.querySelector('.step-output');
+            out.textContent += '\n' + msg.message + '\n';
+            out.classList.add('visible');
+            out.scrollTop = out.scrollHeight;
+          }
+          generatedFiles = msg.files || generatedFiles || [];
+          showResults(generatedFiles, hasSandboxBuild, true);
+          break;
+        }
         case 'complete':
           es.close();
+          activeEventSource = null;
+          if (pauseBtn) pauseBtn.style.display = 'none';
+          if (resumeBtn) resumeBtn.style.display = 'none';
           generatedFiles = msg.files || [];
           if (msg.sandbox_build !== undefined) hasSandboxBuild = true;
           showResults(generatedFiles, hasSandboxBuild);
@@ -363,6 +391,7 @@
 
     es.onerror = function () {
       es.close();
+      activeEventSource = null;
       if (generatedFiles.length) {
         showResults(generatedFiles);
         return;
@@ -375,14 +404,57 @@
       out.classList.add('visible');
       processBtn.disabled = false;
     };
+
+    resumeCurrentProcess = async function () {
+      if (!sessionId || !es) return;
+      if (resumeBtn) resumeBtn.disabled = true;
+      try {
+        await fetch('/api/resume/' + sessionId, { method: 'POST' });
+        const onMessage = es.onmessage;
+        const onError = es.onerror;
+        es = new EventSource('/api/process/' + sessionId);
+        activeEventSource = es;
+        es.onmessage = onMessage;
+        es.onerror = onError;
+        if (pauseBtn) {
+          pauseBtn.style.display = '';
+          pauseBtn.disabled = false;
+        }
+        if (resumeBtn) resumeBtn.style.display = 'none';
+        processBtn.disabled = true;
+      } finally {
+        if (resumeBtn) resumeBtn.disabled = false;
+      }
+    };
+  }
+
+  async function pauseProcessing() {
+    if (!sessionId) return;
+    if (pauseBtn) pauseBtn.disabled = true;
+    try {
+      await fetch('/api/pause/' + sessionId, { method: 'POST' });
+      if (activeEventSource) {
+        // Keep the stream open until the backend acknowledges with a `paused`
+        // event so the final checkpoint/report event reaches the UI.
+      }
+    } catch (err) {
+      console.error('Failed to pause processing:', err);
+      if (pauseBtn) pauseBtn.disabled = false;
+    }
+  }
+
+  async function resumeProcessing() {
+    if (typeof resumeCurrentProcess === 'function') {
+      await resumeCurrentProcess();
+    }
   }
 
   /* ----- Results ------------------------------------------------- */
 
-  function showResults(files, sandboxBuild) {
-    if (!files.length) return;
+  function showResults(files, sandboxBuild, allowEmpty) {
+    if (!files.length && !allowEmpty) return;
     resultsSection.classList.remove('hidden');
-    convSection.classList.remove('hidden');
+    if (files.length) convSection.classList.remove('hidden');
     resultTabs.innerHTML = '';
     files.forEach((f, i) => {
       const tab = document.createElement('button');
@@ -392,7 +464,11 @@
       tab.addEventListener('click', () => loadPreview(f));
       resultTabs.appendChild(tab);
     });
-    loadPreview(files[0]);
+    if (files.length) {
+      loadPreview(files[0]);
+    } else {
+      codePreview.textContent = 'Processing is paused before generated code is available. Use Download All (ZIP) to download reports captured so far.';
+    }
     if (downloadRepoBtn) {
       if (sandboxBuild) {
         downloadRepoBtn.classList.remove('hidden');
@@ -434,6 +510,19 @@
     regenerateBtn.disabled = true;
     pipelineSteps.innerHTML = '';
     resetBtn.style.display = 'none';
+    if (pauseBtn) {
+      pauseBtn.style.display = 'none';
+      pauseBtn.disabled = false;
+    }
+    if (resumeBtn) {
+      resumeBtn.style.display = 'none';
+      resumeBtn.disabled = false;
+    }
+    if (activeEventSource) {
+      activeEventSource.close();
+      activeEventSource = null;
+    }
+    resumeCurrentProcess = null;
     if (downloadRepoBtn) downloadRepoBtn.classList.add('hidden');
     inputCode.value = '';
     inputSourceIcd.value = '';
@@ -685,6 +774,8 @@
 
   processBtn.addEventListener('click', runProcess);
   resetBtn.addEventListener('click', resetAll);
+  if (pauseBtn) pauseBtn.addEventListener('click', pauseProcessing);
+  if (resumeBtn) resumeBtn.addEventListener('click', resumeProcessing);
   downloadBtn.addEventListener('click', () => {
     if (sessionId) window.location.href = '/api/download/' + sessionId;
   });

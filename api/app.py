@@ -2310,6 +2310,135 @@ def _patched_app_js() -> str:
 # API endpoints
 # ---------------------------------------------------------------------------
 
+PIPELINE_EVENTS_FILE = "pipeline_events.jsonl"
+PAUSE_SUMMARY_FILE = "pause_summary.txt"
+
+
+def _read_status(session_dir: Path) -> dict:
+    status_path = session_dir / "status.json"
+    if not status_path.exists():
+        return {}
+    return json.loads(status_path.read_text())
+
+
+def _write_status(session_dir: Path, status: dict) -> None:
+    (session_dir / "status.json").write_text(json.dumps(status))
+
+
+def _pipeline_state(status: dict) -> dict:
+    state = status.setdefault("pipeline_state", {})
+    state.setdefault("completed_stages", [])
+    state.setdefault("completed_files", [])
+    state.setdefault("events", 0)
+    return state
+
+
+def _append_unique(items: list, value) -> None:
+    if value not in items:
+        items.append(value)
+
+
+def _parse_sse_event(evt: str) -> dict | None:
+    if not evt.startswith("data: "):
+        return None
+    try:
+        return json.loads(evt.split("data: ", 1)[1].split("\n", 1)[0])
+    except Exception:
+        return None
+
+
+def _record_pipeline_event(session_dir: Path, payload: dict) -> None:
+    events_path = session_dir / PIPELINE_EVENTS_FILE
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": payload,
+        }) + "\n")
+
+
+def _checkpoint_pipeline_event(session_dir: Path, payload: dict) -> None:
+    status = _read_status(session_dir)
+    state = _pipeline_state(status)
+    state["events"] = int(state.get("events", 0)) + 1
+    if payload.get("stage"):
+        state["last_stage"] = payload.get("stage")
+    if payload.get("type") == "stage_complete" and payload.get("stage"):
+        _append_unique(state["completed_stages"], payload["stage"])
+    if payload.get("type") == "file_complete" and payload.get("file"):
+        _append_unique(state["completed_files"], payload["file"])
+    if payload.get("type") == "sandbox_build_result":
+        state["sandbox_build_success"] = payload.get("success", False)
+        if payload.get("success"):
+            _append_unique(state["completed_stages"], "sandbox_build")
+    if payload.get("type") == "complete":
+        state["completed"] = True
+        status["state"] = "completed"
+    _write_status(session_dir, status)
+
+
+def _is_pause_requested(session_dir: Path) -> bool:
+    return bool(_read_status(session_dir).get("pause_requested"))
+
+
+def _write_pause_summary(session_dir: Path, reason: str = "User paused processing") -> None:
+    status = _read_status(session_dir)
+    state = _pipeline_state(status)
+    gen_dir = session_dir / "generated_code"
+    generated = sorted(p.name for p in gen_dir.iterdir() if p.is_file()) if gen_dir.exists() else []
+    report_lines = [
+        "=" * 65,
+        "PAUSE SUMMARY",
+        "=" * 65,
+        f"\nPaused at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        f"Reason: {reason}",
+        f"Last stage: {state.get('last_stage', 'N/A')}",
+        "",
+        "Completed stages:",
+        *(f"  - {s}" for s in state.get("completed_stages", [])),
+        "",
+        "Completed generated files:",
+        *(f"  - {f}" for f in state.get("completed_files", [])),
+        "",
+        "Generated artifacts currently available:",
+        *(f"  - {f}" for f in generated),
+        "",
+        "This session can be resumed from the UI. Completed stages/files are",
+        "reused; the interrupted stage is rerun with all previous artifacts",
+        "and event history still available in the session directory.",
+        "",
+    ]
+    (session_dir / PAUSE_SUMMARY_FILE).write_text("\n".join(report_lines) + "\n")
+
+
+def _pausable_stream(session_dir: Path, events):
+    """Yield SSE events while recording checkpoints and honoring pause requests."""
+    for evt in events:
+        payload = _parse_sse_event(evt)
+        if payload:
+            _record_pipeline_event(session_dir, payload)
+            _checkpoint_pipeline_event(session_dir, payload)
+        yield evt
+        if _is_pause_requested(session_dir):
+            status = _read_status(session_dir)
+            status["state"] = "paused"
+            status["paused_at"] = datetime.now(timezone.utc).isoformat()
+            _write_status(session_dir, status)
+            _write_pause_summary(session_dir)
+            paused_payload = {
+                "type": "paused",
+                "message": (
+                    "Processing paused. Current reports and generated artifacts "
+                    "are available for download; click Resume to continue."
+                ),
+                "files": sorted(
+                    p.name for p in (session_dir / "generated_code").iterdir()
+                    if p.is_file()
+                ) if (session_dir / "generated_code").exists() else [],
+            }
+            _record_pipeline_event(session_dir, paused_payload)
+            yield _sse(paused_payload)
+            return
+
 @app.get("/static/app.js")
 async def static_app_js():
     return Response(_patched_app_js(), media_type="application/javascript")
@@ -2339,6 +2468,12 @@ async def create_session():
         "source_icd": False,
         "target_icd": False,
         "repo_zip": False,
+        "pause_requested": False,
+        "pipeline_state": {
+            "completed_stages": [],
+            "completed_files": [],
+            "events": 0,
+        },
     }
     (session_dir / "status.json").write_text(json.dumps(status))
     return {"session_id": session_id}
@@ -2465,6 +2600,43 @@ async def get_status(session_id: str):
     return json.loads((session_dir / "status.json").read_text())
 
 
+@app.post("/api/pause/{session_id}")
+async def pause_session(session_id: str):
+    """Request cooperative pause of the active SSE processing stream."""
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    status = _read_status(session_dir)
+    status["pause_requested"] = True
+    status["state"] = "pause_requested"
+    status["pause_requested_at"] = datetime.now(timezone.utc).isoformat()
+    _write_status(session_dir, status)
+    _write_pause_summary(session_dir, "Pause requested by user")
+    return {
+        "ok": True,
+        "state": status["state"],
+        "message": "Pause requested; processing will stop at the next safe checkpoint.",
+    }
+
+
+@app.post("/api/resume/{session_id}")
+async def resume_session(session_id: str):
+    """Clear pause state; the frontend then reconnects to /api/process."""
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    status = _read_status(session_dir)
+    status["pause_requested"] = False
+    status["state"] = "resuming"
+    status["resumed_at"] = datetime.now(timezone.utc).isoformat()
+    _write_status(session_dir, status)
+    return {
+        "ok": True,
+        "state": status["state"],
+        "message": "Resume accepted; reconnect to the processing stream.",
+    }
+
+
 @app.get("/api/process/{session_id}")
 async def process(session_id: str):
     """Analyze ICDs and transform every code file. Returns an SSE stream."""
@@ -2503,6 +2675,20 @@ async def process(session_id: str):
         session_id[:8], len(code_files), len(source_icd), len(target_icd), has_repo,
     )
 
+    is_resume = status.get("state") == "resuming"
+    if not is_resume:
+        status["pause_requested"] = False
+        status["state"] = "processing"
+        status["pipeline_state"] = {
+            "completed_stages": [],
+            "completed_files": [],
+            "events": 0,
+        }
+        events_path = session_dir / PIPELINE_EVENTS_FILE
+        if events_path.exists():
+            events_path.unlink()
+        _write_status(session_dir, status)
+
     def event_stream():
         yield _sse({
             "type": "info",
@@ -2522,303 +2708,327 @@ async def process(session_id: str):
             return
 
         # ---- Step 1: Analyse ICD delta --------------------------------
-        yield _sse({
-            "type": "stage",
-            "stage": "analysis",
-            "message": "Analyzing ICD differences\u2026",
-        })
+        resume_state = _pipeline_state(_read_status(session_dir))
+        completed_stages = set(resume_state.get("completed_stages", []))
+        analysis_files_ready = (
+            (session_dir / "change_spec.txt").exists()
+            and (session_dir / "target_summary.txt").exists()
+            and (session_dir / "icd_analysis.txt").exists()
+        )
+        if is_resume and "analysis" in completed_stages and analysis_files_ready:
+            change_spec = (session_dir / "change_spec.txt").read_text()
+            target_summary = (session_dir / "target_summary.txt").read_text()
+            yield _sse({
+                "type": "stage",
+                "stage": "analysis",
+                "message": "Resuming: reusing completed ICD analysis from checkpoint...",
+            })
+            yield _sse({
+                "type": "info",
+                "stage": "analysis",
+                "message": "Loaded prior change_spec.txt, target_summary.txt, and icd_analysis.txt.",
+            })
+            yield _sse({"type": "stage_complete", "stage": "analysis"})
+        else:
+            # ---- Step 1: Analyse ICD delta --------------------------------
+            yield _sse({
+                "type": "stage",
+                "stage": "analysis",
+                "message": "Analyzing ICD differences\u2026",
+            })
 
-        repo_analysis_hint = ""
-        if repo_summary:
-            repo_analysis_hint = (
-                "\n\nThe code being refactored belongs to the following repository. "
-                "When describing changes, use the ACTUAL type names, function names, "
-                "and naming conventions from this codebase:\n"
-                f"{repo_summary}\n"
+            repo_analysis_hint = ""
+            if repo_summary:
+                repo_analysis_hint = (
+                    "\n\nThe code being refactored belongs to the following repository. "
+                    "When describing changes, use the ACTUAL type names, function names, "
+                    "and naming conventions from this codebase:\n"
+                    f"{repo_summary}\n"
+                )
+
+            compare_system = (
+                "You are an expert systems engineer and C programmer specializing in ICD-driven changes.\n"
+                "Compare the Source ICD vs Target ICD and produce a COMPLETE and EXHAUSTIVE\n"
+                "code-impact change specification. Cover ALL of the following:\n"
+                "- structs/fields/types/sizes/alignment changes\n"
+                "- enums/constants/message IDs and payload formats\n"
+                "- function signatures/APIs/callbacks changes\n"
+                "- behavior/protocol/state/timing constraints\n"
+                "- header/source synchronization requirements\n"
+                "- any additions, removals, or modifications between versions\n\n"
+                "Be thorough and detailed. Do not abbreviate or summarize. "
+                "List every single change with specific old and new values."
+                f"{repo_analysis_hint}"
             )
 
-        compare_system = (
-            "You are an expert systems engineer and C programmer specializing in ICD-driven changes.\n"
-            "Compare the Source ICD vs Target ICD and produce a COMPLETE and EXHAUSTIVE\n"
-            "code-impact change specification. Cover ALL of the following:\n"
-            "- structs/fields/types/sizes/alignment changes\n"
-            "- enums/constants/message IDs and payload formats\n"
-            "- function signatures/APIs/callbacks changes\n"
-            "- behavior/protocol/state/timing constraints\n"
-            "- header/source synchronization requirements\n"
-            "- any additions, removals, or modifications between versions\n\n"
-            "Be thorough and detailed. Do not abbreviate or summarize. "
-            "List every single change with specific old and new values."
-            f"{repo_analysis_hint}"
-        )
+            combined_icd_len = len(source_icd) + len(target_icd)
+            use_direct = combined_icd_len <= DIRECT_COMPARE_MAX_CHARS
 
-        combined_icd_len = len(source_icd) + len(target_icd)
-        use_direct = combined_icd_len <= DIRECT_COMPARE_MAX_CHARS
-
-        try:
-            if use_direct:
-                # ---- DIRECT path: one streaming comparison with full ICD texts ----
-                log.info("Using direct comparison (combined %d chars)", combined_icd_len)
-                yield _sse({
-                    "type": "info",
-                    "stage": "analysis",
-                    "message": (
-                        f"ICDs fit in context ({combined_icd_len:,} chars). "
-                        "Performing direct full-text comparison…"
-                    ),
-                })
-
-                base_compare_prompt = (
-                    "Compare these two complete ICD documents and produce a COMPLETE "
-                    "and EXHAUSTIVE code-impact change specification that will be used "
-                    "to refactor C source code.\n\n"
-                    f"## Source ICD (Full Text)\n{source_icd}\n\n"
-                    f"## Target ICD (Full Text)\n{target_icd}\n\n"
-                    "List EVERY difference between the two ICDs. For each change, state:\n"
-                    "1. What it was in the Source ICD (old)\n"
-                    "2. What it is in the Target ICD (new)\n"
-                    "3. Impact on C code (structs, enums, functions, constants, etc.)"
-                )
-                target_summary = _truncate_text(target_icd, 12_000, "target_icd_for_transform")
-
-            else:
-                # ---- MAP-REDUCE path: for very large ICDs ----
-                log.info("Using map-reduce (combined %d chars > %d threshold)",
-                         combined_icd_len, DIRECT_COMPARE_MAX_CHARS)
-                map_system = (
-                    "You are an ICD analyst. Extract exhaustive technical facts from this ICD chunk.\n"
-                    "Capture structs, enums, constants, message IDs, payload layouts, field sizes/types,\n"
-                    "function/interface signatures, protocol/state/timing requirements, and constraints.\n"
-                    "Return concise bullet points with concrete values; no filler text."
-                )
-                merge_system = (
-                    "You are consolidating multiple ICD chunk notes from the SAME ICD document.\n"
-                    "Merge them into one complete, deduplicated technical summary while preserving\n"
-                    "every concrete detail (names, values, sizes, types)."
-                )
-
-                source_chunks = _split_text_chunks(source_icd, ICD_CHUNK_CHARS)
-                target_chunks = _split_text_chunks(target_icd, ICD_CHUNK_CHARS)
-                yield _sse({
-                    "type": "info",
-                    "stage": "analysis",
-                    "message": (
-                        f"Large ICDs — using chunked analysis: "
-                        f"source={len(source_chunks)} chunks, "
-                        f"target={len(target_chunks)} chunks. "
-                        "This will take a while…"
-                    ),
-                })
-
-                source_notes: list[str] = []
-                for idx, chunk_text in enumerate(source_chunks, start=1):
-                    yield _sse({
-                        "type": "info",
-                        "stage": "analysis",
-                        "message": f"Extracting facts from source ICD chunk {idx}/{len(source_chunks)}…",
-                    })
-                    note = _call_llm_complete(
-                        map_system,
-                        (
-                            f"Source ICD chunk {idx}/{len(source_chunks)}:\n\n"
-                            f"{chunk_text}\n\n"
-                            "Extract all code-relevant facts from this chunk."
-                        ),
-                        max_tokens=2048,
-                        max_passes=2,
-                    )
-                    source_notes.append(note)
-                    yield _sse({
-                        "type": "token",
-                        "stage": "analysis",
-                        "token": (
-                            f"\n\n[Source chunk {idx}/{len(source_chunks)} analysis]\n"
-                            f"{note}\n"
-                        ),
-                    })
-
-                target_notes: list[str] = []
-                for idx, chunk_text in enumerate(target_chunks, start=1):
-                    yield _sse({
-                        "type": "info",
-                        "stage": "analysis",
-                        "message": f"Extracting facts from target ICD chunk {idx}/{len(target_chunks)}…",
-                    })
-                    note = _call_llm_complete(
-                        map_system,
-                        (
-                            f"Target ICD chunk {idx}/{len(target_chunks)}:\n\n"
-                            f"{chunk_text}\n\n"
-                            "Extract all code-relevant facts from this chunk."
-                        ),
-                        max_tokens=2048,
-                        max_passes=2,
-                    )
-                    target_notes.append(note)
-                    yield _sse({
-                        "type": "token",
-                        "stage": "analysis",
-                        "token": (
-                            f"\n\n[Target chunk {idx}/{len(target_chunks)} analysis]\n"
-                            f"{note}\n"
-                        ),
-                    })
-
-                yield _sse({
-                    "type": "info",
-                    "stage": "analysis",
-                    "message": "Consolidating source ICD summary…",
-                })
-                source_summary = _call_llm_complete(
-                    merge_system,
-                    "Merge these Source ICD notes into one complete technical summary:\n\n"
-                    + "\n\n".join(
-                        f"## Source chunk note {i}\n{n}"
-                        for i, n in enumerate(source_notes, 1)
-                    ),
-                    max_tokens=4096,
-                    max_passes=3,
-                )
-                yield _sse({
-                    "type": "token",
-                    "stage": "analysis",
-                    "token": f"\n\n[Consolidated Source ICD Summary]\n{source_summary}\n",
-                })
-
-                yield _sse({
-                    "type": "info",
-                    "stage": "analysis",
-                    "message": "Consolidating target ICD summary…",
-                })
-                target_summary = _call_llm_complete(
-                    merge_system,
-                    "Merge these Target ICD notes into one complete technical summary:\n\n"
-                    + "\n\n".join(
-                        f"## Target chunk note {i}\n{n}"
-                        for i, n in enumerate(target_notes, 1)
-                    ),
-                    max_tokens=4096,
-                    max_passes=3,
-                )
-                yield _sse({
-                    "type": "token",
-                    "stage": "analysis",
-                    "token": f"\n\n[Consolidated Target ICD Summary]\n{target_summary}\n",
-                })
-
-                yield _sse({
-                    "type": "info",
-                    "stage": "analysis",
-                    "message": "Generating detailed change specification…",
-                })
-
-                base_compare_prompt = (
-                    "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "
-                    "comparing the Source ICD to the Target ICD.  This specification will "
-                    "be used to refactor C code, so it must cover every single difference.\n\n"
-                    f"## Source ICD full summary\n{source_summary}\n\n"
-                    f"## Target ICD full summary\n{target_summary}\n\n"
-                    "List EVERY difference between the two ICDs. For each change, state:\n"
-                    "1. What it was in the Source ICD (old)\n"
-                    "2. What it is in the Target ICD (new)\n"
-                    "3. Impact on C code (structs, enums, functions, constants, etc.)"
-                )
-
-            # ---- Streaming comparison (used by both paths) ----
-            analysis_parts: list[str] = []
-            complete_analysis = ""
-            max_analysis_passes = 6
-            compare_max_tokens = 4096
-            last_meta: dict = {}
-
-            for attempt in range(1, max_analysis_passes + 1):
-                meta: dict = {}
-                if attempt == 1:
-                    prompt = base_compare_prompt
-                else:
+            try:
+                if use_direct:
+                    # ---- DIRECT path: one streaming comparison with full ICD texts ----
+                    log.info("Using direct comparison (combined %d chars)", combined_icd_len)
                     yield _sse({
                         "type": "info",
                         "stage": "analysis",
                         "message": (
-                            f"Analysis output was truncated — continuing "
-                            f"(pass {attempt}/{max_analysis_passes})…"
+                            f"ICDs fit in context ({combined_icd_len:,} chars). "
+                            "Performing direct full-text comparison…"
                         ),
                     })
-                    tail_len = 3000
-                    tail = (complete_analysis[-tail_len:]
-                            if len(complete_analysis) > tail_len
-                            else complete_analysis)
-                    prompt = (
-                        "Your previous analysis was cut off due to length limits. "
-                        "Here is the end of what you wrote:\n\n"
-                        f"---\n{tail}\n---\n\n"
-                        "Continue EXACTLY from where you left off. Do not repeat "
-                        "content already written. Cover all remaining differences "
-                        "between the Source and Target ICDs."
+
+                    base_compare_prompt = (
+                        "Compare these two complete ICD documents and produce a COMPLETE "
+                        "and EXHAUSTIVE code-impact change specification that will be used "
+                        "to refactor C source code.\n\n"
+                        f"## Source ICD (Full Text)\n{source_icd}\n\n"
+                        f"## Target ICD (Full Text)\n{target_icd}\n\n"
+                        "List EVERY difference between the two ICDs. For each change, state:\n"
+                        "1. What it was in the Source ICD (old)\n"
+                        "2. What it is in the Target ICD (new)\n"
+                        "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                    )
+                    target_summary = _truncate_text(target_icd, 12_000, "target_icd_for_transform")
+
+                else:
+                    # ---- MAP-REDUCE path: for very large ICDs ----
+                    log.info("Using map-reduce (combined %d chars > %d threshold)",
+                             combined_icd_len, DIRECT_COMPARE_MAX_CHARS)
+                    map_system = (
+                        "You are an ICD analyst. Extract exhaustive technical facts from this ICD chunk.\n"
+                        "Capture structs, enums, constants, message IDs, payload layouts, field sizes/types,\n"
+                        "function/interface signatures, protocol/state/timing requirements, and constraints.\n"
+                        "Return concise bullet points with concrete values; no filler text."
+                    )
+                    merge_system = (
+                        "You are consolidating multiple ICD chunk notes from the SAME ICD document.\n"
+                        "Merge them into one complete, deduplicated technical summary while preserving\n"
+                        "every concrete detail (names, values, sizes, types)."
                     )
 
-                pass_parts: list[str] = []
-                for batch in _batched_stream_text(
-                    _call_llm_stream(
-                        compare_system, prompt,
-                        max_tokens=compare_max_tokens, meta=meta,
+                    source_chunks = _split_text_chunks(source_icd, ICD_CHUNK_CHARS)
+                    target_chunks = _split_text_chunks(target_icd, ICD_CHUNK_CHARS)
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": (
+                            f"Large ICDs — using chunked analysis: "
+                            f"source={len(source_chunks)} chunks, "
+                            f"target={len(target_chunks)} chunks. "
+                            "This will take a while…"
+                        ),
+                    })
+
+                    source_notes: list[str] = []
+                    for idx, chunk_text in enumerate(source_chunks, start=1):
+                        yield _sse({
+                            "type": "info",
+                            "stage": "analysis",
+                            "message": f"Extracting facts from source ICD chunk {idx}/{len(source_chunks)}…",
+                        })
+                        note = _call_llm_complete(
+                            map_system,
+                            (
+                                f"Source ICD chunk {idx}/{len(source_chunks)}:\n\n"
+                                f"{chunk_text}\n\n"
+                                "Extract all code-relevant facts from this chunk."
+                            ),
+                            max_tokens=2048,
+                            max_passes=2,
+                        )
+                        source_notes.append(note)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "analysis",
+                            "token": (
+                                f"\n\n[Source chunk {idx}/{len(source_chunks)} analysis]\n"
+                                f"{note}\n"
+                            ),
+                        })
+
+                    target_notes: list[str] = []
+                    for idx, chunk_text in enumerate(target_chunks, start=1):
+                        yield _sse({
+                            "type": "info",
+                            "stage": "analysis",
+                            "message": f"Extracting facts from target ICD chunk {idx}/{len(target_chunks)}…",
+                        })
+                        note = _call_llm_complete(
+                            map_system,
+                            (
+                                f"Target ICD chunk {idx}/{len(target_chunks)}:\n\n"
+                                f"{chunk_text}\n\n"
+                                "Extract all code-relevant facts from this chunk."
+                            ),
+                            max_tokens=2048,
+                            max_passes=2,
+                        )
+                        target_notes.append(note)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "analysis",
+                            "token": (
+                                f"\n\n[Target chunk {idx}/{len(target_chunks)} analysis]\n"
+                                f"{note}\n"
+                            ),
+                        })
+
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": "Consolidating source ICD summary…",
+                    })
+                    source_summary = _call_llm_complete(
+                        merge_system,
+                        "Merge these Source ICD notes into one complete technical summary:\n\n"
+                        + "\n\n".join(
+                            f"## Source chunk note {i}\n{n}"
+                            for i, n in enumerate(source_notes, 1)
+                        ),
+                        max_tokens=4096,
+                        max_passes=3,
                     )
-                ):
-                    pass_parts.append(batch)
                     yield _sse({
                         "type": "token",
                         "stage": "analysis",
-                        "token": batch,
+                        "token": f"\n\n[Consolidated Source ICD Summary]\n{source_summary}\n",
                     })
 
-                pass_text = "".join(pass_parts)
-                analysis_parts.append(pass_text)
-                complete_analysis = "".join(analysis_parts)
-                last_meta = meta
-
-                if meta.get("finish_reason") != "length":
-                    log.info(
-                        "Analysis pass %d done (finish_reason=%s)",
-                        attempt, meta.get("finish_reason"),
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": "Consolidating target ICD summary…",
+                    })
+                    target_summary = _call_llm_complete(
+                        merge_system,
+                        "Merge these Target ICD notes into one complete technical summary:\n\n"
+                        + "\n\n".join(
+                            f"## Target chunk note {i}\n{n}"
+                            for i, n in enumerate(target_notes, 1)
+                        ),
+                        max_tokens=4096,
+                        max_passes=3,
                     )
-                    break
-                log.info("Analysis pass %d hit token limit, continuing…", attempt)
+                    yield _sse({
+                        "type": "token",
+                        "stage": "analysis",
+                        "token": f"\n\n[Consolidated Target ICD Summary]\n{target_summary}\n",
+                    })
 
-            if last_meta.get("finish_reason") == "length":
-                log.warning(
-                    "ICD analysis may be incomplete after %d passes",
-                    max_analysis_passes,
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": "Generating detailed change specification…",
+                    })
+
+                    base_compare_prompt = (
+                        "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "
+                        "comparing the Source ICD to the Target ICD.  This specification will "
+                        "be used to refactor C code, so it must cover every single difference.\n\n"
+                        f"## Source ICD full summary\n{source_summary}\n\n"
+                        f"## Target ICD full summary\n{target_summary}\n\n"
+                        "List EVERY difference between the two ICDs. For each change, state:\n"
+                        "1. What it was in the Source ICD (old)\n"
+                        "2. What it is in the Target ICD (new)\n"
+                        "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                    )
+
+                # ---- Streaming comparison (used by both paths) ----
+                analysis_parts: list[str] = []
+                complete_analysis = ""
+                max_analysis_passes = 6
+                compare_max_tokens = 4096
+                last_meta: dict = {}
+
+                for attempt in range(1, max_analysis_passes + 1):
+                    meta: dict = {}
+                    if attempt == 1:
+                        prompt = base_compare_prompt
+                    else:
+                        yield _sse({
+                            "type": "info",
+                            "stage": "analysis",
+                            "message": (
+                                f"Analysis output was truncated — continuing "
+                                f"(pass {attempt}/{max_analysis_passes})…"
+                            ),
+                        })
+                        tail_len = 3000
+                        tail = (complete_analysis[-tail_len:]
+                                if len(complete_analysis) > tail_len
+                                else complete_analysis)
+                        prompt = (
+                            "Your previous analysis was cut off due to length limits. "
+                            "Here is the end of what you wrote:\n\n"
+                            f"---\n{tail}\n---\n\n"
+                            "Continue EXACTLY from where you left off. Do not repeat "
+                            "content already written. Cover all remaining differences "
+                            "between the Source and Target ICDs."
+                        )
+
+                    pass_parts: list[str] = []
+                    for batch in _batched_stream_text(
+                        _call_llm_stream(
+                            compare_system, prompt,
+                            max_tokens=compare_max_tokens, meta=meta,
+                        )
+                    ):
+                        pass_parts.append(batch)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "analysis",
+                            "token": batch,
+                        })
+
+                    pass_text = "".join(pass_parts)
+                    analysis_parts.append(pass_text)
+                    complete_analysis = "".join(analysis_parts)
+                    last_meta = meta
+
+                    if meta.get("finish_reason") != "length":
+                        log.info(
+                            "Analysis pass %d done (finish_reason=%s)",
+                            attempt, meta.get("finish_reason"),
+                        )
+                        break
+                    log.info("Analysis pass %d hit token limit, continuing…", attempt)
+
+                if last_meta.get("finish_reason") == "length":
+                    log.warning(
+                        "ICD analysis may be incomplete after %d passes",
+                        max_analysis_passes,
+                    )
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": (
+                            "Note: analysis reached maximum continuation passes. "
+                            "Some minor details may be incomplete."
+                        ),
+                    })
+
+                change_spec = complete_analysis.strip()
+                log.info(
+                    "ICD analysis complete (%d chars, %d passes, mode=%s)",
+                    len(change_spec), len(analysis_parts),
+                    "direct" if use_direct else "map-reduce",
                 )
-                yield _sse({
-                    "type": "info",
-                    "stage": "analysis",
-                    "message": (
-                        "Note: analysis reached maximum continuation passes. "
-                        "Some minor details may be incomplete."
-                    ),
-                })
+            except Exception as e:
+                log.exception("LLM analysis failed: %s", e)
+                yield _sse({"type": "error", "message": str(e)})
+                return
 
-            change_spec = complete_analysis.strip()
-            log.info(
-                "ICD analysis complete (%d chars, %d passes, mode=%s)",
-                len(change_spec), len(analysis_parts),
-                "direct" if use_direct else "map-reduce",
-            )
-        except Exception as e:
-            log.exception("LLM analysis failed: %s", e)
-            yield _sse({"type": "error", "message": str(e)})
-            return
+            (session_dir / "change_spec.txt").write_text(change_spec)
+            (session_dir / "target_summary.txt").write_text(target_summary)
 
-        (session_dir / "change_spec.txt").write_text(change_spec)
-        (session_dir / "target_summary.txt").write_text(target_summary)
+            analysis_report_parts = [change_spec]
+            if repo_knowledge:
+                analysis_report_parts.append("\n\n" + repo_knowledge)
+            full_analysis = "\n".join(analysis_report_parts)
+            (session_dir / "icd_analysis.txt").write_text(full_analysis)
+            (gen_dir / "icd_analysis.txt").write_text(full_analysis)
+            yield _sse({"type": "stage_complete", "stage": "analysis"})
 
-        analysis_report_parts = [change_spec]
-        if repo_knowledge:
-            analysis_report_parts.append("\n\n" + repo_knowledge)
-        full_analysis = "\n".join(analysis_report_parts)
-        (session_dir / "icd_analysis.txt").write_text(full_analysis)
-        (gen_dir / "icd_analysis.txt").write_text(full_analysis)
-        yield _sse({"type": "stage_complete", "stage": "analysis"})
 
         # Gather cross-file context (the uploaded source files)
         all_code_ctx = ""
@@ -2829,6 +3039,25 @@ async def process(session_id: str):
         # ---- Step 2: Transform each file ------------------------------
         for i, code_file in enumerate(code_files):
             fname = code_file.name
+            if (
+                is_resume
+                and fname in set(_pipeline_state(_read_status(session_dir)).get("completed_files", []))
+                and (gen_dir / fname).exists()
+            ):
+                yield _sse({
+                    "type": "stage",
+                    "stage": "transform",
+                    "file": fname,
+                    "index": i,
+                    "total": len(code_files),
+                    "message": f"Resuming: reusing completed transform for {fname}...",
+                })
+                yield _sse({
+                    "type": "file_complete",
+                    "file": fname,
+                    "size": (gen_dir / fname).stat().st_size,
+                })
+                continue
             yield _sse({
                 "type": "stage",
                 "stage": "transform",
@@ -3004,7 +3233,24 @@ async def process(session_id: str):
         # ---- Step 3: Verification --------------------------------------
         gen_files = sorted(p for p in gen_dir.iterdir()
                            if p.is_file() and p.suffix in ('.c', '.h'))
-        if gen_files:
+        verification_done = (
+            is_resume
+            and "verification" in set(_pipeline_state(_read_status(session_dir)).get("completed_stages", []))
+            and (gen_dir / "verification_report.txt").exists()
+        )
+        if verification_done:
+            yield _sse({
+                "type": "stage",
+                "stage": "verification",
+                "message": "Resuming: reusing completed verification report...",
+            })
+            yield _sse({
+                "type": "info",
+                "stage": "verification",
+                "message": "Loaded prior verification_report.txt.",
+            })
+            yield _sse({"type": "stage_complete", "stage": "verification"})
+        elif gen_files:
             yield _sse({
                 "type": "stage",
                 "stage": "verification",
@@ -3292,47 +3538,77 @@ async def process(session_id: str):
         # ---- Step 4: Sandbox build ------------------------------------
         sandbox_build_success = None
         if has_repo:
-            yield _sse({
-                "type": "stage",
-                "stage": "sandbox_build",
-                "message": "Building generated code inside repository sandbox\u2026",
-            })
-            for evt in _sandbox_build_iterate(
-                session_dir=session_dir,
-                gen_dir=gen_dir,
-                repo_dir=repo_dir,
-                change_spec=change_spec,
-                uploaded_names=uploaded_names,
-                has_repo=has_repo,
-                repo_knowledge=repo_knowledge,
-            ):
-                yield evt
-                try:
-                    payload = json.loads(
-                        evt.split("data: ", 1)[1].split("\n", 1)[0]
+            sandbox_done = (
+                is_resume
+                and "sandbox_build" in set(
+                    _pipeline_state(_read_status(session_dir)).get("completed_stages", [])
+                )
+                and (session_dir / "built_repo.zip").exists()
+            )
+            if sandbox_done:
+                sandbox_build_success = bool(
+                    _pipeline_state(_read_status(session_dir)).get(
+                        "sandbox_build_success", True
                     )
-                    if payload.get("type") == "sandbox_build_result":
-                        sandbox_build_success = payload.get("success", False)
-                except Exception:
-                    pass
-            yield _sse({"type": "stage_complete", "stage": "sandbox_build"})
+                )
+                yield _sse({
+                    "type": "stage",
+                    "stage": "sandbox_build",
+                    "message": "Resuming: reusing completed sandbox build artifacts...",
+                })
+                yield _sse({
+                    "type": "sandbox_build_result",
+                    "stage": "sandbox_build",
+                    "success": sandbox_build_success,
+                    "iterations": 0,
+                    "message": "Reused prior built_repo.zip and sandbox_build_log.txt.",
+                })
+                yield _sse({"type": "stage_complete", "stage": "sandbox_build"})
+            else:
+                yield _sse({
+                    "type": "stage",
+                    "stage": "sandbox_build",
+                    "message": "Building generated code inside repository sandbox…",
+                })
+                for evt in _sandbox_build_iterate(
+                    session_dir=session_dir,
+                    gen_dir=gen_dir,
+                    repo_dir=repo_dir,
+                    change_spec=change_spec,
+                    uploaded_names=uploaded_names,
+                    has_repo=has_repo,
+                    repo_knowledge=repo_knowledge,
+                ):
+                    yield evt
+                    try:
+                        payload = json.loads(
+                            evt.split("data: ", 1)[1].split("\n", 1)[0]
+                        )
+                        if payload.get("type") == "sandbox_build_result":
+                            sandbox_build_success = payload.get("success", False)
+                    except Exception:
+                        pass
+                yield _sse({"type": "stage_complete", "stage": "sandbox_build"})
 
+            status = _read_status(session_dir)
             status["sandbox_build_success"] = sandbox_build_success
-            (session_dir / "status.json").write_text(json.dumps(status))
+            _write_status(session_dir, status)
 
         # ---- Done -----------------------------------------------------
+        status = _read_status(session_dir)
+        status["pause_requested"] = False
         status["state"] = "completed"
         status["generated_files"] = sorted(
             p.name for p in gen_dir.iterdir() if p.is_file()
         )
-        (session_dir / "status.json").write_text(json.dumps(status))
+        _write_status(session_dir, status)
         complete_payload = {"type": "complete", "files": status["generated_files"]}
         if sandbox_build_success is not None:
             complete_payload["sandbox_build"] = sandbox_build_success
         yield _sse(complete_payload)
 
     return StreamingResponse(
-        event_stream(),
+        _pausable_stream(session_dir, event_stream()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -3350,8 +3626,20 @@ async def download_all(session_id: str):
 
     gen_dir = session_dir / "generated_code"
     files = sorted(p for p in gen_dir.iterdir() if p.is_file())
-    if not files:
-        raise HTTPException(status_code=404, detail="No generated files found")
+    report_candidates = [
+        session_dir / "icd_analysis.txt",
+        session_dir / "change_spec.txt",
+        session_dir / "target_summary.txt",
+        session_dir / "repo_knowledge.txt",
+        session_dir / "sandbox_build_log.txt",
+        session_dir / PAUSE_SUMMARY_FILE,
+        session_dir / PIPELINE_EVENTS_FILE,
+        session_dir / "status.json",
+        gen_dir / "verification_report.txt",
+        gen_dir / "icd_analysis.txt",
+    ]
+    if not files and not any(p.exists() for p in report_candidates):
+        raise HTTPException(status_code=404, detail="No generated files or reports found")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -3379,6 +3667,17 @@ async def download_all(session_id: str):
         if build_log.exists():
             zf.write(build_log, "sandbox_build_log.txt")
             log.info("Added sandbox_build_log.txt")
+        for report in [
+            session_dir / PAUSE_SUMMARY_FILE,
+            session_dir / PIPELINE_EVENTS_FILE,
+            session_dir / "status.json",
+            session_dir / "change_spec.txt",
+            session_dir / "target_summary.txt",
+            session_dir / "repo_knowledge.txt",
+        ]:
+            if report.exists():
+                zf.write(report, report.name)
+                log.info("Added %s", report.name)
     buf.seek(0)
 
     return StreamingResponse(
