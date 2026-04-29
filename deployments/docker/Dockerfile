@@ -4,7 +4,8 @@ ARG USER_ID=1000
 ARG GROUP_ID=1000
 
 RUN apt-get update \
-    && apt-get install -y vim git curl tmux python3 python3-pip python3.12-venv sudo \
+    && apt-get install -y --no-install-recommends \
+       vim git curl tmux python3 python3-pip python3-venv sudo \
        build-essential cmake \
        gcc-arm-none-eabi libnewlib-arm-none-eabi libnewlib-dev \
     && apt autoremove -y \
