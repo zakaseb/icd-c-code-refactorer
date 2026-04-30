@@ -32,6 +32,10 @@ try:
     from api.orchestrator import run_orchestrator as _run_orchestrator
 except ImportError:  # tolerate flat layout (uvicorn app.app:app)
     from orchestrator import run_orchestrator as _run_orchestrator
+try:
+    from api.agentic_debug import run_agentic_debug as _run_agentic_debug
+except ImportError:
+    from agentic_debug import run_agentic_debug as _run_agentic_debug
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -92,6 +96,26 @@ SANDBOX_ORCH_MAX_STEPS = int(os.environ.get("SANDBOX_ORCH_MAX_STEPS", "80"))
 SANDBOX_ORCH_MAX_BUILDS = int(os.environ.get("SANDBOX_ORCH_MAX_BUILDS", "25"))
 SANDBOX_ORCH_OUTER_ROUNDS = int(
     os.environ.get("SANDBOX_ORCH_OUTER_ROUNDS", "4")
+)
+# Agentic-AI debug pipeline (state-machine, single-hypothesis-per-iteration).
+# When enabled it takes precedence over SANDBOX_USE_ORCHESTRATOR.
+SANDBOX_USE_AGENTIC = os.environ.get(
+    "SANDBOX_USE_AGENTIC", "0"
+).strip().lower() not in ("0", "false", "no", "off")
+SANDBOX_AGENTIC_MAX_ATTEMPTS = int(
+    os.environ.get("SANDBOX_AGENTIC_MAX_ATTEMPTS", "30")
+)
+SANDBOX_AGENTIC_NO_PROGRESS = int(
+    os.environ.get("SANDBOX_AGENTIC_NO_PROGRESS", "3")
+)
+SANDBOX_AGENTIC_OSCILLATION = int(
+    os.environ.get("SANDBOX_AGENTIC_OSCILLATION", "2")
+)
+SANDBOX_AGENTIC_EDIT_BUDGET = int(
+    os.environ.get("SANDBOX_AGENTIC_EDIT_BUDGET", "60")
+)
+SANDBOX_AGENTIC_OUTER_ROUNDS = int(
+    os.environ.get("SANDBOX_AGENTIC_OUTER_ROUNDS", "2")
 )
 # Coalesce tiny llama-server deltas into fewer SSE messages (less JSON.parse +
 # DOM pressure in the browser — important on unified-memory hosts).
@@ -1423,6 +1447,341 @@ def _sandbox_build_iterate(
     escalation_level = 0
     error_history: list[str] = []
     repo_files_patched: dict[Path, str] = {}
+
+    # ---------------------------------------------------------------------
+    # Agentic-AI debugging pipeline (state machine, one hypothesis per iter)
+    #
+    # Treats debugging as a search problem over constrained edits:
+    #   BUILD → TRIAGE → ROOT_CAUSE → PLAN → PATCH → VERIFY → DECIDE
+    # with snapshots+rollback, per-attempt artifacts, and a memory store.
+    # Enabled by SANDBOX_USE_AGENTIC=1; takes precedence over the
+    # ReAct-style orchestrator.
+    # ---------------------------------------------------------------------
+    if SANDBOX_USE_AGENTIC:
+        gen_files_brief: dict[str, str] = {}
+        for gname, gpath in replacement_map.items():
+            try:
+                rel = str(gpath.relative_to(sandbox_dir))
+            except ValueError:
+                rel = gname
+            gen_files_brief[rel] = gname
+
+        def _agentic_runner_factory(local_log: list[str]):
+            attempts = {"n": 0}
+
+            def _runner() -> tuple[bool, str]:
+                attempts["n"] += 1
+                local_log.append("-" * 65)
+                local_log.append(f"BUILD ATTEMPT {attempts['n']}")
+                local_log.append("-" * 65)
+                ok, out = _run_sandbox_build(sandbox_dir, build_info)
+                local_log.append(f"\n{out}\n")
+                local_log.append(
+                    f"\n>>> BUILD {'SUCCEEDED' if ok else 'FAILED'}"
+                    f" on attempt {attempts['n']}\n"
+                )
+                return ok, out
+            return _runner, attempts
+
+        agentic_total_steps = 0
+        agentic_total_builds = 0
+        success_via_agentic = False
+
+        for outer_round in range(1, SANDBOX_AGENTIC_OUTER_ROUNDS + 1):
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"Starting agentic debug pipeline "
+                    f"(round {outer_round}/{SANDBOX_AGENTIC_OUTER_ROUNDS}) — "
+                    f"max {SANDBOX_AGENTIC_MAX_ATTEMPTS} attempts, "
+                    f"no-progress limit {SANDBOX_AGENTIC_NO_PROGRESS}…"
+                ),
+            })
+            build_log_lines.append("=" * 65)
+            build_log_lines.append(
+                f"AGENTIC ROUND {outer_round}"
+            )
+            build_log_lines.append("=" * 65)
+
+            runner, attempts_state = _agentic_runner_factory(build_log_lines)
+
+            round_done_event: dict | None = None
+            try:
+                for evt in _run_agentic_debug(
+                    session_dir=session_dir,
+                    sandbox_dir=sandbox_dir,
+                    build_info=build_info,
+                    sandbox_cc=sandbox_cc,
+                    is_cross=is_cross,
+                    gen_files=gen_files_brief,
+                    change_spec=change_spec,
+                    repo_knowledge=repo_knowledge,
+                    file_index=_file_index,
+                    snapshots=original_repo_files,
+                    build_runner=runner,
+                    llm_stream=_call_llm_stream,
+                    max_attempts=SANDBOX_AGENTIC_MAX_ATTEMPTS,
+                    no_progress_limit=SANDBOX_AGENTIC_NO_PROGRESS,
+                    oscillation_limit=SANDBOX_AGENTIC_OSCILLATION,
+                    edit_budget_files=SANDBOX_AGENTIC_EDIT_BUDGET,
+                ):
+                    et = evt.get("type")
+                    if et == "step":
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": (
+                                f"agentic attempt {evt['step']}/"
+                                f"{SANDBOX_AGENTIC_MAX_ATTEMPTS}"
+                            ),
+                        })
+                    elif et == "phase":
+                        build_log_lines.append(
+                            f"[phase:{evt['step']}] {evt['phase']}"
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": (
+                                f"step {evt['step']}: phase={evt['phase']}"
+                            ),
+                        })
+                    elif et == "thought":
+                        snippet = evt["text"]
+                        if len(snippet) > 800:
+                            snippet = snippet[:800] + " …"
+                        build_log_lines.append(
+                            f"[think:{evt['step']}] {snippet}"
+                        )
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": (
+                                f"\n--- think (step {evt['step']}) ---\n"
+                                f"{snippet}\n"
+                            ),
+                        })
+                    elif et == "action":
+                        try:
+                            args_summary = json.dumps(
+                                evt["args"], ensure_ascii=False,
+                            )
+                        except Exception:
+                            args_summary = str(evt["args"])
+                        if len(args_summary) > 600:
+                            args_summary = args_summary[:600] + " …"
+                        build_log_lines.append(
+                            f"[action:{evt['step']}] {evt['tool']} "
+                            f"{args_summary}"
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": (
+                                f"step {evt['step']}: {evt['tool']}"
+                            ),
+                        })
+                    elif et == "observation":
+                        otext = evt["text"]
+                        if len(otext) > 1500:
+                            otext = otext[:1500] + " …"
+                        build_log_lines.append(
+                            f"[obs:{evt['step']}{' ERR' if evt.get('error') else ''}] "
+                            f"{otext}"
+                        )
+                        sse_obs = _tail_truncate_for_sse(
+                            evt["text"],
+                            SANDBOX_SSE_MAX_BUILD_LOG_CHARS,
+                            "agentic_observation",
+                        )
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": (
+                                f"\n--- observation (step {evt['step']}) ---\n"
+                                f"{sse_obs}\n"
+                            ),
+                        })
+                    elif et == "build":
+                        build_log_lines.append(
+                            f"[build call #{evt['calls']}] "
+                            f"{'OK' if evt['success'] else 'FAIL'}"
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": (
+                                f"build call {evt['calls']}: "
+                                f"{'success' if evt['success'] else 'failed'}"
+                            ),
+                        })
+                    elif et == "raw_token":
+                        yield _sse({
+                            "type": "token",
+                            "stage": "sandbox_build",
+                            "token": evt["text"],
+                        })
+                    elif et == "warning":
+                        build_log_lines.append(
+                            f"[warning] {evt['message']}"
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "sandbox_build",
+                            "message": evt["message"],
+                        })
+                    elif et == "done":
+                        round_done_event = evt
+                        break
+            except Exception as e:
+                log.exception("Agentic round %d crashed", outer_round)
+                build_log_lines.append(f"[agentic crash] {e}")
+                yield _sse({
+                    "type": "info",
+                    "stage": "sandbox_build",
+                    "message": f"Agentic pipeline crashed: {e}",
+                })
+                round_done_event = {
+                    "type": "done",
+                    "success": False,
+                    "reason": f"crash: {e}",
+                    "steps": 0,
+                    "builds": attempts_state["n"],
+                }
+
+            if round_done_event is None:
+                round_done_event = {
+                    "type": "done",
+                    "success": False,
+                    "reason": "round ended without explicit done event",
+                    "steps": SANDBOX_AGENTIC_MAX_ATTEMPTS,
+                    "builds": attempts_state["n"],
+                }
+
+            agentic_total_steps += int(round_done_event.get("steps", 0))
+            agentic_total_builds += int(round_done_event.get("builds", 0))
+            build_log_lines.append(
+                f"\n>>> Round {outer_round} ended: "
+                f"{round_done_event['reason']}\n"
+            )
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"agentic round {outer_round} ended — "
+                    f"{round_done_event['reason']}"
+                ),
+            })
+
+            if round_done_event.get("success"):
+                success_via_agentic = True
+                break
+
+            # Round failed: reset to initial snapshot before next round.
+            if outer_round < SANDBOX_AGENTIC_OUTER_ROUNDS:
+                yield _sse({
+                    "type": "info",
+                    "stage": "sandbox_build",
+                    "message": (
+                        "Resetting all files to initial state for next "
+                        "agentic round…"
+                    ),
+                })
+                for fname in gen_filenames:
+                    if fname in initial_gen_code:
+                        (gen_dir / fname).write_text(initial_gen_code[fname])
+                        if fname in replacement_map:
+                            replacement_map[fname].write_text(
+                                initial_gen_code[fname]
+                            )
+                for rpath, orig_content in original_repo_files.items():
+                    if rpath.name not in gen_filenames:
+                        try:
+                            rpath.write_text(orig_content)
+                        except OSError:
+                            pass
+                build_log_lines.append(
+                    "   Reset all files to initial snapshot before next round.\n"
+                )
+
+        if not success_via_agentic:
+            build_log_lines.extend([
+                "",
+                "=" * 65,
+                "SUMMARY (AGENTIC)",
+                "=" * 65,
+                f"Agentic rounds: {SANDBOX_AGENTIC_OUTER_ROUNDS}",
+                f"Total agent steps: {agentic_total_steps}",
+                f"Total build calls: {agentic_total_builds}",
+                f"Result: BUILD STILL FAILING (best effort packaged)",
+                "",
+                "Per-attempt artifacts: see ./agentic_attempts/attempt_NN/",
+                "Memory store:           see ./playbook.jsonl",
+                "",
+            ])
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    "Agentic pipeline did not converge — packaging "
+                    "best-effort version of the repository for download."
+                ),
+            })
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": "Packaging best-effort repository…",
+            })
+            _package_sandbox_zip(session_dir, sandbox_dir)
+            build_log_path = session_dir / "sandbox_build_log.txt"
+            build_log_path.write_text("\n".join(build_log_lines) + "\n")
+            yield _sse({
+                "type": "sandbox_build_result",
+                "stage": "sandbox_build",
+                "success": False,
+                "iterations": agentic_total_builds,
+                "message": (
+                    "Sandbox build did not converge after "
+                    f"{SANDBOX_AGENTIC_OUTER_ROUNDS} agentic round(s); "
+                    "best-effort repository packaged."
+                ),
+            })
+            return
+
+        build_log_lines.extend([
+            "",
+            "=" * 65,
+            "SUMMARY (AGENTIC)",
+            "=" * 65,
+            f"Agentic rounds: {outer_round}",
+            f"Total agent steps: {agentic_total_steps}",
+            f"Total build calls: {agentic_total_builds}",
+            f"Result: BUILD SUCCEEDED",
+            "",
+            "Per-attempt artifacts: see ./agentic_attempts/attempt_NN/",
+            "Memory store:           see ./playbook.jsonl",
+            "",
+        ])
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": "Packaging built repository…",
+        })
+        _package_sandbox_zip(session_dir, sandbox_dir)
+        build_log_path = session_dir / "sandbox_build_log.txt"
+        build_log_path.write_text("\n".join(build_log_lines) + "\n")
+        yield _sse({
+            "type": "sandbox_build_result",
+            "stage": "sandbox_build",
+            "success": True,
+            "iterations": agentic_total_builds,
+            "message": (
+                f"Sandbox build succeeded via agentic round "
+                f"{outer_round} — repository packaged."
+            ),
+        })
+        return
 
     # ---------------------------------------------------------------------
     # Orchestrator-driven debugging loop
@@ -3674,10 +4033,25 @@ async def download_all(session_id: str):
             session_dir / "change_spec.txt",
             session_dir / "target_summary.txt",
             session_dir / "repo_knowledge.txt",
+            session_dir / "playbook.jsonl",
         ]:
             if report.exists():
                 zf.write(report, report.name)
                 log.info("Added %s", report.name)
+        # Per-attempt artifacts from the agentic debug pipeline (small JSON
+        # blobs + diffs); kept under ./agentic_attempts/ in the ZIP.
+        agentic_attempts_dir = session_dir / "agentic_attempts"
+        if agentic_attempts_dir.exists() and agentic_attempts_dir.is_dir():
+            added = 0
+            for af in sorted(agentic_attempts_dir.rglob("*")):
+                if af.is_file():
+                    arc = "agentic_attempts/" + str(
+                        af.relative_to(agentic_attempts_dir)
+                    )
+                    zf.write(af, arc)
+                    added += 1
+            if added:
+                log.info("Added %d agentic_attempts/* files", added)
     buf.seek(0)
 
     return StreamingResponse(
