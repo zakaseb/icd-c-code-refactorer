@@ -29,6 +29,7 @@ from app import (
     _assemble_prompt,
     _extract_fenced,
     _looks_complete_c_file,
+    _sync_generated_from_sandbox,
     MAX_REPO_CONTEXT_CHARS,
     MAX_INPUT_TOKENS,
     CHARS_PER_TOKEN,
@@ -315,6 +316,31 @@ check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
 check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+
+# ---------------------------------------------------------------
+print("\n=== Test 15: Sandbox sync updates generated downloads ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    root = Path(tmpdir)
+    gen_dir = root / "generated_code"
+    sandbox_dir = root / "sandbox"
+    gen_dir.mkdir()
+    sandbox_dir.mkdir()
+
+    (gen_dir / "main.c").write_text("int broken = ;\n")
+    sandbox_main = sandbox_dir / "src" / "main.c"
+    sandbox_main.parent.mkdir()
+    sandbox_main.write_text("int fixed = 1;\n")
+
+    sync_log: list[str] = []
+    synced = _sync_generated_from_sandbox(
+        gen_dir, {"main.c": sandbox_main}, sync_log,
+    )
+    check("sync returns generated filename", synced == ["main.c"], str(synced))
+    check("generated_code receives sandbox fix",
+          (gen_dir / "main.c").read_text() == "int fixed = 1;\n")
+    check("sync noted in build log",
+          any("Synced generated outputs" in line for line in sync_log),
+          str(sync_log))
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")

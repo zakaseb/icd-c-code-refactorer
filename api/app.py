@@ -1688,6 +1688,7 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "message": "Packaging best-effort repository…",
             })
+            _sync_generated_from_sandbox(gen_dir, replacement_map, build_log_lines)
             _package_sandbox_zip(session_dir, sandbox_dir)
             build_log_path = session_dir / "sandbox_build_log.txt"
             build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -1721,6 +1722,7 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "message": "Packaging built repository…",
         })
+        _sync_generated_from_sandbox(gen_dir, replacement_map, build_log_lines)
         _package_sandbox_zip(session_dir, sandbox_dir)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2156,6 +2158,36 @@ def _sandbox_build_iterate(
         "iterations": iteration,
         "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path,
+    replacement_map: dict[str, Path],
+    build_log_lines: list[str] | None = None,
+) -> list[str]:
+    """Copy sandbox-fixed generated files back to the session output dir.
+
+    The sandbox build may apply final compiler fixes only inside the copied
+    repository. Keep the normal preview/download endpoints in sync with that
+    build-verified code.
+    """
+    synced: list[str] = []
+    for fname, sandbox_path in sorted(replacement_map.items()):
+        if not sandbox_path.exists() or not sandbox_path.is_file():
+            if build_log_lines is not None:
+                build_log_lines.append(
+                    f"Skipped sync for {fname}: sandbox file missing."
+                )
+            continue
+        dest = gen_dir / fname
+        dest.write_text(sandbox_path.read_text(errors="replace"))
+        synced.append(fname)
+
+    if build_log_lines is not None and synced:
+        build_log_lines.append(
+            "Synced generated outputs from sandbox: " + ", ".join(synced)
+        )
+    return synced
 
 
 def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
