@@ -337,7 +337,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     )
     check("sync returns generated filename", synced == ["main.c"], str(synced))
     check("generated_code receives sandbox fix",
-          (gen_dir / "main.c").read_text() == "int fixed = 1;")
+          (gen_dir / "main.c").read_text() == "int fixed = 1;\n")
     check("sync noted in build log",
           any("Synced generated outputs" in line for line in sync_log),
           str(sync_log))
