@@ -37,14 +37,14 @@ Transform C source code between Interface Control Document (ICD) versions using 
 - **Variable Inventory** — Verification reports include a complete inventory of all variables, macros, and function parameters in the generated code.
 - **Detailed Verification Reports** — Every run produces a report documenting structural checks, verification outcomes, unified diffs of all changes, and the variable inventory.
 - **Real-Time Streaming** — All pipeline stages stream progress via Server-Sent Events so you see analysis, transformation, and verification happen token by token.
-- **Fully Local** — Runs Qwen3-Coder-30B via llama.cpp on your own GPU. No cloud APIs, no data exfiltration.
+- **Fully Local** — Runs Qwen3-Next-80B-A3B via llama.cpp on your own GPU. No cloud APIs, no data exfiltration.
 
 
 # Hardware
 
 Device: `Workstation`, `AI-Laptop-Dell`, `AI-Laptop-MSI`
 
-Requires an NVIDIA GPU with 24 GB+ VRAM for full GPU offload of the Qwen3-Coder-30B-A3B model. The number of GPU layers offloaded is controlled by `LLAMA_ARG_N_GPU_LAYERS` (default: `auto`). CPU-only fallback is available but significantly slower.
+Requires an NVIDIA GPU with 48 GB+ VRAM (e.g. A6000, L40, A100 40/80 GB, H100) for full GPU offload of the Qwen3-Next-80B-A3B model at the bundled `UD-Q4_K_XL` quant (~48.5 GB). The number of GPU layers offloaded is controlled by `LLAMA_ARG_N_GPU_LAYERS` (default: `auto`), so smaller GPUs (e.g. 24 GB) still work by spilling layers to CPU RAM with reduced throughput. Because Qwen3-Next-80B-A3B is a Mixture-of-Experts model with ~3 B active parameters per token, per-token latency is comparable to a dense 30 B model when fully offloaded. CPU-only fallback is available but significantly slower.
 
 Please refer to [Reproducible Experiments](https://hal-confluence.edgegroup.ae/spaces/AIENG/pages/424772002/Reproducible+Experiments+in+PyTorch) for settings on reproducible results.
 
@@ -52,8 +52,8 @@ Please refer to [Reproducible Experiments](https://hal-confluence.edgegroup.ae/s
 # Prerequisites
 
 * Docker with NVIDIA GPU support (`nvidia-container-toolkit` installed and configured)
-* NVIDIA GPU with 24 GB+ VRAM recommended
-* ~20 GB free disk space for the quantised GGUF model (auto-downloaded on first run)
+* NVIDIA GPU with 48 GB+ VRAM recommended (24 GB works with partial offload)
+* ~50 GB free disk space for the quantised GGUF model (auto-downloaded on first run)
 * Tools:
   * Docker + NVIDIA Container Toolkit
   * `nvidia-smi` accessible on the host
@@ -79,7 +79,7 @@ mkdir -p models
 
 Open **[http://localhost:8081](http://localhost:8081)** in your browser once the container finishes starting up.
 
-> On first run, `entrypoint.sh` downloads the Qwen3-Coder-30B-A3B-Instruct GGUF model (~20 GB) into `models/`. Subsequent starts are fast as the model is cached.
+> On first run, `entrypoint.sh` downloads the Qwen3-Next-80B-A3B-Instruct GGUF model (~48.5 GB at `UD-Q4_K_XL`) into `models/`. Subsequent starts are fast as the model is cached.
 
 > `run_web.sh` runs a GPU preflight check, reserves CPU cores for the host, and validates port 8081 is free before starting. If the GPU is unavailable it offers a CPU-only fallback (significantly slower).
 
@@ -269,7 +269,7 @@ Each run produces a `verification_report.txt` included in the download ZIP:
                              │ OpenAI-compatible streaming API
 ┌────────────────────────────▼────────────────────────────────────────┐
 │                    llama.cpp (llama-server)                          │
-│             Qwen3-Coder-30B-A3B quantised (Q4_K_XL)                 │
+│           Qwen3-Next-80B-A3B-Instruct quantised (UD-Q4_K_XL)        │
 │                    GPU-accelerated (CUDA)                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -280,7 +280,7 @@ Each run produces a `verification_report.txt` included in the download ZIP:
 | **Backend** | Python 3, FastAPI, uvicorn | Session management, PDF processing, LLM orchestration, verification |
 | **PDF Extraction** | PyMuPDF (fitz) | Reliable text extraction from ICD PDFs |
 | **LLM Inference** | llama.cpp `llama-server` | Local GPU inference, OpenAI-compatible streaming API |
-| **Model** | Qwen3-Coder-30B-A3B-Instruct (GGUF Q4_K_XL) | Code-specialised LLM (~20 GB quantised) |
+| **Model** | Qwen3-Next-80B-A3B-Instruct (GGUF UD-Q4_K_XL) | MoE LLM with ~3 B active params/token (~48.5 GB quantised) |
 | **LLM Proxy** | LiteLLM | Anthropic-compatible API proxy (for Claude Code tooling) |
 | **Container** | Docker + NVIDIA Container Toolkit | Reproducible deployment with GPU passthrough |
 
@@ -288,9 +288,9 @@ Each run produces a `verification_report.txt` included in the download ZIP:
 
 | | Details |
 |---|---|
-| **Model** | Qwen3-Coder-30B-A3B-Instruct (GGUF Q4_K_XL) |
-| **Version** | `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` |
-| **Source** | [Hugging Face — unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF) |
+| **Model** | Qwen3-Next-80B-A3B-Instruct (GGUF UD-Q4_K_XL) |
+| **Version** | `unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF` |
+| **Source** | [Hugging Face — unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF) |
 | **License** | Apache 2.0 |
 | **Usage restrictions** | No PII or sensitive data should be included in uploaded ICD PDFs or source files if operating under data residency constraints. All inference is local — no data leaves the machine. |
 
