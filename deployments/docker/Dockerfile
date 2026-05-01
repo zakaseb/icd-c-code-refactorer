@@ -42,14 +42,14 @@ RUN if getent group $GROUP_ID > /dev/null; then \
 
 RUN chown -R developer:developer /opt/venv
 
-ENV HF_CHAT_TEMPLATE='/app/Qwen3-Next-80B-A3B-Instruct-UD-Q4_K_XL.jinja'
-ADD --chown=developer:developer https://huggingface.co/unsloth/Qwen3-Next-80B-A3B-Instruct/raw/main/chat_template.jinja $HF_CHAT_TEMPLATE
+ENV HF_CHAT_TEMPLATE='/app/Qwen3-Coder-Next-UD-Q4_K_XL.jinja'
+ADD --chown=developer:developer https://huggingface.co/unsloth/Qwen3-Coder-Next/raw/main/chat_template.jinja $HF_CHAT_TEMPLATE
 
 USER developer
 
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
-ENV HF_REPO_ID="unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF"
-ENV HF_MODEL="Qwen3-Next-80B-A3B-Instruct-UD-Q4_K_XL.gguf"
+ENV HF_REPO_ID="unsloth/Qwen3-Coder-Next-GGUF"
+ENV HF_MODEL="Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
 
 ENV LLAMA_ARG_HOST=0.0.0.0
 ENV LLAMA_ARG_PORT=24000

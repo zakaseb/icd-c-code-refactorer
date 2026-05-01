@@ -59,7 +59,7 @@ LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:24000")
 LLM_BASE_URL_LITELLM = os.environ.get("LITELLM_BASE_URL", "http://127.0.0.1:4000")
 LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "sk-1234-miaw")
 HF_MODEL = os.environ.get(
-    "HF_MODEL", "Qwen3-Next-80B-A3B-Instruct-UD-Q4_K_XL.gguf"
+    "HF_MODEL", "Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
 )
 MODEL_NAME = HF_MODEL.replace(".gguf", "") if HF_MODEL.endswith(".gguf") else HF_MODEL
 MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
