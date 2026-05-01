@@ -1688,6 +1688,7 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "message": "Packaging best-effort repository…",
             })
+            _sync_generated_from_sandbox(gen_dir, replacement_map)
             _package_sandbox_zip(session_dir, sandbox_dir)
             build_log_path = session_dir / "sandbox_build_log.txt"
             build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -1721,6 +1722,7 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "message": "Packaging built repository…",
         })
+        _sync_generated_from_sandbox(gen_dir, replacement_map)
         _package_sandbox_zip(session_dir, sandbox_dir)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2168,6 +2170,15 @@ def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
                 zf.write(fpath, arcname)
     log.info("Packaged sandbox as %s (%d bytes)", zip_path, zip_path.stat().st_size)
     return zip_path
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path, replacement_map: dict[str, Path],
+) -> None:
+    """Copy sandbox-fixed generated files back to the session output dir."""
+    for fname, sandbox_path in replacement_map.items():
+        if sandbox_path.exists() and sandbox_path.is_file():
+            (gen_dir / fname).write_text(sandbox_path.read_text(errors="replace"))
 
 
 def _assemble_prompt(
