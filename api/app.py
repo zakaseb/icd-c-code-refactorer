@@ -1340,6 +1340,7 @@ def _sandbox_build_iterate(
                 "skipping compilation loop. Repository packaged as-is."
             ),
         })
+        _sync_generated_from_sandbox(gen_dir, replacement_map)
         _package_sandbox_zip(session_dir, sandbox_dir)
         yield _sse({
             "type": "info",
@@ -1688,6 +1689,7 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "message": "Packaging best-effort repository…",
             })
+            _sync_generated_from_sandbox(gen_dir, replacement_map)
             _package_sandbox_zip(session_dir, sandbox_dir)
             build_log_path = session_dir / "sandbox_build_log.txt"
             build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -1721,6 +1723,7 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "message": "Packaging built repository…",
         })
+        _sync_generated_from_sandbox(gen_dir, replacement_map)
         _package_sandbox_zip(session_dir, sandbox_dir)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2144,6 +2147,7 @@ def _sandbox_build_iterate(
         "stage": "sandbox_build",
         "message": "Packaging built repository…",
     })
+    _sync_generated_from_sandbox(gen_dir, replacement_map)
     _package_sandbox_zip(session_dir, sandbox_dir)
 
     build_log_path = session_dir / "sandbox_build_log.txt"
@@ -2156,6 +2160,24 @@ def _sandbox_build_iterate(
         "iterations": iteration,
         "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path,
+    replacement_map: dict[str, Path],
+) -> None:
+    """Copy sandbox fixes for generated files back to the session outputs."""
+    for filename, sandbox_path in replacement_map.items():
+        if not sandbox_path.exists() or not sandbox_path.is_file():
+            log.warning("Skipping missing sandbox generated file: %s", sandbox_path)
+            continue
+        dest = (gen_dir / filename).resolve()
+        try:
+            dest.relative_to(gen_dir.resolve())
+        except ValueError:
+            log.warning("Skipping unsafe generated filename during sync: %s", filename)
+            continue
+        dest.write_text(sandbox_path.read_text(errors="replace"))
 
 
 def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
