@@ -1689,6 +1689,7 @@ def _sandbox_build_iterate(
                 "message": "Packaging best-effort repository…",
             })
             _package_sandbox_zip(session_dir, sandbox_dir)
+            _sync_generated_from_sandbox(gen_dir, replacement_map)
             build_log_path = session_dir / "sandbox_build_log.txt"
             build_log_path.write_text("\n".join(build_log_lines) + "\n")
             yield _sse({
@@ -1722,6 +1723,7 @@ def _sandbox_build_iterate(
             "message": "Packaging built repository…",
         })
         _package_sandbox_zip(session_dir, sandbox_dir)
+        _sync_generated_from_sandbox(gen_dir, replacement_map)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
         yield _sse({
@@ -2145,6 +2147,7 @@ def _sandbox_build_iterate(
         "message": "Packaging built repository…",
     })
     _package_sandbox_zip(session_dir, sandbox_dir)
+    _sync_generated_from_sandbox(gen_dir, replacement_map)
 
     build_log_path = session_dir / "sandbox_build_log.txt"
     build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2168,6 +2171,31 @@ def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
                 zf.write(fpath, arcname)
     log.info("Packaged sandbox as %s (%d bytes)", zip_path, zip_path.stat().st_size)
     return zip_path
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path,
+    replacement_map: dict[str, Path],
+) -> None:
+    """Copy final sandbox versions of generated files back to session storage."""
+    for generated_name, sandbox_path in replacement_map.items():
+        if not sandbox_path.is_file():
+            log.warning(
+                "Cannot sync generated file %s: sandbox path missing: %s",
+                generated_name,
+                sandbox_path,
+            )
+            continue
+        try:
+            (gen_dir / generated_name).write_text(
+                sandbox_path.read_text(errors="replace")
+            )
+        except OSError as exc:
+            log.warning(
+                "Failed syncing generated file %s from sandbox: %s",
+                generated_name,
+                exc,
+            )
 
 
 def _assemble_prompt(
