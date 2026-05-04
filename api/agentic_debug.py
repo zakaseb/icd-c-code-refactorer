@@ -66,6 +66,7 @@ DEFAULT_MAX_ATTEMPTS = 30
 DEFAULT_NO_PROGRESS_LIMIT = 3      # iterations without net error reduction
 DEFAULT_OSCILLATION_LIMIT = 2      # same fingerprint reappears N times
 DEFAULT_EDIT_BUDGET_FILES = 60     # cumulative distinct files modified
+DEFAULT_MAX_TOUCHED_FILES_PER_ATTEMPT = 3
 DEFAULT_PLANNER_MAX_TOKENS = 1536
 DEFAULT_PATCH_MAX_TOKENS = 4096
 DEFAULT_BUILD_OUTPUT_BUDGET = 8000
@@ -93,6 +94,33 @@ class ErrorClass(str, Enum):
     STRUCT_LAYOUT = "struct_layout"
     CALLING_CONVENTION = "calling_convention"
     OTHER = "other"
+
+
+class Lane(str, Enum):
+    """Independent verification lanes for mixed firmware/software stacks."""
+
+    FIRMWARE = "firmware"
+    SOFTWARE = "software"
+
+
+# Deterministic repair-family ordering for Xilinx SDK 2018 convergence.
+_REPAIR_FAMILY_PRIORITY: dict[ErrorClass, int] = {
+    # 1) Missing/renamed headers/macros/types
+    ErrorClass.MISSING_INCLUDE: 1,
+    ErrorClass.UNKNOWN_TYPE: 1,
+    ErrorClass.MACRO_MISMATCH: 1,
+    ErrorClass.ENUM_VALUE_DRIFT: 1,
+    # 2) Function prototype/signature drift
+    ErrorClass.SIGNATURE_MISMATCH: 2,
+    # 3) Struct/register field drift + volatile correctness
+    ErrorClass.STRUCT_LAYOUT: 3,
+    ErrorClass.QUALIFIER_MISMATCH: 3,
+    ErrorClass.CALLING_CONVENTION: 3,
+    # 4) Undefined references / linker symbol mapping
+    ErrorClass.LINK_UNDEFINED: 4,
+    # 5) Warning hardening / cleanup
+    ErrorClass.OTHER: 5,
+}
 
 
 @dataclass
@@ -414,7 +442,13 @@ def cluster_errors(
             )
         )
 
-    clusters.sort(key=lambda c: (-c.centrality, c.error_class.value))
+    clusters.sort(
+        key=lambda c: (
+            _priority_for_error_class(c.error_class),
+            -c.centrality,
+            c.root_cause,
+        )
+    )
     return clusters
 
 
@@ -445,10 +479,9 @@ def _suggest_fix(klass: ErrorClass, rep: BuildError, files: list[str]) -> str:
         )
     if klass == ErrorClass.LINK_UNDEFINED:
         return (
-            "Provide a stub or wrapper for the missing symbol. For BSP "
-            "symbols (Xil_*, xil_printf, …) on the cross-compile sandbox, "
-            "the build runner already retries compile-only — focus only on "
-            "non-BSP undefined symbols."
+            "Map undefined references via linker-safe wrappers/adapters and "
+            "resolve ISR/handler symbols explicitly. Under the Xilinx profile, "
+            "compile-only pass is insufficient; full link must succeed."
         )
     if klass == ErrorClass.QUALIFIER_MISMATCH:
         return (
@@ -481,6 +514,436 @@ def errors_fingerprint(errors: list[BuildError]) -> str:
         for e in errors
     })
     return "\n".join(items)
+
+
+_FIRMWARE_PATH_HINTS = (
+    "/bsp/", "/drivers/", "/driver/", "/hal/", "/hw/", "/mmio/", "/isr/",
+    "/interrupt", "/platform", "/startup", "/boot", "/xil", "/xilinx",
+    "/ps7", "/periph", "/peripheral", "/standalone",
+)
+_SOFTWARE_PATH_HINTS = (
+    "/app/", "/application/", "/logic/", "/state/", "/workflow/", "/service/",
+    "/controller/", "/module/",
+)
+_FIRMWARE_NAME_HINTS = (
+    "xparameters", "xil_", "isr", "irq", "handler", "startup", "ps7", "bsp",
+    "lscript", ".ld", ".lds",
+)
+_SOFTWARE_NAME_HINTS = (
+    "app_", "state_", "workflow_", "logic_", "controller_",
+)
+
+_ISR_SYMBOL_RE = re.compile(r"(?:^|_)(?:isr|irq|handler)(?:_|$)", re.IGNORECASE)
+_SECTION_DRIFT_RE = re.compile(
+    r"(section .* will not fit|region .* overflowed|"
+    r"cannot move location counter|\.text|\.data|\.bss|heap|stack)",
+    re.IGNORECASE,
+)
+_DUP_SYMBOL_RE = re.compile(r"(multiple definition of|first defined here)", re.IGNORECASE)
+_BSP_FILE_RE = re.compile(r"(xparameters.*\.h|xil_.*\.h|/bsp/|/ps7/)", re.IGNORECASE)
+_BSP_BUILD_RE = re.compile(r"(bsp|standalone|libxil|xparameters)", re.IGNORECASE)
+
+_SUPERLOOP_HEAD_RE = re.compile(r"(while\s*\(\s*1\s*\)|for\s*\(\s*;\s*;\s*\))")
+_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_MODULO_RE = re.compile(r"\b([A-Za-z_]\w*)\s*%\s*(\d+)")
+_BLOCKING_CALL_RE = re.compile(
+    r"\b(sleep|usleep|nanosleep|delay|delay_ms|delay_us|"
+    r"read|recv|accept|select|poll|sem_wait|pthread_join)\s*\(",
+    re.IGNORECASE,
+)
+
+_C_KEYWORDS = {
+    "if", "for", "while", "switch", "return", "sizeof", "typedef",
+    "struct", "enum", "union", "do", "case",
+}
+
+
+@dataclass
+class LaneDiagnostics:
+    lane: Lane
+    errors: list[BuildError]
+    clusters: list[ErrorCluster]
+    fingerprint: str
+
+
+@dataclass
+class LaneSplitResult:
+    firmware: LaneDiagnostics
+    software: LaneDiagnostics
+    active_lane: Lane
+    active_errors: list[BuildError]
+    active_clusters: list[ErrorCluster]
+
+
+def _priority_for_error_class(klass: ErrorClass) -> int:
+    return _REPAIR_FAMILY_PRIORITY.get(klass, 99)
+
+
+def _lane_for_path(path: str) -> Lane:
+    pl = path.replace("\\", "/").lower()
+    parts = [x for x in pl.split("/") if x]
+    if any(p in {"app", "application", "logic", "state", "workflow", "service", "controller", "module"} for p in parts):
+        return Lane.SOFTWARE
+    if any(p in {"bsp", "drivers", "driver", "hal", "hw", "mmio", "isr", "interrupt", "platform", "startup", "boot", "xil", "xilinx", "ps7", "periph", "peripheral", "standalone"} for p in parts):
+        return Lane.FIRMWARE
+    if any(h in pl for h in _FIRMWARE_PATH_HINTS):
+        return Lane.FIRMWARE
+    if any(h in pl for h in _SOFTWARE_PATH_HINTS):
+        return Lane.SOFTWARE
+    name = Path(pl).name
+    if any(h in name for h in _FIRMWARE_NAME_HINTS):
+        return Lane.FIRMWARE
+    if any(h in name for h in _SOFTWARE_NAME_HINTS):
+        return Lane.SOFTWARE
+    # In Xilinx superloop repos, default unknowns to firmware lane (hard gate).
+    return Lane.FIRMWARE
+
+
+def _lane_for_link_symbol(symbol: str, message: str = "") -> Lane:
+    s = (symbol or "").lower()
+    m = (message or "").lower()
+    if (
+        _ISR_SYMBOL_RE.search(symbol or "")
+        or s.startswith(("xil_", "xscu", "xuart", "xgpio", "xspi", "xadc", "xintc"))
+        or "interrupt" in s
+        or "handler" in s
+    ):
+        return Lane.FIRMWARE
+    if any(k in s for k in ("app", "state", "logic", "workflow", "dispatch")):
+        return Lane.SOFTWARE
+    if "undefined reference" in m:
+        return Lane.FIRMWARE
+    return Lane.FIRMWARE
+
+
+def split_errors_by_lane(errors: list[BuildError]) -> tuple[list[BuildError], list[BuildError]]:
+    firmware: list[BuildError] = []
+    software: list[BuildError] = []
+    for e in errors:
+        if e.file:
+            lane = _lane_for_path(e.file)
+        else:
+            lane = _lane_for_link_symbol(e.symbol, e.message)
+        if lane == Lane.FIRMWARE:
+            firmware.append(e)
+        else:
+            software.append(e)
+    return firmware, software
+
+
+def evaluate_lanes(errors: list[BuildError], index: "CodebaseIndex | None" = None) -> LaneSplitResult:
+    firmware_errors, software_errors = split_errors_by_lane(errors)
+    firmware_clusters = cluster_errors(firmware_errors, index=index)
+    software_clusters = cluster_errors(software_errors, index=index)
+    firmware = LaneDiagnostics(
+        lane=Lane.FIRMWARE,
+        errors=firmware_errors,
+        clusters=firmware_clusters,
+        fingerprint=errors_fingerprint(firmware_errors),
+    )
+    software = LaneDiagnostics(
+        lane=Lane.SOFTWARE,
+        errors=software_errors,
+        clusters=software_clusters,
+        fingerprint=errors_fingerprint(software_errors),
+    )
+    if firmware_errors:
+        active_lane = Lane.FIRMWARE
+        active_errors = firmware_errors
+        active_clusters = firmware_clusters
+    else:
+        active_lane = Lane.SOFTWARE
+        active_errors = software_errors
+        active_clusters = software_clusters
+    return LaneSplitResult(
+        firmware=firmware,
+        software=software,
+        active_lane=active_lane,
+        active_errors=active_errors,
+        active_clusters=active_clusters,
+    )
+
+
+def _is_compile_only_success(build_output: str) -> bool:
+    return "Compile-only PASSED" in (build_output or "")
+
+
+def _linker_errors_present(errors: list[BuildError]) -> bool:
+    return any(e.error_class == ErrorClass.LINK_UNDEFINED for e in errors)
+
+
+def unresolved_icd_deltas(errors: list[BuildError]) -> bool:
+    """Whether unresolved ICD-mapped type/macro/symbol drifts remain."""
+    blockers = {
+        ErrorClass.MISSING_INCLUDE,
+        ErrorClass.UNKNOWN_TYPE,
+        ErrorClass.MACRO_MISMATCH,
+        ErrorClass.SIGNATURE_MISMATCH,
+        ErrorClass.STRUCT_LAYOUT,
+        ErrorClass.QUALIFIER_MISMATCH,
+        ErrorClass.ENUM_VALUE_DRIFT,
+    }
+    return any(e.error_class in blockers for e in errors)
+
+
+def run_linker_bsp_consistency_audits(
+    *,
+    build_output: str,
+    errors: list[BuildError],
+    sandbox_dir: Path,
+    touched_files: Iterable[Path],
+    baseline_snapshots: dict[Path, str],
+) -> list[str]:
+    """Per-attempt Xilinx linker/BSP consistency audits."""
+    audits: list[str] = []
+
+    unresolved_isr = sorted({
+        e.symbol for e in errors
+        if e.error_class == ErrorClass.LINK_UNDEFINED
+        and (_ISR_SYMBOL_RE.search(e.symbol or "") or "handler" in (e.symbol or "").lower())
+    })
+    if unresolved_isr:
+        audits.append(
+            "Unresolved ISR/handler symbols: "
+            + ", ".join(unresolved_isr[:12])
+            + (" …" if len(unresolved_isr) > 12 else "")
+        )
+
+    sec_hits = []
+    for ln in (build_output or "").splitlines():
+        if _SECTION_DRIFT_RE.search(ln):
+            sec_hits.append(ln.strip())
+    if sec_hits:
+        audits.append(
+            "Section placement/size drift detected: "
+            + " | ".join(sec_hits[:3])
+            + (" …" if len(sec_hits) > 3 else "")
+        )
+
+    dup_hits = []
+    for ln in (build_output or "").splitlines():
+        if _DUP_SYMBOL_RE.search(ln):
+            dup_hits.append(ln.strip())
+    if dup_hits:
+        audits.append(
+            "Duplicate symbol conflict detected (possible wrapper collision): "
+            + " | ".join(dup_hits[:2])
+            + (" …" if len(dup_hits) > 2 else "")
+        )
+
+    touched = list(touched_files)
+    for p in touched:
+        rel = str(p.relative_to(sandbox_dir)) if p.is_absolute() else str(p)
+        if not _BSP_FILE_RE.search(rel.replace("\\", "/")):
+            continue
+        if not p.exists() or not p.is_file():
+            continue
+        before = baseline_snapshots.get(p)
+        if before is None:
+            continue
+        try:
+            after = p.read_text(errors="replace")
+        except OSError:
+            continue
+        if after != before:
+            audits.append(
+                f"BSP-generated header divergence candidate: {rel} "
+                "(differs from baseline snapshot)"
+            )
+
+    if _BSP_BUILD_RE.search(build_output or "") and not any("BSP" in a for a in audits):
+        audits.append("BSP/linker diagnostics present in build log; inspect generated headers and linker script.")
+    return audits
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int:
+    depth = 0
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _extract_first_superloop_body(text: str) -> str:
+    m = _SUPERLOOP_HEAD_RE.search(text or "")
+    if not m:
+        return ""
+    open_idx = text.find("{", m.end())
+    if open_idx < 0:
+        return ""
+    close_idx = _find_matching_brace(text, open_idx)
+    if close_idx < 0:
+        return ""
+    return text[open_idx + 1:close_idx]
+
+
+def _phase_for_call(name: str) -> str | None:
+    n = name.lower()
+    if any(k in n for k in ("init", "setup", "config", "start")):
+        return "init"
+    if any(k in n for k in ("poll", "sample", "read", "tick", "scan")):
+        return "poll"
+    if any(k in n for k in ("process", "update", "compute", "handle")):
+        return "process"
+    if any(k in n for k in ("dispatch", "send", "publish", "write", "emit", "tx")):
+        return "dispatch"
+    return None
+
+
+def _superloop_phase_sequence(loop_body: str) -> list[str]:
+    seq: list[str] = []
+    for m in _CALL_RE.finditer(loop_body or ""):
+        fn = m.group(1)
+        if fn in _C_KEYWORDS:
+            continue
+        phase = _phase_for_call(fn)
+        if phase and phase not in seq:
+            seq.append(phase)
+    return seq
+
+
+def _extract_modulo_schedule(loop_body: str) -> dict[str, set[int]]:
+    out: dict[str, set[int]] = {}
+    for m in _MODULO_RE.finditer(loop_body or ""):
+        counter = m.group(1)
+        freq = int(m.group(2))
+        out.setdefault(counter, set()).add(freq)
+    return out
+
+
+def _extract_blocking_calls(loop_body: str) -> set[str]:
+    return {m.group(1).lower() for m in _BLOCKING_CALL_RE.finditer(loop_body or "")}
+
+
+def run_superloop_contract_checks(
+    *,
+    sandbox_dir: Path,
+    patch_result: PatchResult,
+) -> tuple[list[str], list[str]]:
+    """Validate superloop ordering/cadence/non-blocking contracts."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    phase_idx = {"init": 0, "poll": 1, "process": 2, "dispatch": 3}
+
+    for path in patch_result.applied:
+        if path.suffix not in (".c", ".h"):
+            continue
+        before = patch_result.snapshot_before.get(path) or ""
+        try:
+            after = path.read_text(errors="replace")
+        except OSError:
+            continue
+        before_loop = _extract_first_superloop_body(before)
+        after_loop = _extract_first_superloop_body(after)
+        if not after_loop and not before_loop:
+            continue
+
+        rel = str(path.relative_to(sandbox_dir))
+
+        # Contract 1: call-ordering (init -> poll -> process -> dispatch)
+        after_seq = _superloop_phase_sequence(after_loop)
+        if all(p in after_seq for p in ("init", "poll", "process", "dispatch")):
+            ordered = sorted(after_seq, key=lambda p: phase_idx[p])
+            if after_seq != ordered:
+                errors.append(
+                    f"{rel}: superloop ordering changed; expected init->poll->process->dispatch, got {'->'.join(after_seq)}"
+                )
+        before_seq = _superloop_phase_sequence(before_loop)
+        common = [p for p in before_seq if p in after_seq]
+        if len(common) >= 2:
+            for i in range(len(common) - 1):
+                a = common[i]
+                b = common[i + 1]
+                if after_seq.index(a) > after_seq.index(b):
+                    errors.append(
+                        f"{rel}: superloop relative phase order changed ({a} now after {b})"
+                    )
+                    break
+
+        # Contract 2: cadence via modulo schedules.
+        before_sched = _extract_modulo_schedule(before_loop)
+        after_sched = _extract_modulo_schedule(after_loop)
+        for counter, old_freqs in before_sched.items():
+            if counter in after_sched and after_sched[counter] != old_freqs:
+                errors.append(
+                    f"{rel}: scheduling cadence changed for '{counter}' "
+                    f"from {sorted(old_freqs)} to {sorted(after_sched[counter])}"
+                )
+
+        # Contract 3: no new blocking behavior inside superloop.
+        before_blk = _extract_blocking_calls(before_loop)
+        after_blk = _extract_blocking_calls(after_loop)
+        new_blk = sorted(after_blk - before_blk)
+        if new_blk:
+            errors.append(
+                f"{rel}: new blocking call(s) introduced in superloop: {', '.join(new_blk)}"
+            )
+
+        if not before_loop and after_loop:
+            warnings.append(
+                f"{rel}: superloop detected for first time in touched file; review call ordering and cadence manually."
+            )
+
+    return errors, warnings
+
+
+def run_touched_module_regression_checks(
+    *,
+    sandbox_dir: Path,
+    touched_files: Iterable[Path],
+) -> list[str]:
+    findings: list[str] = []
+    for p in touched_files:
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            txt = p.read_text(errors="replace")
+        except OSError:
+            continue
+        rel = str(p.relative_to(sandbox_dir)) if p.is_absolute() else str(p)
+        if p.suffix in (".c", ".h"):
+            if txt.count("{") != txt.count("}"):
+                findings.append(f"{rel}: unbalanced braces after patch")
+        if p.suffix == ".h":
+            if not _INCLUDE_GUARD_RE.search(txt) and "#pragma once" not in txt:
+                findings.append(f"{rel}: missing include guard / #pragma once after patch")
+    return findings
+
+
+def _capture_checkpoint(build_root: Path) -> dict[Path, str]:
+    checkpoint: dict[Path, str] = {}
+    interesting = {".c", ".h", ".ld", ".lds", ".s", ".S", ".inc"}
+    for p in build_root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix not in interesting:
+            continue
+        try:
+            checkpoint[p] = p.read_text(errors="replace")
+        except OSError:
+            continue
+    return checkpoint
+
+
+def _restore_checkpoint(checkpoint: dict[Path, str]) -> None:
+    for p, content in checkpoint.items():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        except OSError:
+            log.warning("checkpoint restore: failed for %s", p)
+
+
+def _is_lane_oscillation(history: list[Lane]) -> bool:
+    if len(history) < 3:
+        return False
+    a, b, c = history[-3], history[-2], history[-1]
+    return a == c and a != b
 
 
 # ---------------------------------------------------------------------------
@@ -706,13 +1169,19 @@ possible blast radius.
 4. Prefer in this order: compatibility adapters/shims → header typedef
    /macro bridges → wrapper functions → deep call-site rewrites
    (last resort).
-5. The current correction layer is provided — you must respect it.
+5. Respect lane gating:
+   - Lane A (firmware) is a hard gate.
+   - If firmware lane still has errors, do not emit software-lane hypotheses.
+6. The current correction layer is provided — you must respect it.
    - Layer **shim**: build-breaker fixes only (make it compile/link with a
      compatibility layer).
    - Layer **semantic**: replace shims with precise mappings from the
      target ICD.
    - Layer **cleanup**: remove dead aliases, tighten types.
-6. If no further hypothesis is reasonable (build is green or you would
+7. If strategy mode says `second_choice`, avoid the #1 ranked cluster and
+   target the second-best feasible cluster/hypothesis instead.
+8. Keep touched files very small (target <=3 files) unless impossible.
+9. If no further hypothesis is reasonable (build is green or you would
    make things worse), set `"kind": "stop"` and explain in `notes`.
 """
 
@@ -757,6 +1226,10 @@ markers.  Each `### path/to/file.ext` MUST exactly match an entry from
 * Ensure `#include` paths still resolve.
 * For new files, use the path the hypothesis listed and provide a sane
   include-guard.
+* Preserve superloop behavior: do not reorder init/poll/process/dispatch,
+  do not change modulo-scheduling cadence, and do not introduce blocking
+  calls in superloop paths.
+* Prefer compatibility aliases/wrappers over broad rewrites.
 """
 
 
@@ -766,26 +1239,42 @@ def _planner_prompt(
     attempt: int,
     max_attempts: int,
     metrics_history: list[dict],
-    clusters: list[ErrorCluster],
+    lane_result: LaneSplitResult,
     pre_build_warnings: list[str],
+    linker_bsp_audits: list[str],
+    superloop_findings: list[str],
     sandbox_cc: str,
     is_cross: bool,
     change_spec: str,
     repo_knowledge: str,
     playbook_hints: list[str],
+    strategy_mode: str,
+    compile_only_success_streak: int,
 ) -> str:
+    clusters = lane_result.active_clusters
     cluster_blob = json.dumps(
         [c.to_json() for c in clusters[:8]],
+        indent=2, ensure_ascii=False,
+    )
+    fw_blob = json.dumps(
+        [c.to_json() for c in lane_result.firmware.clusters[:6]],
+        indent=2, ensure_ascii=False,
+    )
+    sw_blob = json.dumps(
+        [c.to_json() for c in lane_result.software.clusters[:6]],
         indent=2, ensure_ascii=False,
     )
     metrics_tail = metrics_history[-5:]
     metrics_blob = json.dumps(metrics_tail, indent=2, ensure_ascii=False)
     hints = "\n".join(f"- {h}" for h in playbook_hints) or "(none yet)"
     warnings = "\n".join(f"- {w}" for w in pre_build_warnings) or "(none)"
+    audits = "\n".join(f"- {a}" for a in linker_bsp_audits) or "(none)"
+    superloop = "\n".join(f"- {s}" for s in superloop_findings) or "(none)"
     cross_note = (
         "Cross-compile sandbox is in use. BSP linker errors (Xil_*, "
         "xil_printf, etc.) are EXPECTED and resolved by compile-only "
-        "fallback — focus on non-BSP issues only."
+        "fallback in generic mode, but this Xilinx profile requires full "
+        "build green before DONE."
         if is_cross else "Native compile."
     )
     return (
@@ -793,15 +1282,42 @@ def _planner_prompt(
         f"- Attempt: {attempt}/{max_attempts}\n"
         f"- Active correction layer: {layer}\n"
         f"- Compiler: {sandbox_cc}\n"
+        f"- Active verification lane: {lane_result.active_lane.value}\n"
+        f"- Lane-A firmware errors: {len(lane_result.firmware.errors)}\n"
+        f"- Lane-B software errors: {len(lane_result.software.errors)}\n"
+        f"- Strategy mode: {strategy_mode}\n"
+        f"- Compile-only success streak: {compile_only_success_streak}\n"
         f"- {cross_note}\n\n"
+        "## Deterministic repair ordering (MUST follow)\n"
+        "1) Missing/renamed headers/macros/types\n"
+        "2) Function prototype/signature drift\n"
+        "3) Struct/register field drift + volatile correctness\n"
+        "4) Undefined references / linker symbol mapping\n"
+        "5) Warning hardening and cleanup\n\n"
+        "## Lane gating rule\n"
+        "- Solve Lane-A firmware completely before Lane-B software.\n"
+        "- Do NOT propose software-lane edits while firmware lane still has errors.\n\n"
         f"## ICD change spec (truncated)\n{change_spec[:4000]}\n\n"
         f"## Repo knowledge (truncated)\n{repo_knowledge[:2000]}\n\n"
         f"## Recent metrics history\n```json\n{metrics_blob}\n```\n\n"
-        f"## Top error clusters (sorted by centrality)\n"
+        "## Lane-A firmware clusters\n"
+        f"```json\n{fw_blob}\n```\n\n"
+        "## Lane-B software clusters\n"
+        f"```json\n{sw_blob}\n```\n\n"
+        "## Active-lane clusters (what you should fix now)\n"
         f"```json\n{cluster_blob}\n```\n\n"
         f"## Pre-build static warnings\n{warnings}\n\n"
+        f"## Linker/BSP consistency audits\n{audits}\n\n"
+        f"## Superloop validation findings\n{superloop}\n\n"
         f"## Playbook hints (memory of past successful fixes)\n{hints}\n\n"
-        f"## Your turn\nProduce one Hypothesis JSON now."
+        "## Patch priority for Xilinx SDK 2018\n"
+        "1. Header-level macro/type aliases\n"
+        "2. Wrapper functions preserving old signatures\n"
+        "3. Isolated per-peripheral translation units\n"
+        "4. Broad call-site rewrites only if compatibility is impossible\n\n"
+        "## Your turn\n"
+        "Produce one Hypothesis JSON now. Keep touched files minimal "
+        "(target <=3 files)."
     )
 
 
@@ -1002,6 +1518,7 @@ class Phase(str, Enum):
     ROOT_CAUSE = "root_cause"
     PLAN = "plan"
     PATCH = "patch"
+    SUPERLOOP = "superloop_validation"
     VERIFY = "verify"
     DECIDE = "decide"
     DONE = "done"
@@ -1065,6 +1582,7 @@ def run_agentic_debug(
     no_progress_limit: int = DEFAULT_NO_PROGRESS_LIMIT,
     oscillation_limit: int = DEFAULT_OSCILLATION_LIMIT,
     edit_budget_files: int = DEFAULT_EDIT_BUDGET_FILES,
+    max_touched_files_per_attempt: int = DEFAULT_MAX_TOUCHED_FILES_PER_ATTEMPT,
     planner_max_tokens: int = DEFAULT_PLANNER_MAX_TOKENS,
     patch_max_tokens: int = DEFAULT_PATCH_MAX_TOKENS,
 ) -> Iterator[dict]:
@@ -1090,38 +1608,86 @@ def run_agentic_debug(
     build_root = build_info.get("build_dir", sandbox_dir)
     index = CodebaseIndex.build(sandbox_dir, build_root)
 
+    # Best-known checkpoint used by stall recovery.
+    best_checkpoint = _capture_checkpoint(build_root)
+    best_score: tuple[int, int, int] = (10**9, 10**9, 10**9)
+
+    layer_order = ["shim", "semantic", "cleanup"]
+    layer_idx = 0
+    second_choice_mode = False
+    metrics_history: list[dict] = []
+    seen_fingerprints: dict[str, int] = {}
+    lane_history: list[Lane] = []
+    touched_recent: list[Path] = []
+    no_progress = 0
+    distinct_files_touched: set[Path] = set()
+    compile_only_success_streak = 0
+    superloop_fail_streak = 0
+    last_superloop_findings: list[str] = []
+    last_linker_bsp_audits: list[str] = []
+
     # ------------------------------------------------------------------ BUILD
     yield {"type": "phase", "step": 0, "phase": Phase.BUILD.value}
-    success, build_output = build_runner()
+    ok, build_output = build_runner()
     build_calls = 1
-    yield {"type": "build", "step": 0, "success": success, "calls": build_calls}
-    if success:
+    yield {"type": "build", "step": 0, "success": ok, "calls": build_calls}
+
+    init_errors = parse_build_log(build_output)
+    for e in init_errors:
+        e.error_class = classify_error(e)
+    init_real_errors = [e for e in init_errors if e.severity == "error"]
+    init_lanes = evaluate_lanes(init_real_errors, index=index)
+    init_compile_only = _is_compile_only_success(build_output)
+    if init_compile_only and _linker_errors_present(init_real_errors):
+        compile_only_success_streak = 1
+
+    best_score = (
+        len(init_lanes.firmware.errors),
+        len(init_lanes.software.errors),
+        len(init_real_errors),
+    )
+
+    full_build_ok = ok and not init_compile_only
+    if (
+        full_build_ok
+        and not init_lanes.firmware.errors
+        and not init_lanes.software.errors
+        and not unresolved_icd_deltas(init_real_errors)
+    ):
         _write_attempt_artifacts(
             attempts_dir / "attempt_00",
-            raw_log=build_output, errors=[], clusters=[],
+            raw_log=build_output, errors=init_real_errors, clusters=[],
             hypothesis=None, metrics=AttemptMetrics(
                 attempt=0, phase=Phase.DONE.value, errors_total=0,
                 error_families=0, new_errors=0, resolved_errors=0,
                 files_touched=0, patch_size_lines=0, duration_s=0.0,
                 layer="shim", hypothesis_id="-", hypothesis_kind="-",
-                success=True, fingerprint="",
+                success=True, fingerprint=errors_fingerprint(init_real_errors),
             ),
             patch_diff="",
         )
         yield {
-            "type": "done", "success": True,
-            "reason": "Build already succeeds without any edits.",
-            "steps": 0, "builds": build_calls,
+            "type": "done",
+            "success": True,
+            "reason": (
+                "Initial build already satisfies Xilinx profile gates "
+                "(full build + firmware lane + software lane)."
+            ),
+            "steps": 0,
+            "builds": build_calls,
         }
         return
 
-    layer_order = ["shim", "semantic", "cleanup"]
-    layer_idx = 0
-    metrics_history: list[dict] = []
-    seen_fingerprints: dict[str, int] = {}
-    no_progress = 0
-    distinct_files_touched: set[Path] = set()
-    last_error_count: int | None = None
+    if ok and init_compile_only:
+        yield {
+            "type": "observation",
+            "step": 0,
+            "text": (
+                "Build returned compile-only success, but this Xilinx profile "
+                "requires full link success before DONE."
+            ),
+            "error": True,
+        }
 
     last_build_output = build_output
 
@@ -1136,146 +1702,228 @@ def run_agentic_debug(
         errors = parse_build_log(last_build_output)
         for e in errors:
             e.error_class = classify_error(e)
-
-        # Filter out warnings — they shouldn't drive fix planning.
         real_errors = [e for e in errors if e.severity == "error"]
-
-        if not real_errors:
-            # We had a non-zero exit but couldn't parse any error — treat as
-            # opaque failure: surface raw tail to UI, then escalate.
-            yield {
-                "type": "observation", "step": attempt,
-                "text": (
-                    "Build failed but no parseable diagnostics found. "
-                    "Raw tail will be sent to the planner."
-                ),
-                "error": True,
-            }
+        lane_result = evaluate_lanes(real_errors, index=index)
+        if lane_result.active_errors:
+            lane_history.append(lane_result.active_lane)
 
         fingerprint = errors_fingerprint(real_errors)
         seen_fingerprints[fingerprint] = seen_fingerprints.get(fingerprint, 0) + 1
 
-        # -------------------------------------------------------- ROOT_CAUSE
-        yield {"type": "phase", "step": attempt, "phase": Phase.ROOT_CAUSE.value}
-        clusters = cluster_errors(real_errors, index=index)
-        clusters_blob = [c.to_json() for c in clusters]
+        last_linker_bsp_audits = run_linker_bsp_consistency_audits(
+            build_output=last_build_output,
+            errors=real_errors,
+            sandbox_dir=sandbox_dir,
+            touched_files=touched_recent,
+            baseline_snapshots=snapshots,
+        )
+
         try:
-            (attempt_dir / "error_clusters.json").write_text(
-                json.dumps(clusters_blob, indent=2, ensure_ascii=False)
+            (attempt_dir / "build.log.raw").write_text(last_build_output)
+            (attempt_dir / "build.log.structured.json").write_text(
+                json.dumps([e.to_json() for e in errors], indent=2, ensure_ascii=False)
+            )
+            (attempt_dir / "lane_firmware_clusters.json").write_text(
+                json.dumps([c.to_json() for c in lane_result.firmware.clusters], indent=2, ensure_ascii=False)
+            )
+            (attempt_dir / "lane_software_clusters.json").write_text(
+                json.dumps([c.to_json() for c in lane_result.software.clusters], indent=2, ensure_ascii=False)
+            )
+            (attempt_dir / "linker_bsp_audits.txt").write_text(
+                "\n".join(last_linker_bsp_audits) + ("\n" if last_linker_bsp_audits else "")
             )
         except OSError:
             pass
 
+        active_clusters = lane_result.active_clusters
+        if not active_clusters and real_errors:
+            active_clusters = cluster_errors(real_errors, index=index)
+        if not real_errors:
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": (
+                    "Build failed but no parseable diagnostics were produced. "
+                    "Will continue with linker/BSP audits and planner hints."
+                ),
+                "error": True,
+            }
+
         yield {
-            "type": "observation", "step": attempt,
+            "type": "observation",
+            "step": attempt,
             "text": (
-                f"Triaged {len(errors)} diagnostics → "
-                f"{len(real_errors)} errors → {len(clusters)} root-cause clusters. "
-                f"Top: " + (
-                    clusters[0].root_cause if clusters else "(none)"
-                )
+                "Lane triage: firmware="
+                f"{len(lane_result.firmware.errors)} error(s), software="
+                f"{len(lane_result.software.errors)} error(s). "
+                f"Active lane: {lane_result.active_lane.value}."
             ),
             "error": False,
         }
+        if last_linker_bsp_audits:
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": "Linker/BSP audits: " + " | ".join(last_linker_bsp_audits[:3]),
+                "error": False,
+            }
+
+        # -------------------------------------------------------- ROOT_CAUSE
+        yield {"type": "phase", "step": attempt, "phase": Phase.ROOT_CAUSE.value}
+        clusters = active_clusters
+        try:
+            (attempt_dir / "error_clusters.json").write_text(
+                json.dumps([c.to_json() for c in clusters], indent=2, ensure_ascii=False)
+            )
+        except OSError:
+            pass
+        if not clusters:
+            no_progress += 1
+            if no_progress >= no_progress_limit:
+                yield {
+                    "type": "done",
+                    "success": False,
+                    "reason": "Unable to extract actionable error clusters repeatedly.",
+                    "steps": attempt,
+                    "builds": build_calls,
+                }
+                return
+            continue
 
         # -------------------------------------------------------- PLAN
         yield {"type": "phase", "step": attempt, "phase": Phase.PLAN.value}
         layer = layer_order[layer_idx]
-        playbook_hints = []
+        playbook_hints: list[str] = []
         if clusters:
             playbook_hints = playbook.hints_for(
-                clusters[0].error_class, clusters[0].representative.symbol,
+                clusters[0].error_class,
+                clusters[0].representative.symbol,
             )
-        prebuild_warnings = run_pre_build_checks(
-            sandbox_dir, list(distinct_files_touched)
-        )
+        prebuild_warnings = run_pre_build_checks(sandbox_dir, list(distinct_files_touched))
         planner_user = _planner_prompt(
             layer=layer,
             attempt=attempt,
             max_attempts=max_attempts,
             metrics_history=metrics_history,
-            clusters=clusters,
+            lane_result=lane_result,
             pre_build_warnings=prebuild_warnings,
+            linker_bsp_audits=last_linker_bsp_audits,
+            superloop_findings=last_superloop_findings,
             sandbox_cc=sandbox_cc,
             is_cross=is_cross,
             change_spec=change_spec,
             repo_knowledge=repo_knowledge,
             playbook_hints=playbook_hints,
+            strategy_mode=("second_choice" if second_choice_mode else "primary"),
+            compile_only_success_streak=compile_only_success_streak,
         )
         planner_raw_parts: list[str] = []
 
         def _on_planner_token(t: str) -> None:
             planner_raw_parts.append(t)
+
         try:
             planner_raw = _llm_complete(
-                llm_stream, _PLANNER_SYSTEM_PROMPT, planner_user,
-                max_tokens=planner_max_tokens, on_token=_on_planner_token,
+                llm_stream,
+                _PLANNER_SYSTEM_PROMPT,
+                planner_user,
+                max_tokens=planner_max_tokens,
+                on_token=_on_planner_token,
             )
         except Exception as e:
             yield {"type": "warning", "message": f"planner LLM failed: {e}"}
             planner_raw = "".join(planner_raw_parts)
 
-        # Stream planner thoughts to UI as raw tokens
         for piece in _chunk_text(planner_raw, 1024):
             yield {"type": "raw_token", "text": piece}
 
         hypothesis = parse_hypothesis(planner_raw)
         if hypothesis is None:
             yield {
-                "type": "observation", "step": attempt,
+                "type": "observation",
+                "step": attempt,
                 "text": "Planner produced no parsable hypothesis JSON.",
                 "error": True,
             }
             no_progress += 1
             _record_metrics(
-                attempt_dir, metrics_history,
+                attempt_dir,
+                metrics_history,
                 AttemptMetrics(
-                    attempt=attempt, phase=Phase.PLAN.value,
+                    attempt=attempt,
+                    phase=Phase.PLAN.value,
                     errors_total=len(real_errors),
                     error_families=len(clusters),
-                    new_errors=0, resolved_errors=0,
-                    files_touched=0, patch_size_lines=0,
+                    new_errors=0,
+                    resolved_errors=0,
+                    files_touched=0,
+                    patch_size_lines=0,
                     duration_s=time.monotonic() - attempt_start,
-                    layer=layer, hypothesis_id="-", hypothesis_kind="parse_fail",
-                    success=False, fingerprint=fingerprint,
+                    layer=layer,
+                    hypothesis_id="-",
+                    hypothesis_kind="parse_fail",
+                    success=False,
+                    fingerprint=fingerprint,
                 ),
             )
             if no_progress >= no_progress_limit:
                 yield {
-                    "type": "done", "success": False,
+                    "type": "done",
+                    "success": False,
                     "reason": "Planner failed to produce hypotheses repeatedly.",
-                    "steps": attempt, "builds": build_calls,
+                    "steps": attempt,
+                    "builds": build_calls,
                 }
                 return
             continue
 
         if hypothesis.kind == "stop":
             yield {
-                "type": "done", "success": False,
+                "type": "done",
+                "success": False,
                 "reason": (
                     "Planner declined to propose more changes "
                     f"(layer={layer}, notes={hypothesis.notes[:200]})."
                 ),
-                "steps": attempt, "builds": build_calls,
+                "steps": attempt,
+                "builds": build_calls,
             }
             return
 
+        # Enforce lane gating (A before B).
+        if (
+            lane_result.active_lane == Lane.FIRMWARE
+            and all(_lane_for_path(p) == Lane.SOFTWARE for p in hypothesis.target_files)
+        ):
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": (
+                    "Rejected hypothesis: firmware lane still failing but target files are software-only."
+                ),
+                "error": True,
+            }
+            no_progress += 1
+            continue
+
         yield {
-            "type": "thought", "step": attempt,
+            "type": "thought",
+            "step": attempt,
             "text": (
-                f"[plan/{layer}] {hypothesis.id} kind={hypothesis.kind} "
-                f"risk={hypothesis.risk} target_files={hypothesis.target_files}\n"
+                f"[plan/{layer}/{lane_result.active_lane.value}] {hypothesis.id} "
+                f"kind={hypothesis.kind} risk={hypothesis.risk} "
+                f"target_files={hypothesis.target_files}\n"
                 f"rationale: {hypothesis.rationale[:600]}"
             ),
         }
         yield {
-            "type": "action", "step": attempt, "tool": "patch",
+            "type": "action",
+            "step": attempt,
+            "tool": "patch",
             "args": {"hypothesis": hypothesis.to_json()},
         }
         try:
-            (attempt_dir / "hypothesis.md").write_text(
-                _hypothesis_md(hypothesis, clusters)
-            )
+            (attempt_dir / "hypothesis.md").write_text(_hypothesis_md(hypothesis, clusters))
         except OSError:
             pass
 
@@ -1303,10 +1951,14 @@ def run_agentic_debug(
 
         def _on_patcher_token(t: str) -> None:
             patcher_raw_parts.append(t)
+
         try:
             patcher_raw = _llm_complete(
-                llm_stream, _PATCHER_SYSTEM_PROMPT, patcher_user,
-                max_tokens=patch_max_tokens, on_token=_on_patcher_token,
+                llm_stream,
+                _PATCHER_SYSTEM_PROMPT,
+                patcher_user,
+                max_tokens=patch_max_tokens,
+                on_token=_on_patcher_token,
             )
         except Exception as e:
             yield {"type": "warning", "message": f"patcher LLM failed: {e}"}
@@ -1318,41 +1970,32 @@ def run_agentic_debug(
         new_files = parse_patch(patcher_raw)
         if not new_files:
             yield {
-                "type": "observation", "step": attempt,
+                "type": "observation",
+                "step": attempt,
                 "text": "Patch agent returned no parseable file blocks.",
                 "error": True,
             }
             no_progress += 1
-            _record_metrics(
-                attempt_dir, metrics_history,
-                AttemptMetrics(
-                    attempt=attempt, phase=Phase.PATCH.value,
-                    errors_total=len(real_errors),
-                    error_families=len(clusters),
-                    new_errors=0, resolved_errors=0,
-                    files_touched=0, patch_size_lines=0,
-                    duration_s=time.monotonic() - attempt_start,
-                    layer=layer, hypothesis_id=hypothesis.id,
-                    hypothesis_kind=hypothesis.kind, success=False,
-                    fingerprint=fingerprint,
-                ),
-            )
             if no_progress >= no_progress_limit:
                 yield {
-                    "type": "done", "success": False,
+                    "type": "done",
+                    "success": False,
                     "reason": "Patch agent failed to emit edits repeatedly.",
-                    "steps": attempt, "builds": build_calls,
+                    "steps": attempt,
+                    "builds": build_calls,
                 }
                 return
             continue
 
         result = apply_hypothesis(sandbox_dir, hypothesis, new_files)
+        touched_recent = list(result.applied)
         try:
             (attempt_dir / "patch.diff").write_text(result.diff or "(empty diff)")
         except OSError:
             pass
         yield {
-            "type": "observation", "step": attempt,
+            "type": "observation",
+            "step": attempt,
             "text": (
                 f"Applied {len(result.applied)} file(s). "
                 + (f"Rejected: {result.rejected}" if result.rejected else "")
@@ -1362,153 +2005,305 @@ def run_agentic_debug(
         if not result.applied:
             no_progress += 1
             continue
+
+        # Patch entropy guardrail per attempt.
+        if len(result.applied) > max_touched_files_per_attempt:
+            rollback(result.snapshot_before)
+            no_progress += 1
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": (
+                    f"Rejected patch: touched {len(result.applied)} files "
+                    f"(max per attempt is {max_touched_files_per_attempt})."
+                ),
+                "error": True,
+            }
+            continue
+
         for f in result.applied:
             distinct_files_touched.add(f)
         if len(distinct_files_touched) > edit_budget_files:
             yield {
-                "type": "done", "success": False,
+                "type": "done",
+                "success": False,
                 "reason": (
                     f"Edit budget exhausted "
                     f"({len(distinct_files_touched)} > {edit_budget_files} files)."
                 ),
-                "steps": attempt, "builds": build_calls,
+                "steps": attempt,
+                "builds": build_calls,
             }
             return
 
-        # -------------------------------------------------------- VERIFY (build)
-        yield {"type": "phase", "step": attempt, "phase": Phase.VERIFY.value}
-        ok, new_build_output = build_runner()
-        build_calls += 1
-        yield {"type": "build", "step": attempt, "success": ok, "calls": build_calls}
+        # ------------------------------------------------ SUPERLOOP VALIDATION
+        yield {"type": "phase", "step": attempt, "phase": Phase.SUPERLOOP.value}
+        superloop_errors, superloop_warnings = run_superloop_contract_checks(
+            sandbox_dir=sandbox_dir,
+            patch_result=result,
+        )
+        last_superloop_findings = [*superloop_errors, *superloop_warnings]
         try:
-            (attempt_dir / "build.log.raw").write_text(new_build_output)
-        except OSError:
-            pass
-
-        new_errors = parse_build_log(new_build_output)
-        new_real_errors = [e for e in new_errors if e.severity == "error"]
-        try:
-            (attempt_dir / "build.log.structured.json").write_text(
-                json.dumps([e.to_json() for e in new_errors], indent=2,
-                           ensure_ascii=False),
+            (attempt_dir / "superloop_checks.txt").write_text(
+                "\n".join(last_superloop_findings) + ("\n" if last_superloop_findings else "")
             )
         except OSError:
             pass
 
+        if superloop_warnings:
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": "Superloop warnings: " + " | ".join(superloop_warnings[:3]),
+                "error": False,
+            }
+
+        if superloop_errors:
+            rollback(result.snapshot_before)
+            superloop_fail_streak += 1
+            no_progress += 1
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": "Superloop contract failed: " + " | ".join(superloop_errors[:3]),
+                "error": True,
+            }
+            _record_metrics(
+                attempt_dir,
+                metrics_history,
+                AttemptMetrics(
+                    attempt=attempt,
+                    phase=Phase.SUPERLOOP.value,
+                    errors_total=len(real_errors),
+                    error_families=len(clusters),
+                    new_errors=0,
+                    resolved_errors=0,
+                    files_touched=len(result.applied),
+                    patch_size_lines=sum(c.count("\n") for c in new_files.values()),
+                    duration_s=time.monotonic() - attempt_start,
+                    layer=layer,
+                    hypothesis_id=hypothesis.id,
+                    hypothesis_kind=hypothesis.kind,
+                    success=False,
+                    fingerprint=fingerprint,
+                ),
+            )
+            if superloop_fail_streak >= 2:
+                _restore_checkpoint(best_checkpoint)
+                second_choice_mode = True
+                no_progress = 0
+                yield {
+                    "type": "observation",
+                    "step": attempt,
+                    "text": (
+                        "Repeated superloop validation failures; restored best checkpoint "
+                        "and switching to second-ranked hypothesis mode."
+                    ),
+                    "error": True,
+                }
+                ok_restore, restored_output = build_runner()
+                build_calls += 1
+                yield {"type": "build", "step": attempt, "success": ok_restore, "calls": build_calls}
+                last_build_output = restored_output
+                continue
+            if no_progress >= no_progress_limit:
+                yield {
+                    "type": "done",
+                    "success": False,
+                    "reason": (
+                        f"No net error reduction across {no_progress_limit} iterations "
+                        "(superloop regression gate)."
+                    ),
+                    "steps": attempt,
+                    "builds": build_calls,
+                }
+                return
+            continue
+        superloop_fail_streak = 0
+
+        # -------------------------------------------------------- VERIFY (build)
+        yield {"type": "phase", "step": attempt, "phase": Phase.VERIFY.value}
+        ok_new, new_build_output = build_runner()
+        build_calls += 1
+        yield {"type": "build", "step": attempt, "success": ok_new, "calls": build_calls}
+
+        new_errors = parse_build_log(new_build_output)
+        for e in new_errors:
+            e.error_class = classify_error(e)
+        new_real_errors = [e for e in new_errors if e.severity == "error"]
+        new_lane_result = evaluate_lanes(new_real_errors, index=index)
+        compile_only_now = _is_compile_only_success(new_build_output)
+        full_build_success = ok_new and not compile_only_now
+        if compile_only_now and _linker_errors_present(new_real_errors):
+            compile_only_success_streak += 1
+        else:
+            compile_only_success_streak = 0
+
+        regression_findings = run_touched_module_regression_checks(
+            sandbox_dir=sandbox_dir,
+            touched_files=result.applied,
+        )
+        unresolved_delta = unresolved_icd_deltas(new_real_errors)
+
         prev_count = len(real_errors)
         new_count = len(new_real_errors)
-        resolved = max(0, prev_count - new_count) if last_error_count is not None or True else 0
+        resolved = max(0, prev_count - new_count)
         new_intro = max(0, new_count - prev_count)
-        last_error_count = new_count
 
         metrics = AttemptMetrics(
-            attempt=attempt, phase=Phase.VERIFY.value,
+            attempt=attempt,
+            phase=Phase.VERIFY.value,
             errors_total=new_count,
             error_families=len({(e.error_class, e.symbol) for e in new_real_errors}),
-            new_errors=new_intro, resolved_errors=resolved,
+            new_errors=new_intro,
+            resolved_errors=resolved,
             files_touched=len(result.applied),
             patch_size_lines=sum(c.count("\n") for c in new_files.values()),
             duration_s=time.monotonic() - attempt_start,
-            layer=layer, hypothesis_id=hypothesis.id,
+            layer=layer,
+            hypothesis_id=hypothesis.id,
             hypothesis_kind=hypothesis.kind,
-            success=ok, fingerprint=errors_fingerprint(new_real_errors),
+            success=full_build_success,
+            fingerprint=errors_fingerprint(new_real_errors),
         )
         _record_metrics(attempt_dir, metrics_history, metrics)
 
-        if ok:
+        # Acceptance criteria gate: full build + both lanes + superloop + ICD deltas + regression checks.
+        if (
+            full_build_success
+            and not new_lane_result.firmware.errors
+            and not new_lane_result.software.errors
+            and not unresolved_delta
+            and not regression_findings
+        ):
             playbook.record({
-                "error_class": (
-                    clusters[0].error_class.value if clusters else "other"
-                ),
-                "symbol": (
-                    clusters[0].representative.symbol if clusters else ""
-                ),
+                "error_class": (clusters[0].error_class.value if clusters else "other"),
+                "symbol": (clusters[0].representative.symbol if clusters else ""),
                 "patch_kind": hypothesis.kind,
                 "summary": hypothesis.title,
                 "success": True,
             })
             yield {
-                "type": "done", "success": True,
+                "type": "done",
+                "success": True,
                 "reason": (
-                    f"Build succeeded after {attempt} hypothesis "
-                    f"(layer={layer}, {build_calls} build calls)."
+                    "Xilinx profile acceptance criteria met: full build green, "
+                    "firmware lane pass, software lane pass, superloop contracts pass, "
+                    "no unresolved ICD deltas, and touched-module regressions clear."
                 ),
-                "steps": attempt, "builds": build_calls,
+                "steps": attempt,
+                "builds": build_calls,
             }
             return
 
-        # -------------------------------------------------------- DECIDE
-        yield {"type": "phase", "step": attempt, "phase": Phase.DECIDE.value}
-
-        if metrics.fingerprint == fingerprint:
-            # Edit had zero effect.
-            no_progress += 1
+        if ok_new and compile_only_now:
             yield {
-                "type": "observation", "step": attempt,
-                "text": "Patch did not change the error set — rolling back.",
+                "type": "observation",
+                "step": attempt,
+                "text": (
+                    "Compile-only success is not sufficient under this profile; "
+                    "continuing until full link succeeds."
+                ),
                 "error": True,
             }
-            rollback(result.snapshot_before)
-        else:
-            if new_intro > 0 and resolved == 0:
-                # Pure regression — undo and bias the planner away from this kind.
-                yield {
-                    "type": "observation", "step": attempt,
-                    "text": (
-                        f"Patch introduced {new_intro} new errors with no "
-                        f"resolutions — rolling back."
-                    ),
-                    "error": True,
-                }
-                rollback(result.snapshot_before)
-                no_progress += 1
-                playbook.record({
-                    "error_class": (
-                        clusters[0].error_class.value if clusters else "other"
-                    ),
-                    "symbol": (
-                        clusters[0].representative.symbol if clusters else ""
-                    ),
-                    "patch_kind": hypothesis.kind,
-                    "summary": "regression: " + hypothesis.title,
-                    "success": False,
-                })
-            else:
-                no_progress = 0  # we made progress
+        if regression_findings:
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": "Regression checks failed: " + " | ".join(regression_findings[:3]),
+                "error": True,
+            }
 
-        # Oscillation check
+        # Update best checkpoint if objective improved.
+        score = (
+            len(new_lane_result.firmware.errors),
+            len(new_lane_result.software.errors),
+            len(new_real_errors),
+        )
+        if score < best_score:
+            best_score = score
+            best_checkpoint = _capture_checkpoint(build_root)
+
+        # -------------------------------------------------------- DECIDE
+        yield {"type": "phase", "step": attempt, "phase": Phase.DECIDE.value}
+        stall_reasons: list[str] = []
+
+        if metrics.fingerprint == fingerprint:
+            no_progress += 1
+            rollback(result.snapshot_before)
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": "Patch did not change active error family — rolling back.",
+                "error": True,
+            }
+        elif new_intro > 0 and resolved == 0:
+            rollback(result.snapshot_before)
+            no_progress += 1
+            playbook.record({
+                "error_class": (clusters[0].error_class.value if clusters else "other"),
+                "symbol": (clusters[0].representative.symbol if clusters else ""),
+                "patch_kind": hypothesis.kind,
+                "summary": "regression: " + hypothesis.title,
+                "success": False,
+            })
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": (
+                    f"Patch introduced {new_intro} new errors with no resolved families — rolling back."
+                ),
+                "error": True,
+            }
+        else:
+            no_progress = 0
+            second_choice_mode = False
+
+        if _is_lane_oscillation(lane_history):
+            stall_reasons.append("A->B->A lane oscillation detected")
+        if compile_only_success_streak >= 2 and _linker_errors_present(new_real_errors):
+            stall_reasons.append("linker failures persist after two compile-only iterations")
+        if superloop_fail_streak >= 2:
+            stall_reasons.append("superloop validation repeatedly failing")
         if seen_fingerprints.get(metrics.fingerprint, 0) >= oscillation_limit:
-            # Same fingerprint a second time → escalate by advancing layer.
-            if layer_idx < len(layer_order) - 1:
+            stall_reasons.append("error fingerprint oscillation")
+
+        if stall_reasons:
+            _restore_checkpoint(best_checkpoint)
+            second_choice_mode = True
+            no_progress = 0
+            yield {
+                "type": "observation",
+                "step": attempt,
+                "text": (
+                    "Stall indicators triggered: " + " | ".join(stall_reasons[:3])
+                    + ". Restored best checkpoint and switching to second-ranked hypothesis strategy."
+                ),
+                "error": True,
+            }
+            if layer_idx < len(layer_order) - 1 and "error fingerprint oscillation" in stall_reasons:
                 layer_idx += 1
                 yield {
-                    "type": "observation", "step": attempt,
-                    "text": (
-                        f"Oscillation detected — advancing correction layer "
-                        f"to '{layer_order[layer_idx]}'."
-                    ),
+                    "type": "observation",
+                    "step": attempt,
+                    "text": f"Escalated correction layer to '{layer_order[layer_idx]}' after oscillation.",
                     "error": False,
                 }
-            else:
-                yield {
-                    "type": "done", "success": False,
-                    "reason": (
-                        f"Oscillation persists at deepest layer "
-                        f"({metrics.fingerprint!r})."
-                    ),
-                    "steps": attempt, "builds": build_calls,
-                }
-                return
+            ok_restore, restored_output = build_runner()
+            build_calls += 1
+            yield {"type": "build", "step": attempt, "success": ok_restore, "calls": build_calls}
+            last_build_output = restored_output
+            continue
 
-        # No-net-improvement check
         if no_progress >= no_progress_limit:
             yield {
-                "type": "done", "success": False,
+                "type": "done",
+                "success": False,
                 "reason": (
-                    f"No net error reduction across "
-                    f"{no_progress_limit} iterations."
+                    f"No net error reduction across {no_progress_limit} iterations."
                 ),
-                "steps": attempt, "builds": build_calls,
+                "steps": attempt,
+                "builds": build_calls,
             }
             return
 
@@ -1518,9 +2313,14 @@ def run_agentic_debug(
         )
 
     yield {
-        "type": "done", "success": False,
-        "reason": f"Attempt budget exhausted ({max_attempts}).",
-        "steps": max_attempts, "builds": build_calls,
+        "type": "done",
+        "success": False,
+        "reason": (
+            f"Attempt budget exhausted ({max_attempts}) before satisfying "
+            "Xilinx acceptance criteria."
+        ),
+        "steps": max_attempts,
+        "builds": build_calls,
     }
 
 
