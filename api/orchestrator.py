@@ -62,7 +62,7 @@ log = logging.getLogger(__name__)
 # Configuration knobs
 # ---------------------------------------------------------------------------
 
-DEFAULT_MAX_STEPS = 80
+DEFAULT_MAX_STEPS = 120
 DEFAULT_MAX_BUILDS = 25
 DEFAULT_MAX_FILE_BYTES = 12_000          # per read_file response
 DEFAULT_MAX_SEARCH_HITS = 30

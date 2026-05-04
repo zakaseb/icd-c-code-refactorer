@@ -415,8 +415,6 @@ def _call_llm_stream(
             "max_tokens": eff_max_tokens,
             "temperature": 0.2,
             "stream": True,
-            "reasoning_format": "none",
-            "reasoning_in_content": True,
         }
         try:
             with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
