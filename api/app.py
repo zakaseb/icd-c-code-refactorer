@@ -94,7 +94,10 @@ SANDBOX_SSE_MAX_BUILD_LOG_CHARS = int(
 SANDBOX_USE_ORCHESTRATOR = os.environ.get(
     "SANDBOX_USE_ORCHESTRATOR", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
-SANDBOX_ORCH_MAX_STEPS = int(os.environ.get("SANDBOX_ORCH_MAX_STEPS", "120"))
+_orch_steps_raw = os.environ.get("SANDBOX_ORCH_MAX_STEPS", "0").strip()
+SANDBOX_ORCH_MAX_STEPS: int | None = int(_orch_steps_raw) if _orch_steps_raw else 0
+if SANDBOX_ORCH_MAX_STEPS is not None and SANDBOX_ORCH_MAX_STEPS <= 0:
+    SANDBOX_ORCH_MAX_STEPS = None
 SANDBOX_ORCH_MAX_BUILDS = int(os.environ.get("SANDBOX_ORCH_MAX_BUILDS", "25"))
 SANDBOX_ORCH_OUTER_ROUNDS = int(
     os.environ.get("SANDBOX_ORCH_OUTER_ROUNDS", "4")
@@ -1947,6 +1950,7 @@ def _sandbox_build_iterate(
     # Orchestrator-driven debugging loop
     # ---------------------------------------------------------------------
     if SANDBOX_USE_ORCHESTRATOR:
+        orch_started = time.monotonic()
         gen_files_brief = {}
         for gname, gpath in replacement_map.items():
             try:
@@ -1977,14 +1981,18 @@ def _sandbox_build_iterate(
         orch_total_builds = 0
 
         for outer_round in range(1, SANDBOX_ORCH_OUTER_ROUNDS + 1):
+            step_phrase = (
+                f"max {SANDBOX_ORCH_MAX_STEPS} steps, "
+                if SANDBOX_ORCH_MAX_STEPS is not None
+                else "no step limit, "
+            )
             yield _sse({
                 "type": "info",
                 "stage": "sandbox_build",
                 "message": (
-                    f"Starting debugging orchestrator "
+                    "Starting debugging orchestrator "
                     f"(round {outer_round}/{SANDBOX_ORCH_OUTER_ROUNDS}) — "
-                    f"max {SANDBOX_ORCH_MAX_STEPS} steps, "
-                    f"{SANDBOX_ORCH_MAX_BUILDS} builds…"
+                    f"{step_phrase}{SANDBOX_ORCH_MAX_BUILDS} builds…"
                 ),
             })
             build_log_lines.append("=" * 65)
@@ -2016,13 +2024,17 @@ def _sandbox_build_iterate(
                 ):
                     et = evt.get("type")
                     if et == "step":
+                        if SANDBOX_ORCH_MAX_STEPS is None:
+                            msg = f"orchestrator step {evt['step']}"
+                        else:
+                            msg = (
+                                f"orchestrator step {evt['step']}/"
+                                f"{SANDBOX_ORCH_MAX_STEPS}"
+                            )
                         yield _sse({
                             "type": "info",
                             "stage": "sandbox_build",
-                            "message": (
-                                f"orchestrator step {evt['step']}/"
-                                f"{SANDBOX_ORCH_MAX_STEPS}"
-                            ),
+                            "message": msg,
                         })
                     elif et == "thought":
                         snippet = evt["text"]
@@ -2182,6 +2194,8 @@ def _sandbox_build_iterate(
                 )
 
         iteration = max(1, orch_total_builds)
+        orch_runtime_s = max(0.0, time.monotonic() - orch_started)
+        orch_runtime_h = orch_runtime_s / 3600.0
         if not success_via_orchestrator:
             build_log_lines.extend([
                 "",
@@ -2191,6 +2205,7 @@ def _sandbox_build_iterate(
                 f"Orchestrator rounds: {SANDBOX_ORCH_OUTER_ROUNDS}",
                 f"Total agent steps: {orch_total_steps}",
                 f"Total build calls: {orch_total_builds}",
+                f"Runtime (hours): {orch_runtime_h:.2f}",
                 f"Result: BUILD STILL FAILING (best effort packaged)",
                 "",
             ])
@@ -2215,10 +2230,11 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "success": False,
                 "iterations": orch_total_builds,
+                "runtime_hours": round(orch_runtime_h, 3),
                 "message": (
                     "Sandbox build did not converge after "
                     f"{SANDBOX_ORCH_OUTER_ROUNDS} orchestrator round(s); "
-                    "best-effort repository packaged."
+                    f"best-effort repository packaged. Runtime: {orch_runtime_h:.2f}h."
                 ),
             })
             return
@@ -2231,6 +2247,7 @@ def _sandbox_build_iterate(
             f"Orchestrator rounds: {outer_round}",
             f"Total agent steps: {orch_total_steps}",
             f"Total build calls: {orch_total_builds}",
+            f"Runtime (hours): {orch_runtime_h:.2f}",
             f"Result: BUILD SUCCEEDED",
             "",
         ])
@@ -2248,9 +2265,10 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "success": True,
             "iterations": orch_total_builds,
+            "runtime_hours": round(orch_runtime_h, 3),
             "message": (
                 f"Sandbox build succeeded after orchestrator round "
-                f"{outer_round} — repository packaged."
+                f"{outer_round} — repository packaged. Runtime: {orch_runtime_h:.2f}h."
             ),
         })
         return

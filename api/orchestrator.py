@@ -62,7 +62,7 @@ log = logging.getLogger(__name__)
 # Configuration knobs
 # ---------------------------------------------------------------------------
 
-DEFAULT_MAX_STEPS = 120
+DEFAULT_MAX_STEPS: int | None = None
 DEFAULT_MAX_BUILDS = 25
 DEFAULT_MAX_FILE_BYTES = 12_000          # per read_file response
 DEFAULT_MAX_SEARCH_HITS = 30
@@ -722,7 +722,7 @@ def run_orchestrator(
     snapshots: dict[Path, str],
     build_runner: Callable[[], tuple[bool, str]],
     llm_stream: Callable[..., Iterator[str]],
-    max_steps: int = DEFAULT_MAX_STEPS,
+    max_steps: int | None = DEFAULT_MAX_STEPS,
     max_builds: int = DEFAULT_MAX_BUILDS,
     max_input_tokens: int = 24_000,
     max_output_tokens: int = 1024,
@@ -766,7 +766,21 @@ def run_orchestrator(
     history: list[StepRecord] = []
     last_build_output = initial_build_output
 
-    for step in range(1, max_steps + 1):
+    step = 1
+    while True:
+        if max_steps is not None and step > max_steps:
+            yield {
+                "type": "done",
+                "success": ctx.last_build_success,
+                "reason": (
+                    f"step budget exhausted ({max_steps} steps, "
+                    f"{ctx.build_calls} builds)."
+                ),
+                "steps": step - 1,
+                "builds": ctx.build_calls,
+            }
+            return
+
         yield {"type": "step", "step": step}
 
         # --- Build prompt ---------------------------------------------------
@@ -785,7 +799,9 @@ def run_orchestrator(
         char_budget = max_input_tokens * 4
         prompt = (
             f"{brief}\n\n## Prior turns\n{transcript}\n\n"
-            f"## Your turn (step {step}/{max_steps})\n"
+            f"## Your turn (step {step}"
+            + (f"/{max_steps}" if max_steps is not None else "")
+            + ")\n"
             "Decide the single best next tool call."
         )
         if len(prompt) > char_budget:
@@ -793,7 +809,9 @@ def run_orchestrator(
             transcript = render_transcript(history, max_chars=max(2000, keep))
             prompt = (
                 f"{brief}\n\n## Prior turns\n{transcript}\n\n"
-                f"## Your turn (step {step}/{max_steps})\n"
+                f"## Your turn (step {step}"
+                + (f"/{max_steps}" if max_steps is not None else "")
+                + ")\n"
                 "Decide the single best next tool call."
             )
 
@@ -972,13 +990,4 @@ def run_orchestrator(
                 }
                 return
 
-    yield {
-        "type": "done",
-        "success": ctx.last_build_success,
-        "reason": (
-            f"step budget exhausted ({max_steps} steps, "
-            f"{ctx.build_calls} builds)."
-        ),
-        "steps": max_steps,
-        "builds": ctx.build_calls,
-    }
+        step += 1
