@@ -77,10 +77,12 @@ ICD_CHUNK_CHARS = 3_000
 MAX_CODE_CONTEXT_CHARS = 8_000
 MAX_REPO_CONTEXT_CHARS = 15_000
 
-CHARS_PER_TOKEN = 4
+CHARS_PER_TOKEN = 3
 CTX_SIZE_TOKENS = int(os.environ.get("LLAMA_ARG_CTX_SIZE", "32768"))
 MAX_OUTPUT_TOKENS = 4096
 MAX_INPUT_TOKENS = CTX_SIZE_TOKENS - MAX_OUTPUT_TOKENS
+LLM_PROMPT_SAFETY_TOKENS = int(os.environ.get("LLM_PROMPT_SAFETY_TOKENS", "1024"))
+LLM_MIN_OUTPUT_TOKENS = int(os.environ.get("LLM_MIN_OUTPUT_TOKENS", "768"))
 
 SANDBOX_BUILD_TIMEOUT = 120
 # Cap compiler/build output in SSE: large make/cmake logs on high-core hosts
@@ -92,7 +94,7 @@ SANDBOX_SSE_MAX_BUILD_LOG_CHARS = int(
 SANDBOX_USE_ORCHESTRATOR = os.environ.get(
     "SANDBOX_USE_ORCHESTRATOR", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
-SANDBOX_ORCH_MAX_STEPS = int(os.environ.get("SANDBOX_ORCH_MAX_STEPS", "80"))
+SANDBOX_ORCH_MAX_STEPS = int(os.environ.get("SANDBOX_ORCH_MAX_STEPS", "120"))
 SANDBOX_ORCH_MAX_BUILDS = int(os.environ.get("SANDBOX_ORCH_MAX_BUILDS", "25"))
 SANDBOX_ORCH_OUTER_ROUNDS = int(
     os.environ.get("SANDBOX_ORCH_OUTER_ROUNDS", "4")
@@ -103,7 +105,7 @@ SANDBOX_USE_AGENTIC = os.environ.get(
     "SANDBOX_USE_AGENTIC", "0"
 ).strip().lower() not in ("0", "false", "no", "off")
 SANDBOX_AGENTIC_MAX_ATTEMPTS = int(
-    os.environ.get("SANDBOX_AGENTIC_MAX_ATTEMPTS", "30")
+    os.environ.get("SANDBOX_AGENTIC_MAX_ATTEMPTS", "120")
 )
 SANDBOX_AGENTIC_NO_PROGRESS = int(
     os.environ.get("SANDBOX_AGENTIC_NO_PROGRESS", "3")
@@ -265,6 +267,100 @@ def extract_pdf_text(pdf_path: Path) -> str:
     return "\n\n".join(parts)
 
 
+_CONTEXT_OVERFLOW_MARKERS = (
+    "exceeds the available context",
+    "exceed the available context",
+    "context size",
+    "n_ctx",
+    "context window",
+    "input is too large",
+    "prompt is too long",
+    "tokens, exceed",
+)
+
+
+def _is_context_overflow_error(status_code: int, body_text: str) -> bool:
+    """Heuristically detect a llama-server context-window 4xx error."""
+    if status_code != 400:
+        return False
+    low = (body_text or "").lower()
+    return any(marker in low for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _tail_truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Trim *text* head-down so its estimated token count fits *max_tokens*.
+
+    Used when the user prompt alone exceeds the per-request budget; we
+    keep the *end* of the prompt because the most actionable instructions
+    and the file-to-transform live near the tail of our assembled
+    sections.
+    """
+    if max_tokens <= 0:
+        return ""
+    max_chars = max_tokens * CHARS_PER_TOKEN
+    if len(text) <= max_chars:
+        return text
+    head_marker = (
+        f"[... {len(text) - max_chars} leading characters truncated to fit "
+        f"llama-server context window ...]\n\n"
+    )
+    keep = max(0, max_chars - len(head_marker))
+    return head_marker + text[-keep:]
+
+
+def _clamp_chat_request(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> tuple[str, str, int, bool]:
+    """Pre-flight clamp a chat request to fit the llama-server context.
+
+    Returns ``(system_prompt, user_prompt, max_tokens, was_clamped)``.
+
+    Strategy (in order):
+
+    1. If everything fits with safety margin, return unchanged.
+    2. Otherwise, reduce ``max_tokens`` toward ``LLM_MIN_OUTPUT_TOKENS``
+       to free room for the prompt.
+    3. If the prompt *still* doesn't fit, tail-truncate the user prompt
+       (the system prompt is small and stable, so we keep it intact).
+    """
+    sys_tokens = _estimate_tokens(system_prompt)
+    user_tokens = _estimate_tokens(user_prompt)
+    available = max(0, CTX_SIZE_TOKENS - LLM_PROMPT_SAFETY_TOKENS - sys_tokens)
+    target_user_tokens = max(0, available - max_tokens)
+
+    if user_tokens <= target_user_tokens:
+        return system_prompt, user_prompt, max_tokens, False
+
+    overflow = (sys_tokens + user_tokens + max_tokens
+                + LLM_PROMPT_SAFETY_TOKENS) - CTX_SIZE_TOKENS
+
+    new_max_tokens = max_tokens
+    if overflow > 0:
+        new_max_tokens = max(
+            LLM_MIN_OUTPUT_TOKENS, max_tokens - overflow,
+        )
+
+    user_budget = max(
+        0, CTX_SIZE_TOKENS - LLM_PROMPT_SAFETY_TOKENS - sys_tokens - new_max_tokens,
+    )
+    if user_tokens > user_budget:
+        user_prompt = _tail_truncate_to_tokens(user_prompt, user_budget)
+        log.warning(
+            "Clamping LLM request: tail-truncated user prompt %d -> ~%d tokens "
+            "(sys=%d, max_tokens=%d, ctx=%d).",
+            user_tokens, user_budget, sys_tokens, new_max_tokens,
+            CTX_SIZE_TOKENS,
+        )
+    if new_max_tokens != max_tokens:
+        log.warning(
+            "Clamping LLM request: max_tokens %d -> %d to fit context.",
+            max_tokens, new_max_tokens,
+        )
+    return system_prompt, user_prompt, new_max_tokens, True
+
+
 def _call_llm_stream(
     system_prompt: str, user_prompt: str, max_tokens: int = 16384,
     meta: dict | None = None,
@@ -275,36 +371,96 @@ def _call_llm_stream(
     If *meta* dict is provided, ``meta["finish_reason"]`` is set to the
     finish_reason reported by the last SSE chunk (e.g. ``"stop"`` or
     ``"length"``).
+
+    Defensive behavior:
+    * The full response body is read on any non-2xx status so the actual
+      llama-server error message (e.g. context-window overflow) surfaces
+      to the caller / SSE client instead of a generic ``Client error
+      '400 Bad Request'`` from httpx.
+    * The request is pre-flight clamped against ``CTX_SIZE_TOKENS`` so
+      that ``prompt_tokens + max_tokens`` cannot exceed the configured
+      ``LLAMA_ARG_CTX_SIZE`` (with a safety margin).  When clamping is
+      not enough, the user prompt is tail-truncated.
+    * On a context-overflow 400 (rare race when our token estimate is
+      wrong), we shrink ``max_tokens`` and the user prompt and retry
+      once before failing.
     """
     url = f"{LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-        "stream": True,
-        # Disable hidden reasoning stream so content tokens appear promptly.
-        "reasoning_format": "none",
-        "reasoning_in_content": True,
-    }
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
         "Content-Type": "application/json",
     }
 
+    sys_p, usr_p, eff_max_tokens, _ = _clamp_chat_request(
+        system_prompt, user_prompt, max_tokens,
+    )
+
     yielded = False
     finish_reason_last: str | None = None
     last_err: Exception | None = None
+    last_400_body: str | None = None
     max_attempts = 4
+    overflow_retries = 0
+    max_overflow_retries = 2
 
-    for attempt in range(1, max_attempts + 1):
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": usr_p},
+            ],
+            "max_tokens": eff_max_tokens,
+            "temperature": 0.2,
+            "stream": True,
+            "reasoning_format": "none",
+            "reasoning_in_content": True,
+        }
         try:
             with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
                 with client.stream("POST", url, json=payload, headers=headers) as resp:
-                    resp.raise_for_status()
+                    if resp.status_code >= 400:
+                        try:
+                            body_bytes = resp.read()
+                        except Exception:
+                            body_bytes = b""
+                        body_text = body_bytes.decode("utf-8", errors="replace")
+                        if (
+                            _is_context_overflow_error(resp.status_code, body_text)
+                            and overflow_retries < max_overflow_retries
+                        ):
+                            overflow_retries += 1
+                            new_max = max(
+                                LLM_MIN_OUTPUT_TOKENS, eff_max_tokens // 2,
+                            )
+                            new_user_budget = max(
+                                0,
+                                CTX_SIZE_TOKENS
+                                - LLM_PROMPT_SAFETY_TOKENS * 2
+                                - _estimate_tokens(sys_p)
+                                - new_max,
+                            )
+                            usr_p = _tail_truncate_to_tokens(usr_p, new_user_budget)
+                            log.warning(
+                                "llama-server returned context-overflow 400 "
+                                "(retry %d/%d): shrinking max_tokens %d -> %d "
+                                "and tail-truncating user prompt to ~%d tokens.",
+                                overflow_retries, max_overflow_retries,
+                                eff_max_tokens, new_max, new_user_budget,
+                            )
+                            eff_max_tokens = new_max
+                            attempt -= 1
+                            continue
+                        last_400_body = body_text
+                        snippet = body_text.strip().splitlines()[:5]
+                        snippet_joined = " | ".join(s.strip() for s in snippet if s.strip())
+                        if not snippet_joined:
+                            snippet_joined = body_text[:500]
+                        raise RuntimeError(
+                            f"llama-server HTTP {resp.status_code}: {snippet_joined[:1500]}"
+                        )
                     for line in resp.iter_lines():
                         if not line or line == "data: [DONE]":
                             continue
@@ -342,6 +498,12 @@ def _call_llm_stream(
             "Failed to connect to llama-server after retries. "
             "Check container logs/tmux for llama-server startup errors."
         ) from last_err
+    if last_400_body is not None and not yielded:
+        # raise_for_status was bypassed because we already raised RuntimeError above;
+        # this branch only reached if the loop fell through without yielding.
+        raise RuntimeError(
+            f"llama-server rejected request: {last_400_body[:1500]}"
+        )
     if not yielded:
         raise RuntimeError("LLM returned empty response from direct llama-server")
 

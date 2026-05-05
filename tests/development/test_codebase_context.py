@@ -204,7 +204,10 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
 # ---------------------------------------------------------------
 print("\n=== Test 7: _estimate_tokens ===")
-check("1000 chars ~ 250 tokens", _estimate_tokens("x" * 1000) == 250)
+check(
+    "1000 chars / CHARS_PER_TOKEN tokens",
+    _estimate_tokens("x" * 1000) == 1000 // CHARS_PER_TOKEN,
+)
 check("empty = 0", _estimate_tokens("") == 0)
 
 # ---------------------------------------------------------------
@@ -314,7 +317,11 @@ print("\n=== Test 14: Constants are reasonable ===")
 check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
-check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+check(
+    "CHARS_PER_TOKEN is conservative for code (3-4)",
+    CHARS_PER_TOKEN in (3, 4),
+    f"got {CHARS_PER_TOKEN}",
+)
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")
