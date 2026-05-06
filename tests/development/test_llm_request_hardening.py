@@ -260,10 +260,15 @@ def test_iteration_caps_are_120():
         appmod.SANDBOX_AGENTIC_MAX_ATTEMPTS == 120,
         f"got {appmod.SANDBOX_AGENTIC_MAX_ATTEMPTS}",
     )
+    # The orchestrator cap may be either an explicit >=120 or None
+    # (unlimited): an upstream commit makes 0 / negative mean "no cap"
+    # so debug runs can converge without an arbitrary ceiling.  Either
+    # is acceptable for the user-facing "iterations >= 120" requirement.
+    val = appmod.SANDBOX_ORCH_MAX_STEPS
     _check(
-        "orchestrator_max_steps_is_120",
-        appmod.SANDBOX_ORCH_MAX_STEPS == 120,
-        f"got {appmod.SANDBOX_ORCH_MAX_STEPS}",
+        "orchestrator_max_steps_is_120_or_unlimited",
+        val is None or (isinstance(val, int) and val >= 120),
+        f"got {val!r}",
     )
 
 
