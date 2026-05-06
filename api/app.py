@@ -1340,6 +1340,7 @@ def _sandbox_build_iterate(
                 "skipping compilation loop. Repository packaged as-is."
             ),
         })
+        _sync_generated_from_sandbox(gen_dir, replacement_map)
         _package_sandbox_zip(session_dir, sandbox_dir)
         yield _sse({
             "type": "info",
@@ -1688,6 +1689,7 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "message": "Packaging best-effort repository…",
             })
+            _sync_generated_from_sandbox(gen_dir, replacement_map)
             _package_sandbox_zip(session_dir, sandbox_dir)
             build_log_path = session_dir / "sandbox_build_log.txt"
             build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -1721,6 +1723,7 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "message": "Packaging built repository…",
         })
+        _sync_generated_from_sandbox(gen_dir, replacement_map)
         _package_sandbox_zip(session_dir, sandbox_dir)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2144,6 +2147,7 @@ def _sandbox_build_iterate(
         "stage": "sandbox_build",
         "message": "Packaging built repository…",
     })
+    _sync_generated_from_sandbox(gen_dir, replacement_map)
     _package_sandbox_zip(session_dir, sandbox_dir)
 
     build_log_path = session_dir / "sandbox_build_log.txt"
@@ -2168,6 +2172,33 @@ def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
                 zf.write(fpath, arcname)
     log.info("Packaged sandbox as %s (%d bytes)", zip_path, zip_path.stat().st_size)
     return zip_path
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path,
+    replacement_map: dict[str, Path],
+) -> int:
+    """Copy final sandbox versions of generated files back to ``gen_dir``.
+
+    The sandbox debugger may patch generated files in-place inside the copied
+    repository. Preview and the main download bundle read from ``generated_code``,
+    so keep that directory aligned with the packaged sandbox output.
+    """
+    synced = 0
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    for filename, sandbox_path in replacement_map.items():
+        if not sandbox_path.is_file():
+            log.warning(
+                "Generated file %s not synced; sandbox path missing: %s",
+                filename, sandbox_path,
+            )
+            continue
+        dest = gen_dir / filename
+        shutil.copyfile(sandbox_path, dest)
+        synced += 1
+    if synced:
+        log.info("Synced %d generated file(s) from sandbox", synced)
+    return synced
 
 
 def _assemble_prompt(
