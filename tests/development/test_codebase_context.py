@@ -29,6 +29,7 @@ from app import (
     _assemble_prompt,
     _extract_fenced,
     _looks_complete_c_file,
+    _sync_generated_from_sandbox,
     MAX_REPO_CONTEXT_CHARS,
     MAX_INPUT_TOKENS,
     CHARS_PER_TOKEN,
@@ -315,6 +316,27 @@ check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
 check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+
+# ---------------------------------------------------------------
+print("\n=== Test 15: Sandbox generated fixes sync back to generated_code ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    root = Path(tmpdir)
+    gen_dir = root / "generated_code"
+    sandbox_dir = root / "sandbox"
+    gen_dir.mkdir()
+    (sandbox_dir / "src").mkdir(parents=True)
+
+    (gen_dir / "comm.h").write_text("stale generated header\n")
+    sandbox_header = sandbox_dir / "src" / "comm.h"
+    sandbox_header.write_text("fixed sandbox header\n")
+
+    synced = _sync_generated_from_sandbox(gen_dir, {"comm.h": sandbox_header})
+    check("sync reports generated file", synced == ["comm.h"], f"got {synced}")
+    check(
+        "generated_code receives sandbox fix",
+        (gen_dir / "comm.h").read_text() == "fixed sandbox header\n",
+        (gen_dir / "comm.h").read_text(),
+    )
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")
