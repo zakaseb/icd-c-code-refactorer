@@ -76,6 +76,10 @@ DIRECT_COMPARE_MAX_CHARS = 0
 ICD_CHUNK_CHARS = 3_000
 MAX_CODE_CONTEXT_CHARS = 8_000
 MAX_REPO_CONTEXT_CHARS = 15_000
+# Byte cap for the "old scripts" (.c / .h) context injected into the ICD-delta
+# analysis prompt. Larger than `MAX_REPO_CONTEXT_CHARS` because reasoning about
+# the *Impact on C code* benefits from seeing concrete source, not just headers.
+SOURCE_SCRIPTS_MAX_CHARS = 25_000
 
 CHARS_PER_TOKEN = 3
 CTX_SIZE_TOKENS = int(os.environ.get("LLAMA_ARG_CTX_SIZE", "32768"))
@@ -793,6 +797,83 @@ def _build_repo_summary(repo_dir: Path) -> str:
 
     result = "".join(parts)
     return _truncate_text(result, 4000, "repo_summary")
+
+
+def _build_source_scripts_context(
+    repo_dir: Path,
+    max_chars: int = SOURCE_SCRIPTS_MAX_CHARS,
+) -> str:
+    """Build a context containing the ACTUAL .c and .h source files.
+
+    Used as the "old scripts" reference during ICD-delta analysis so the LLM
+    can accurately reason about the *Impact on C code* portion of the change
+    specification.  Unlike `_build_repo_summary`, which is a heuristic
+    extraction (type names, function names, macros), this dumps the real
+    source so the model sees concrete struct layouts, function bodies,
+    enum values, macro expansions and #include topology.
+
+    Headers are emitted first (highest signal-per-byte), then implementation
+    files, until the byte budget is exhausted.  The first section is a flat
+    file tree so the model knows what exists even if some files get trimmed.
+    """
+    all_files = sorted(p for p in repo_dir.rglob("*") if p.is_file())
+    if not all_files:
+        return ""
+
+    tree_lines = [str(f.relative_to(repo_dir)) for f in all_files]
+    headers = [f for f in all_files if f.suffix.lower() in _HEADER_EXTS]
+    sources = [f for f in all_files if f.suffix.lower() in _SOURCE_EXTS]
+    if not headers and not sources:
+        return ""
+
+    parts: list[str] = [
+        "## Existing C Source Scripts (PRE-CHANGE \"OLD\" CODE)\n",
+        "The blocks below are the actual .c / .h files of the repository as "
+        "they exist BEFORE the ICD change. Treat them as the ground-truth "
+        "current implementation when assessing impact on C code.\n\n",
+        "### Repository File Structure\n```\n"
+        + "\n".join(tree_lines[:120])
+        + ("\n... (more files omitted)" if len(tree_lines) > 120 else "")
+        + "\n```\n",
+    ]
+    budget = max_chars - sum(len(p) for p in parts)
+
+    def _emit(fp: Path, kind: str) -> bool:
+        """Append one file. Returns False when the budget is exhausted."""
+        nonlocal budget
+        try:
+            content = fp.read_text(errors="replace")
+        except Exception:
+            return True
+        rel = str(fp.relative_to(repo_dir))
+        entry = f"\n### {kind}: {rel}\n```c\n{content}\n```\n"
+        if len(entry) <= budget:
+            parts.append(entry)
+            budget -= len(entry)
+            return True
+        if budget > 300:
+            trim = content[: max(0, budget - 200)]
+            parts.append(
+                f"\n### {kind}: {rel}\n```c\n{trim}\n"
+                "/* ... truncated (source-scripts budget exhausted) ... */\n```\n"
+            )
+            budget = 0
+        return False
+
+    if headers:
+        parts.append("\n## Headers (.h)\n")
+        for fp in headers:
+            if not _emit(fp, "Header"):
+                break
+
+    if sources and budget > 0:
+        parts.append("\n## Implementation Files (.c)\n")
+        for fp in sources:
+            if not _emit(fp, "Source"):
+                break
+
+    result = "".join(parts)
+    return _truncate_text(result, max_chars, "source_scripts")
 
 
 def _build_repo_knowledge(repo_dir: Path, max_chars: int = 10_000) -> str:
@@ -3197,14 +3278,16 @@ async def process(session_id: str):
 
     repo_dir = session_dir / "repo_contents"
     has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
-    repo_summary = ""
+    repo_source_scripts = ""
     repo_knowledge = ""
     if has_repo:
-        repo_summary = _build_repo_summary(repo_dir)
+        repo_source_scripts = _build_source_scripts_context(repo_dir)
         repo_knowledge = _build_repo_knowledge(repo_dir)
         (session_dir / "repo_knowledge.txt").write_text(repo_knowledge)
-        log.info("Repo summary for ICD analysis: %d chars, repo knowledge: %d chars",
-                 len(repo_summary), len(repo_knowledge))
+        log.info(
+            "Source scripts for ICD analysis: %d chars, repo knowledge: %d chars",
+            len(repo_source_scripts), len(repo_knowledge),
+        )
 
     uploaded_names = {p.name for p in code_files}
     log.info(
@@ -3275,12 +3358,29 @@ async def process(session_id: str):
             })
 
             repo_analysis_hint = ""
-            if repo_summary:
+            if repo_source_scripts:
                 repo_analysis_hint = (
-                    "\n\nThe code being refactored belongs to the following repository. "
-                    "When describing changes, use the ACTUAL type names, function names, "
-                    "and naming conventions from this codebase:\n"
-                    f"{repo_summary}\n"
+                    "\n\n"
+                    "You are also given the ACTUAL existing C source code of the "
+                    "project — the \"old scripts\" — that will be refactored to "
+                    "match the Target ICD. Treat these scripts as the ground-truth "
+                    "pre-change implementation.\n\n"
+                    "When you build the change specification you MUST:\n"
+                    "  * Read the old scripts carefully BEFORE listing impacts.\n"
+                    "  * Quote the EXACT type names, struct fields, enum members, "
+                    "function signatures, macro names, and #include paths as they "
+                    "appear in the old scripts.\n"
+                    "  * For every 'Impact on C code' item, name the specific file "
+                    "(e.g. `include/comm.h`, `src/sensor.c`) and the specific "
+                    "symbol or block that must change, mapped from its OLD form in "
+                    "the scripts to its NEW form required by the Target ICD.\n"
+                    "  * Do NOT invent symbols, types, or files that do not appear "
+                    "in the old scripts; if the ICD introduces something brand-new, "
+                    "say so explicitly and indicate where it should be added.\n"
+                    "  * Flag any ICD requirements that have no clear hook in the "
+                    "current code as 'NEW' so a downstream refactor agent knows to "
+                    "create them rather than edit existing code.\n\n"
+                    f"{repo_source_scripts}\n"
                 )
 
             compare_system = (
@@ -3294,7 +3394,9 @@ async def process(session_id: str):
                 "- header/source synchronization requirements\n"
                 "- any additions, removals, or modifications between versions\n\n"
                 "Be thorough and detailed. Do not abbreviate or summarize. "
-                "List every single change with specific old and new values."
+                "List every single change with specific old and new values. "
+                "Ground the 'Impact on C code' section in the actual old scripts "
+                "provided below — cite real files and symbols, never invented ones."
                 f"{repo_analysis_hint}"
             )
 
@@ -3314,6 +3416,14 @@ async def process(session_id: str):
                         ),
                     })
 
+                    grounding_note = (
+                        "\n\nThe system prompt contains the project's actual existing "
+                        "C source scripts (the 'old scripts'). Use them as the "
+                        "authoritative pre-change implementation when filling in the "
+                        "'Impact on C code' field — quote real file paths and real "
+                        "symbol names, and explicitly mark anything brand-new."
+                        if repo_source_scripts else ""
+                    )
                     base_compare_prompt = (
                         "Compare these two complete ICD documents and produce a COMPLETE "
                         "and EXHAUSTIVE code-impact change specification that will be used "
@@ -3323,7 +3433,10 @@ async def process(session_id: str):
                         "List EVERY difference between the two ICDs. For each change, state:\n"
                         "1. What it was in the Source ICD (old)\n"
                         "2. What it is in the Target ICD (new)\n"
-                        "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                        "3. Impact on C code (structs, enums, functions, constants, etc.) — "
+                        "cite the specific file and symbol from the old scripts, mapping the "
+                        "OLD form to the NEW form."
+                        f"{grounding_note}"
                     )
                     target_summary = _truncate_text(target_icd, 12_000, "target_icd_for_transform")
 
@@ -3458,6 +3571,14 @@ async def process(session_id: str):
                         "message": "Generating detailed change specification…",
                     })
 
+                    grounding_note = (
+                        "\n\nThe system prompt contains the project's actual existing "
+                        "C source scripts (the 'old scripts'). Use them as the "
+                        "authoritative pre-change implementation when filling in the "
+                        "'Impact on C code' field — quote real file paths and real "
+                        "symbol names, and explicitly mark anything brand-new."
+                        if repo_source_scripts else ""
+                    )
                     base_compare_prompt = (
                         "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "
                         "comparing the Source ICD to the Target ICD.  This specification will "
@@ -3467,7 +3588,10 @@ async def process(session_id: str):
                         "List EVERY difference between the two ICDs. For each change, state:\n"
                         "1. What it was in the Source ICD (old)\n"
                         "2. What it is in the Target ICD (new)\n"
-                        "3. Impact on C code (structs, enums, functions, constants, etc.)"
+                        "3. Impact on C code (structs, enums, functions, constants, etc.) — "
+                        "cite the specific file and symbol from the old scripts, mapping the "
+                        "OLD form to the NEW form."
+                        f"{grounding_note}"
                     )
 
                 # ---- Streaming comparison (used by both paths) ----

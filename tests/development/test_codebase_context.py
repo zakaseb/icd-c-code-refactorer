@@ -21,6 +21,7 @@ from app import (
     _build_repo_context,
     _build_file_repo_context,
     _build_repo_summary,
+    _build_source_scripts_context,
     _safe_extract_zip,
     _extract_includes,
     _find_repo_file,
@@ -32,6 +33,7 @@ from app import (
     MAX_REPO_CONTEXT_CHARS,
     MAX_INPUT_TOKENS,
     CHARS_PER_TOKEN,
+    SOURCE_SCRIPTS_MAX_CHARS,
 )
 
 client = TestClient(app)
@@ -203,6 +205,75 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("function names in summary", "COMM_Init" in summary or "SENSOR_Init" in summary)
 
 # ---------------------------------------------------------------
+print("\n=== Test 6b: _build_source_scripts_context ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    zp = Path(tmpdir) / "test.zip"
+    zp.write_bytes(zip_bytes)
+    dest = Path(tmpdir) / "repo"
+    _safe_extract_zip(zp, dest)
+
+    scripts = _build_source_scripts_context(dest)
+    check("scripts context non-empty", len(scripts) > 0)
+    check(
+        "scripts context within budget",
+        len(scripts) <= SOURCE_SCRIPTS_MAX_CHARS + 200,
+        f"got {len(scripts)} chars (budget {SOURCE_SCRIPTS_MAX_CHARS})",
+    )
+    check(
+        "labelled as old/pre-change code",
+        "PRE-CHANGE" in scripts and "old" in scripts.lower(),
+        "expected explicit 'pre-change' / 'old' labelling for impact-on-C grounding",
+    )
+    check(
+        "file tree present",
+        "Repository File Structure" in scripts,
+    )
+    check(
+        "headers section present",
+        "Headers (.h)" in scripts,
+    )
+    check(
+        "implementation section present",
+        "Implementation Files (.c)" in scripts,
+    )
+    check(
+        "real header content (comm.h body) included",
+        "CommMessage_t" in scripts and "COMM_Init" in scripts,
+    )
+    check(
+        "real source content (comm.c body) included",
+        "s_initialized" in scripts,
+        "expected concrete .c body, not just summary",
+    )
+    check(
+        "real source content (sensor.c body) included",
+        "SENSOR_Read" in scripts and "SensorReading_t" in scripts,
+    )
+    check(
+        "headers come before sources",
+        scripts.find("Headers (.h)") < scripts.find("Implementation Files (.c)"),
+    )
+
+    # Confirm budget enforcement under a tight cap.
+    tight = _build_source_scripts_context(dest, max_chars=2000)
+    check("tight budget respected", len(tight) <= 2100,
+          f"got {len(tight)} chars for 2K cap")
+    check("tight budget still labels old scripts", "PRE-CHANGE" in tight)
+
+    # Empty repo -> empty string.
+    empty_repo = Path(tmpdir) / "empty"
+    empty_repo.mkdir()
+    check("empty repo -> empty context",
+          _build_source_scripts_context(empty_repo) == "")
+
+    # Repo with only non-C files -> empty string.
+    nonc_repo = Path(tmpdir) / "nonc"
+    nonc_repo.mkdir()
+    (nonc_repo / "README.md").write_text("hi")
+    check("non-C repo -> empty context",
+          _build_source_scripts_context(nonc_repo) == "")
+
+# ---------------------------------------------------------------
 print("\n=== Test 7: _estimate_tokens ===")
 check(
     "1000 chars / CHARS_PER_TOKEN tokens",
@@ -321,6 +392,16 @@ check(
     "CHARS_PER_TOKEN is conservative for code (3-4)",
     CHARS_PER_TOKEN in (3, 4),
     f"got {CHARS_PER_TOKEN}",
+)
+check(
+    "SOURCE_SCRIPTS_MAX_CHARS larger than repo summary cap (4K)",
+    SOURCE_SCRIPTS_MAX_CHARS >= 10_000,
+    f"got {SOURCE_SCRIPTS_MAX_CHARS}",
+)
+check(
+    "SOURCE_SCRIPTS_MAX_CHARS fits inside model context budget",
+    SOURCE_SCRIPTS_MAX_CHARS // CHARS_PER_TOKEN < MAX_INPUT_TOKENS,
+    f"{SOURCE_SCRIPTS_MAX_CHARS} chars vs {MAX_INPUT_TOKENS} tokens",
 )
 
 # ---------------------------------------------------------------
