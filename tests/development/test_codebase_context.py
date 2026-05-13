@@ -22,6 +22,7 @@ from app import (
     _build_file_repo_context,
     _build_repo_summary,
     _safe_extract_zip,
+    _run_sandbox_build,
     _extract_includes,
     _find_repo_file,
     _structural_verify,
@@ -136,6 +137,45 @@ r = client.post(
 )
 check("upload 200", r.status_code == 200)
 check("file_count == 5", r.json().get("file_count") == 5)
+
+# ---------------------------------------------------------------
+print("\n=== Test 2b: ZIP extraction blocks prefix traversal ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    tmp = Path(tmpdir)
+    zp = tmp / "evil.zip"
+    dest = tmp / "repo"
+    sibling = tmp / "repo_evil" / "pwned.txt"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("good/file.txt", "ok")
+        zf.writestr("../repo_evil/pwned.txt", "owned")
+
+    stats = _safe_extract_zip(zp, dest)
+    check("safe file extracted", (dest / "good" / "file.txt").read_text() == "ok")
+    check("traversal file skipped", not sibling.exists())
+    check("file_count excludes traversal", stats["file_count"] == 1, str(stats))
+
+# ---------------------------------------------------------------
+print("\n=== Test 2c: sandbox build paths are not shell-interpreted ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    tmp = Path(tmpdir)
+    marker = tmp / "injected_marker"
+    build_dir = tmp / "project; touch injected_marker; #"
+    build_dir.mkdir()
+    makefile = build_dir / "Makefile"
+    makefile.write_text(
+        "all:\n"
+        "\t@echo build-ok\n"
+        "clean:\n"
+        "\t@true\n"
+    )
+
+    ok, output = _run_sandbox_build(
+        tmp,
+        {"type": "make", "path": makefile, "build_dir": build_dir},
+        timeout=10,
+    )
+    check("build succeeds with metachar path", ok, output)
+    check("shell injection marker absent", not marker.exists())
 
 # ---------------------------------------------------------------
 print("\n=== Test 3: _extract_includes ===")

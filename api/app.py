@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 import shutil
+import shlex
 import subprocess
 import zipfile
 import io
@@ -471,13 +472,16 @@ def _estimate_tokens(text: str) -> int:
 def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> dict:
     """Extract a ZIP safely into *dest_dir*, returning file statistics."""
     dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_dir.resolve()
     file_count = 0
     with zipfile.ZipFile(zip_path, 'r') as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            target = (dest_dir / info.filename).resolve()
-            if not str(target).startswith(str(dest_dir.resolve())):
+            target = (dest_root / info.filename).resolve()
+            try:
+                target.relative_to(dest_root)
+            except ValueError:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, open(target, 'wb') as dst:
@@ -1067,30 +1071,61 @@ def _run_sandbox_build(
     bdir = build_info["build_dir"]
     sandbox_cc = _detect_cross_compiler(build_info)
 
-    if btype == "make":
-        full_cmd = (
-            f"make -C {bdir} CC='{sandbox_cc}' clean 2>/dev/null; "
-            f"make -C {bdir} CC='{sandbox_cc}' 2>&1"
-        )
-    elif btype == "cmake":
-        cmake_build = bdir / "_cmake_build"
-        cc_bin = sandbox_cc.split()[0]
-        cc_flags = " ".join(sandbox_cc.split()[1:])
-        full_cmd = (
-            f"cmake -S {bdir} -B {cmake_build} "
-            f"-DCMAKE_C_COMPILER={cc_bin} "
-            f'-DCMAKE_C_FLAGS="{cc_flags}" 2>&1 && '
-            f"cmake --build {cmake_build} 2>&1"
-        )
-    else:
-        return False, "No supported build system detected in repository."
-
     try:
-        result = subprocess.run(
-            full_cmd, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=str(sandbox_dir),
-        )
-        output = (result.stdout or "") + (result.stderr or "")
+        if btype == "make":
+            subprocess.run(
+                ["make", "-C", str(bdir), f"CC={sandbox_cc}", "clean"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=timeout,
+                cwd=str(sandbox_dir),
+            )
+            result = subprocess.run(
+                ["make", "-C", str(bdir), f"CC={sandbox_cc}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+                cwd=str(sandbox_dir),
+            )
+            output = result.stdout or ""
+        elif btype == "cmake":
+            cmake_build = bdir / "_cmake_build"
+            cc_parts = shlex.split(sandbox_cc)
+            cc_bin = cc_parts[0]
+            cc_flags = " ".join(cc_parts[1:])
+            configure = subprocess.run(
+                [
+                    "cmake",
+                    "-S",
+                    str(bdir),
+                    "-B",
+                    str(cmake_build),
+                    f"-DCMAKE_C_COMPILER={cc_bin}",
+                    f"-DCMAKE_C_FLAGS={cc_flags}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+                cwd=str(sandbox_dir),
+            )
+            output = configure.stdout or ""
+            if configure.returncode == 0:
+                result = subprocess.run(
+                    ["cmake", "--build", str(cmake_build)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=timeout,
+                    cwd=str(sandbox_dir),
+                )
+                output += result.stdout or ""
+            else:
+                result = configure
+        else:
+            return False, "No supported build system detected in repository."
 
         if result.returncode == 0:
             return True, output.strip()
@@ -1109,32 +1144,35 @@ def _run_sandbox_build(
         for inc in bdir.rglob("*.h"):
             include_dirs.add(str(inc.parent))
 
-        # Write a shell script to compile each source individually,
-        # avoiding shell argument-length limits on large repos.
-        script = bdir / "_sandbox_compile.sh"
-        lines = ["#!/bin/sh", "set -e", f'CC="{sandbox_cc}"']
-        inc_args = " ".join(f'"-I{d}"' for d in sorted(include_dirs))
-        lines.append(f"INC={inc_args}")
+        # Compile each source individually without a shell so repository path
+        # names cannot be interpreted as shell syntax.
+        compiler = shlex.split(sandbox_cc)
+        include_args = [f"-I{d}" for d in sorted(include_dirs)]
+        deadline = time.monotonic() + timeout
         for src in c_sources:
             obj = src.with_suffix(".o")
-            lines.append(f'$CC $INC -c -o "{obj}" "{src}" 2>&1')
-        script.write_text("\n".join(lines) + "\n")
-        script.chmod(0o755)
-
-        result2 = subprocess.run(
-            ["sh", str(script)], capture_output=True, text=True,
-            timeout=timeout, cwd=str(sandbox_dir),
-        )
-        compile_output += (result2.stdout or "") + (result2.stderr or "")
-
-        if result2.returncode == 0:
-            compile_output += (
-                "\n\n--- Compile-only PASSED (all .c → .o succeeded) ---\n"
-                "Linking skipped: BSP libraries/linker scripts not in repository.\n"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, f"Build timed out after {timeout} seconds."
+            cmd = [*compiler, *include_args, "-c", "-o", str(obj), str(src)]
+            compile_output += "\n$ " + " ".join(shlex.quote(arg) for arg in cmd) + "\n"
+            result2 = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=remaining,
+                cwd=str(sandbox_dir),
             )
-            return True, compile_output.strip()
+            compile_output += result2.stdout or ""
+            if result2.returncode != 0:
+                return False, compile_output.strip()
 
-        return False, compile_output.strip()
+        compile_output += (
+            "\n\n--- Compile-only PASSED (all .c -> .o succeeded) ---\n"
+            "Linking skipped: BSP libraries/linker scripts not in repository.\n"
+        )
+        return True, compile_output.strip()
 
     except subprocess.TimeoutExpired:
         return False, f"Build timed out after {timeout} seconds."
