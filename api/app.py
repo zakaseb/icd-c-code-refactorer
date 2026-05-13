@@ -749,68 +749,17 @@ def _build_file_repo_context(
     return "".join(parts)
 
 
-def _build_repo_summary(repo_dir: Path) -> str:
-    """Build a concise summary of the repo for use in ICD analysis.
-
-    Extracts the file tree, naming conventions, and key type/function
-    declarations — small enough (~3K chars) to include in the analysis
-    prompt without blowing the context budget.
-    """
-    all_files = sorted(p for p in repo_dir.rglob("*") if p.is_file())
-    tree_lines: list[str] = []
-    type_names: list[str] = []
-    func_names: list[str] = []
-    macro_names: list[str] = []
-
-    typedef_re = re.compile(r'\btypedef\b.*?(\b\w+_[te]\b)\s*;', re.DOTALL)
-    func_re = re.compile(r'^[A-Za-z_]\w*\s+([A-Z_]\w+)\s*\(', re.MULTILINE)
-    define_re = re.compile(r'^\s*#\s*define\s+([A-Z_][A-Z0-9_]+)', re.MULTILINE)
-
-    for f in all_files:
-        rel = str(f.relative_to(repo_dir))
-        tree_lines.append(rel)
-        suffix = f.suffix.lower()
-        if suffix not in _HEADER_EXTS:
-            continue
-        try:
-            content = f.read_text(errors="replace")
-        except Exception:
-            continue
-        type_names.extend(typedef_re.findall(content))
-        func_names.extend(func_re.findall(content)[:20])
-        macro_names.extend(define_re.findall(content)[:20])
-
-    type_names = sorted(set(type_names))[:40]
-    func_names = sorted(set(func_names))[:40]
-    macro_names = sorted(set(macro_names))[:30]
-
-    parts = [
-        "## Repository Overview (for ICD analysis context)\n",
-        f"### File Structure\n```\n" + "\n".join(tree_lines[:80]) + "\n```\n",
-    ]
-    if type_names:
-        parts.append(f"\n### Type Definitions\n{', '.join(type_names)}\n")
-    if func_names:
-        parts.append(f"\n### Function Names\n{', '.join(func_names)}\n")
-    if macro_names:
-        parts.append(f"\n### Key Macros\n{', '.join(macro_names)}\n")
-
-    result = "".join(parts)
-    return _truncate_text(result, 4000, "repo_summary")
-
-
 def _build_source_scripts_context(
     repo_dir: Path,
     max_chars: int = SOURCE_SCRIPTS_MAX_CHARS,
 ) -> str:
     """Build a context containing the ACTUAL .c and .h source files.
 
-    Used as the "old scripts" reference during ICD-delta analysis so the LLM
-    can accurately reason about the *Impact on C code* portion of the change
-    specification.  Unlike `_build_repo_summary`, which is a heuristic
-    extraction (type names, function names, macros), this dumps the real
-    source so the model sees concrete struct layouts, function bodies,
-    enum values, macro expansions and #include topology.
+    This is the sole repository-level context used by the ICD-delta analysis
+    stage: instead of a heuristic summary of identifiers, the LLM is given
+    the real source so it can ground the *Impact on C code* portion of the
+    change specification in concrete struct layouts, function bodies, enum
+    values, macro expansions and ``#include`` topology.
 
     Headers are emitted first (highest signal-per-byte), then implementation
     files, until the byte budget is exhausted.  The first section is a flat

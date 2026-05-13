@@ -20,7 +20,6 @@ from app import (
     app,
     _build_repo_context,
     _build_file_repo_context,
-    _build_repo_summary,
     _build_source_scripts_context,
     _safe_extract_zip,
     _extract_includes,
@@ -190,22 +189,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("no includes = empty context", ctx_no_deps == "", f"got '{ctx_no_deps[:50]}'")
 
 # ---------------------------------------------------------------
-print("\n=== Test 6: _build_repo_summary ===")
-with tempfile.TemporaryDirectory() as tmpdir:
-    zp = Path(tmpdir) / "test.zip"
-    zp.write_bytes(zip_bytes)
-    dest = Path(tmpdir) / "repo"
-    _safe_extract_zip(zp, dest)
-
-    summary = _build_repo_summary(dest)
-    check("summary non-empty", len(summary) > 0)
-    check("summary under 4K", len(summary) <= 4100)
-    check("file structure in summary", "File Structure" in summary)
-    check("type names in summary", "CommMessage_t" in summary or "SensorReading_t" in summary)
-    check("function names in summary", "COMM_Init" in summary or "SENSOR_Init" in summary)
-
-# ---------------------------------------------------------------
-print("\n=== Test 6b: _build_source_scripts_context ===")
+print("\n=== Test 6: _build_source_scripts_context ===")
 with tempfile.TemporaryDirectory() as tmpdir:
     zp = Path(tmpdir) / "test.zip"
     zp.write_bytes(zip_bytes)
@@ -394,7 +378,7 @@ check(
     f"got {CHARS_PER_TOKEN}",
 )
 check(
-    "SOURCE_SCRIPTS_MAX_CHARS larger than repo summary cap (4K)",
+    "SOURCE_SCRIPTS_MAX_CHARS comfortably above 10K",
     SOURCE_SCRIPTS_MAX_CHARS >= 10_000,
     f"got {SOURCE_SCRIPTS_MAX_CHARS}",
 )
