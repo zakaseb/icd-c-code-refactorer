@@ -40,6 +40,8 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from per_file_compile import run_per_file_compile
+
 app = FastAPI(title="ICD C Code Refactorer", docs_url=None, redoc_url=None)
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -2997,9 +2999,11 @@ def _pausable_stream(session_dir: Path, events):
                     "Processing paused. Current reports and generated artifacts "
                     "are available for download; click Resume to continue."
                 ),
+                # Previewable subset only — .o object files ship in the zip
+                # but are not opened in the UI preview pane.
                 "files": sorted(
                     p.name for p in (session_dir / "generated_code").iterdir()
-                    if p.is_file()
+                    if p.is_file() and p.suffix.lower() != ".o"
                 ) if (session_dir / "generated_code").exists() else [],
             }
             _record_pipeline_event(session_dir, paused_payload)
@@ -4145,6 +4149,26 @@ async def process(session_id: str):
             report_path.write_text("\n".join(report_lines) + "\n")
             yield _sse({"type": "stage_complete", "stage": "verification"})
 
+        # ---- Step 3.5: Per-file compile gate (.c -> .o) ----------------
+        # Compile each revised .c on its own with the project's toolchain
+        # so the .c/.h/.o triples and the per-file compile_report are
+        # downloadable BEFORE the long-running sandbox build kicks in.
+        # The same agentic LLM-fix loop used by the sandbox build is
+        # applied here, scoped to one .c (+ its companion .h) at a time.
+        completed_now = set(_pipeline_state(_read_status(session_dir)).get("completed_stages", []))
+        for evt in run_per_file_compile(
+            session_dir=session_dir,
+            gen_dir=gen_dir,
+            code_dir=code_dir,
+            repo_dir=repo_dir,
+            has_repo=has_repo,
+            change_spec=change_spec,
+            repo_knowledge=repo_knowledge,
+            is_resume=is_resume,
+            completed_stages=completed_now,
+        ):
+            yield evt
+
         # ---- Step 4: Sandbox build ------------------------------------
         sandbox_build_success = None
         if has_repo:
@@ -4208,8 +4232,12 @@ async def process(session_id: str):
         status = _read_status(session_dir)
         status["pause_requested"] = False
         status["state"] = "completed"
+        # `generated_files` drives the UI preview tabs, so .o files (binary
+        # objects from the per-file compile gate) are excluded — they are
+        # still in `gen_dir` and ship in the /api/download zip.
         status["generated_files"] = sorted(
-            p.name for p in gen_dir.iterdir() if p.is_file()
+            p.name for p in gen_dir.iterdir()
+            if p.is_file() and p.suffix.lower() != ".o"
         )
         _write_status(session_dir, status)
         complete_payload = {"type": "complete", "files": status["generated_files"]}
@@ -4246,6 +4274,7 @@ async def download_all(session_id: str):
         session_dir / PIPELINE_EVENTS_FILE,
         session_dir / "status.json",
         gen_dir / "verification_report.txt",
+        gen_dir / "compile_report.txt",
         gen_dir / "icd_analysis.txt",
     ]
     if not files and not any(p.exists() for p in report_candidates):
@@ -4269,6 +4298,13 @@ async def download_all(session_id: str):
         if vr.exists():
             zf.write(vr, "verification_report.txt")
             log.info("Added verification_report.txt")
+        # Per-file compile gate report (added by name above already, but
+        # this also handles the resume-only case where gen_dir lists the
+        # report among `files` and we want to ensure it's present.)
+        compile_rep = gen_dir / "compile_report.txt"
+        if compile_rep.exists() and "compile_report.txt" not in zf.namelist():
+            zf.write(compile_rep, "compile_report.txt")
+            log.info("Added compile_report.txt")
         built_repo = session_dir / "built_repo.zip"
         if built_repo.exists():
             zf.write(built_repo, "built_repo.zip")
@@ -5011,8 +5047,10 @@ async def regenerate(session_id: str):
 
         status["state"] = "completed"
         status["regeneration_count"] = regen_count
+        # Filter .o objects: not previewable in the UI; still in the zip.
         status["generated_files"] = sorted(
-            p.name for p in gen_dir.iterdir() if p.is_file()
+            p.name for p in gen_dir.iterdir()
+            if p.is_file() and p.suffix.lower() != ".o"
         )
         (session_dir / "status.json").write_text(json.dumps(status))
         complete_payload = {"type": "complete", "files": status["generated_files"]}

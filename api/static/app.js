@@ -241,6 +241,7 @@
     const fileSteps = {};
     let generatedFiles = [];
     let verificationStep = null;
+    let compileStep = null;
     let sandboxStep = null;
     let hasSandboxBuild = false;
 
@@ -255,6 +256,7 @@
           let step;
           if (msg.stage === 'analysis') step = analysisStep;
           else if (msg.stage === 'verification') step = verificationStep;
+          else if (msg.stage === 'compile') step = compileStep;
           else if (msg.stage === 'sandbox_build') step = sandboxStep;
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
@@ -279,12 +281,58 @@
             pipelineSteps.appendChild(verificationStep);
             setStepStatus(verificationStep, 'running');
             verificationStep.querySelector('.step-output').classList.add('visible');
+          } else if (msg.stage === 'compile' && !compileStep) {
+            compileStep = createStep('compile',
+              'Compiling generated .c files to .o objects\u2026');
+            pipelineSteps.appendChild(compileStep);
+            setStepStatus(compileStep, 'running');
+            compileStep.querySelector('.step-output').classList.add('visible');
           } else if (msg.stage === 'sandbox_build' && !sandboxStep) {
             sandboxStep = createStep('sandbox-build',
               'Building generated code in sandbox environment\u2026');
             pipelineSteps.appendChild(sandboxStep);
             setStepStatus(sandboxStep, 'running');
             sandboxStep.querySelector('.step-output').classList.add('visible');
+          }
+          break;
+
+        case 'compile_file_result':
+          if (compileStep) {
+            const out = compileStep.querySelector('.step-output');
+            const tag = msg.success ? 'OK' : 'FAIL';
+            const line =
+              '\n[' + tag + '] ' + msg.file +
+              (msg.object ? ' \u2192 ' + msg.object : '') +
+              ' (attempt ' + (msg.attempt || 1) + ')\n';
+            if (typeof window.appendStepLog === 'function') {
+              window.appendStepLog(out, line);
+            } else {
+              out.textContent += line;
+              out.scrollTop = out.scrollHeight;
+            }
+          }
+          break;
+
+        case 'compile_summary':
+          if (compileStep) {
+            compileStep.querySelector('.step-label').textContent =
+              'Per-file compile: ' + msg.ok + '/' + msg.total + ' compiled' +
+              (msg.failed ? ', ' + msg.failed + ' still failing' : '');
+          }
+          break;
+
+        case 'compile_artifacts_ready':
+          // Surface the Download All button NOW so the user can grab the
+          // .c / .h / .o triples + compile_report.txt while sandbox_build
+          // is still running. Re-call showResults whenever new artefacts
+          // become available so the tab list stays current. The server
+          // already pre-filters .o out of msg.files, but we re-check
+          // defensively before wiring them up as preview tabs.
+          generatedFiles = (Array.isArray(msg.files) ? msg.files : []).filter(function (f) {
+            return !f.toLowerCase().endsWith('.o');
+          });
+          if (generatedFiles.length) {
+            showResults(generatedFiles, hasSandboxBuild, true);
           }
           break;
 
@@ -295,6 +343,13 @@
           } else if (msg.stage === 'verification' && verificationStep) {
             setStepStatus(verificationStep, 'complete');
             verificationStep.querySelector('.step-label').textContent = 'Verification complete';
+          } else if (msg.stage === 'compile' && compileStep) {
+            setStepStatus(compileStep, 'complete');
+            const label = compileStep.querySelector('.step-label').textContent;
+            if (label === 'Compiling generated .c files to .o objects\u2026') {
+              compileStep.querySelector('.step-label').textContent =
+                'Per-file compile complete \u2014 artefacts available for download';
+            }
           } else if (msg.stage === 'sandbox_build' && sandboxStep) {
             setStepStatus(sandboxStep, 'complete');
             sandboxStep.querySelector('.step-label').textContent = 'Sandbox build complete';
@@ -328,6 +383,14 @@
             const out = verificationStep.querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
+          } else if (msg.stage === 'compile' && compileStep) {
+            const out = compileStep.querySelector('.step-output');
+            if (typeof window.appendStepLog === 'function') {
+              window.appendStepLog(out, '\n' + msg.message + '\n');
+            } else {
+              out.textContent += '\n' + msg.message + '\n';
+              out.scrollTop = out.scrollHeight;
+            }
           } else if (msg.stage === 'sandbox_build' && sandboxStep) {
             const out = sandboxStep.querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
@@ -393,7 +456,7 @@
       es.close();
       activeEventSource = null;
       if (generatedFiles.length) {
-        showResults(generatedFiles);
+        showResults(generatedFiles, hasSandboxBuild);
         return;
       }
       setStepStatus(analysisStep, 'error');
@@ -452,20 +515,36 @@
   /* ----- Results ------------------------------------------------- */
 
   function showResults(files, sandboxBuild, allowEmpty) {
-    if (!files.length && !allowEmpty) return;
+    // Defensive: drop any .o objects that might slip through — they are
+    // binary and not previewable, but they DO ship in the /api/download zip.
+    const previewable = (files || []).filter(function (f) {
+      return !f.toLowerCase().endsWith('.o');
+    });
+    if (!previewable.length && !allowEmpty) return;
     resultsSection.classList.remove('hidden');
-    if (files.length) convSection.classList.remove('hidden');
+    if (previewable.length) convSection.classList.remove('hidden');
+    // Preserve the currently active tab if it still exists in the new list.
+    const activeTabEl = resultTabs.querySelector('.file-tab.active');
+    const previouslyActive = activeTabEl ? activeTabEl.dataset.file : null;
     resultTabs.innerHTML = '';
-    files.forEach((f, i) => {
+    let activeIdx = 0;
+    if (previouslyActive) {
+      const idx = previewable.indexOf(previouslyActive);
+      if (idx >= 0) activeIdx = idx;
+    }
+    previewable.forEach((f, i) => {
       const tab = document.createElement('button');
-      tab.className = 'file-tab' + (i === 0 ? ' active' : '');
+      tab.className = 'file-tab' + (i === activeIdx ? ' active' : '');
       tab.textContent = f;
       tab.dataset.file = f;
       tab.addEventListener('click', () => loadPreview(f));
       resultTabs.appendChild(tab);
     });
-    if (files.length) {
-      loadPreview(files[0]);
+    if (previewable.length) {
+      // Only re-load the preview if we don't already have it open.
+      if (previewable[activeIdx] !== previouslyActive) {
+        loadPreview(previewable[activeIdx]);
+      }
     } else {
       codePreview.textContent = 'Processing is paused before generated code is available. Use Download All (ZIP) to download reports captured so far.';
     }
