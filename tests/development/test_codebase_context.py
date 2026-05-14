@@ -29,6 +29,7 @@ from app import (
     _assemble_prompt,
     _extract_fenced,
     _looks_complete_c_file,
+    _sync_generated_from_sandbox,
     MAX_REPO_CONTEXT_CHARS,
     MAX_INPUT_TOKENS,
     CHARS_PER_TOKEN,
@@ -315,6 +316,34 @@ check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
 check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+
+# ---------------------------------------------------------------
+print("\n=== Test 15: sandbox-generated sync preserves orchestrator fixes ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    root = Path(tmpdir)
+    gen_dir = root / "generated_code"
+    sandbox_dir = root / "sandbox"
+    fixed_path = sandbox_dir / "project" / "src" / "comm.c"
+    gen_dir.mkdir()
+    fixed_path.parent.mkdir(parents=True)
+
+    (gen_dir / "comm.c").write_text("int stale_broken = 1;\n")
+    fixed_path.write_text("int sandbox_fixed = 1;\n")
+    log_lines: list[str] = []
+
+    synced = _sync_generated_from_sandbox(
+        gen_dir,
+        sandbox_dir,
+        {"comm.c": fixed_path},
+        log_lines,
+    )
+
+    check("sync count == 1", synced == 1, f"got {synced}")
+    check(
+        "generated_code updated from sandbox",
+        (gen_dir / "comm.c").read_text() == "int sandbox_fixed = 1;\n",
+    )
+    check("sync logged", any("Synced 1 generated" in line for line in log_lines))
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")

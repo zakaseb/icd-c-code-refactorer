@@ -1688,6 +1688,9 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "message": "Packaging best-effort repository…",
             })
+            _sync_generated_from_sandbox(
+                gen_dir, sandbox_dir, replacement_map, build_log_lines,
+            )
             _package_sandbox_zip(session_dir, sandbox_dir)
             build_log_path = session_dir / "sandbox_build_log.txt"
             build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -1721,6 +1724,9 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "message": "Packaging built repository…",
         })
+        _sync_generated_from_sandbox(
+            gen_dir, sandbox_dir, replacement_map, build_log_lines,
+        )
         _package_sandbox_zip(session_dir, sandbox_dir)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2156,6 +2162,54 @@ def _sandbox_build_iterate(
         "iterations": iteration,
         "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path,
+    sandbox_dir: Path,
+    replacement_map: dict[str, Path],
+    build_log_lines: list[str] | None = None,
+) -> int:
+    """Copy sandbox-fixed generated files back to the session output folder."""
+    sandbox_root = sandbox_dir.resolve()
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    synced = 0
+
+    for fname, sandbox_path in sorted(replacement_map.items()):
+        try:
+            src = sandbox_path.resolve()
+            src.relative_to(sandbox_root)
+        except (OSError, ValueError) as exc:
+            msg = f"Skipped sync for {fname}: sandbox path is invalid ({exc})"
+            log.warning(msg)
+            if build_log_lines is not None:
+                build_log_lines.append(msg)
+            continue
+
+        if not src.is_file():
+            msg = f"Skipped sync for {fname}: {src} is not a file"
+            log.warning(msg)
+            if build_log_lines is not None:
+                build_log_lines.append(msg)
+            continue
+
+        dest = gen_dir / Path(fname).name
+        try:
+            dest.write_text(src.read_text(errors="replace"))
+        except OSError as exc:
+            msg = f"Skipped sync for {fname}: {exc}"
+            log.warning(msg)
+            if build_log_lines is not None:
+                build_log_lines.append(msg)
+            continue
+
+        synced += 1
+
+    if build_log_lines is not None:
+        build_log_lines.append(
+            f"Synced {synced} generated file(s) from sandbox to generated_code."
+        )
+    return synced
 
 
 def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
