@@ -8,6 +8,15 @@ CMakeLists declare one, native ``gcc`` otherwise).  The artefacts land in
 can grab the refactored ``.c`` / ``.h`` files plus the freshly compiled
 ``.o`` objects **before** the long-running sandbox build finishes.
 
+Scope: this gate compiles ONLY the newly generated + verified scripts in
+``gen_dir`` and resolves ``#include``s against ``gen_dir`` + ``code_dir``
+(the user's uploaded originals).  The broader repository ZIP is
+intentionally **not** swept for include directories — pulling a foreign
+cross-toolchain's sysroot onto the native compiler's ``-I`` path would
+shadow the host's libc headers and make perfectly fine generated code
+fail with cascading "unknown type name" errors.  Full-project header
+resolution is the responsibility of the sandbox build stage.
+
 If a ``.c`` fails to compile, an agentic fix loop iteratively asks the LLM
 to repair the offending ``.c`` (and matching ``.h``, when relevant) using
 the same prompting strategy as ``_sandbox_build_iterate``:
@@ -300,10 +309,28 @@ def run_per_file_compile(
         yield _sse({"type": "stage_complete", "stage": "compile"})
         return
 
-    # ---- 3. Build include-dir list (gen_dir wins over repo) -----------------
+    # ---- 3. Build include-dir list ----------------------------------------
+    # SCOPE: the per-file compile gate is a fast smoke test that ONLY the
+    # newly generated and verified scripts (.c/.h in gen_dir) compile to
+    # .o objects with the project's toolchain. We therefore restrict the
+    # `-I` search path to:
+    #   1. gen_dir  — newly generated + verified headers (highest priority)
+    #   2. code_dir — the user's uploaded originals, as a safe fallback for
+    #                 any header the pipeline did not regenerate.
+    # We intentionally do NOT sweep the broader repo_dir, because:
+    #   - Real-world repos ship an entire foreign cross-toolchain sysroot
+    #     under e.g. `.../arm-xilinx-eabi/include/`. Adding those dirs to
+    #     `-I` would let `#include <string.h>` resolve to a header
+    #     designed for a different compiler (with its own implicit
+    #     builtins like `wint_t` / `size_t`), which then explodes under
+    #     the native compiler with cascading "unknown type name" errors
+    #     in code that is otherwise perfectly fine.
+    #   - Full-repo header resolution lives in the sandbox build stage,
+    #     which uses the repo's Makefile / CMakeLists with the correct
+    #     toolchain and sysroot — that is the right place for it.
     include_dirs = _collect_include_dirs(
         gen_dir,
-        repo_dir if has_repo and repo_dir and repo_dir.exists() else None,
+        code_dir if code_dir and code_dir.exists() else None,
     )
     # Always include the gen_dir itself even if it has no .h yet (gen_dir
     # often hosts the canonical generated headers next to the .c sources).
@@ -313,7 +340,12 @@ def run_per_file_compile(
     yield _sse({
         "type": "info",
         "stage": "compile",
-        "message": f"Resolved {len(include_dirs)} include directories.",
+        "message": (
+            f"Resolved {len(include_dirs)} include directories "
+            f"(scoped to newly generated + verified scripts only — "
+            f"repository ZIP intentionally NOT on the -I path so foreign "
+            f"toolchain sysroots cannot shadow the host compiler's libc)."
+        ),
     })
 
     # ---- 4. Snapshot the pre-compile-gate generated files (for stall reset)
@@ -670,7 +702,8 @@ def run_per_file_compile(
         f"Max fix attempts:   {max_fix_attempts}",
         "",
         "-" * 65,
-        "INCLUDE PATH (in order; gen_dir wins over repo)",
+        "INCLUDE PATH (newly generated + verified scripts only; "
+        "gen_dir wins over code_dir; repo NOT swept)",
         "-" * 65,
     ]
     for d in include_dirs:

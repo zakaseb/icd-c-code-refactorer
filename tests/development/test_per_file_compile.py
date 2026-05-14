@@ -1,14 +1,19 @@
 """End-to-end test for the per-file compile gate (api/per_file_compile.py).
 
 Exercises:
-  Test 1  module imports cleanly
-  Test 2  clean compile of a simple .c with native gcc
-  Test 3  agentic fix path: broken .c is auto-repaired by a mocked LLM
-  Test 4  resume short-circuit when compile is already in completed_stages
-  Test 5  skip path when no .c files were generated
-  Test 6  compile_report.txt contents (status, command, attempts)
-  Test 7  /api/download zip includes .o files and compile_report.txt
-  Test 8  status["generated_files"] never contains .o entries
+  Test 1   module imports cleanly
+  Test 2   clean compile of a simple .c with native gcc
+  Test 3   agentic fix path: broken .c is auto-repaired by a mocked LLM
+  Test 4   resume short-circuit when compile is already in completed_stages
+  Test 5   skip path when no .c files were generated
+  Test 6   compile_report.txt contents (status, command, attempts)
+  Test 7   /api/download zip includes .o files and compile_report.txt
+  Test 8   status["generated_files"] never contains .o entries
+  Test 9   _extract_per_file_blocks parser
+  Test 10  _collect_include_dirs prefers gen_dir over repo (helper unit)
+  Test 11  REGRESSION: repo_dir is NEVER swept for -I, even when it carries
+           a toxic foreign cross-toolchain header (IMU.c production bug)
+  Test 12  code_dir headers are findable when gen_dir has only the .c
 
 The test does NOT require a running LLM — we monkey-patch
 `app._call_llm_complete` to a deterministic stub that returns a corrected
@@ -407,6 +412,137 @@ with tempfile.TemporaryDirectory() as tmpd:
           f"got {[str(p) for p in inc]}")
     check("collect_include_dirs found both repo dirs",
           any(p == r.resolve() for p in inc) and any(p == sub.resolve() for p in inc))
+
+
+# ---------------------------------------------------------------
+# Regression test for the IMU.c failure pattern reported in production:
+# a real-world repo can ship an entire foreign cross-toolchain sysroot
+# (e.g. `.../arm-xilinx-eabi/include/`). Sweeping it for `-I` paths used
+# to drag those incompatible libc headers in front of the host's, which
+# made native gcc fail with cascading "unknown type name 'wint_t'" /
+# "unknown type name 'size_t'" errors on code that was otherwise fine.
+# The compile gate must now ignore repo_dir entirely and scope `-I` to
+# the newly generated + verified scripts only.
+print("\n=== Test 11: repo_dir is NOT swept for -I (IMU.c regression) ===")
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    sess, gen, code, repo = setup_session_dir(tmp)
+    (gen / "foo.h").write_text(CLEAN_H)
+    (gen / "foo.c").write_text(CLEAN_C)
+    (code / "foo.c").write_text(CLEAN_C)
+    (code / "foo.h").write_text(CLEAN_H)
+
+    # Plant a "toxic" cross-toolchain header tree under repo_dir that
+    # mirrors the production failure: a `string.h` that references types
+    # the native compiler can't possibly provide. If this file ever
+    # appears on the compile `-I` path, foo.c's `#include "foo.h"` is
+    # fine but ANY `#include <string.h>` (and we add one below) would
+    # explode exactly like IMU.c did.
+    toxic_dir = repo / "superloop-sw-develop" / "Workspace" \
+        / "P3_MCP_Application" / "cmake-src" / "toolchain" / "gnu" \
+        / "arm" / "nt" / "arm-xilinx-eabi" / "include"
+    toxic_dir.mkdir(parents=True, exist_ok=True)
+    (toxic_dir / "string.h").write_text(
+        "/* Foreign cross-toolchain string.h — relies on builtins the\n"
+        "   host compiler does not provide. Should NEVER be picked up\n"
+        "   by the per-file compile gate. */\n"
+        "extern int  _bogus_xilinx_builtin_wint_t;\n"
+        "extern int  _bogus_xilinx_builtin_size_t;\n"
+        "#error \"per-file compile gate must NOT load this foreign header\"\n"
+    )
+    # And a benign-looking second one further inside the repo, just to
+    # confirm we ignore every depth.
+    (repo / "include").mkdir(parents=True, exist_ok=True)
+    (repo / "include" / "junk.h").write_text("/* must not be on -I */\n")
+
+    # Force foo.c to actually try `<string.h>` so that, IF the toxic
+    # header were on the path, gcc would resolve to it and #error out.
+    (gen / "foo.c").write_text(
+        "#include \"foo.h\"\n"
+        "#include <string.h>\n"
+        + CLEAN_C.split("#include \"foo.h\"\n", 1)[1]
+    )
+
+    events = drain(run_per_file_compile(
+        session_dir=sess, gen_dir=gen, code_dir=code, repo_dir=repo,
+        has_repo=True, change_spec="(stub)", repo_knowledge="",
+        is_resume=False, completed_stages=set(),
+        max_fix_attempts=2, compile_timeout=30,
+        cc_override=NATIVE_CC,
+    ))
+
+    summary = next((e for e in events if e["type"] == "compile_summary"), None)
+    check(
+        "compile succeeds even though repo_dir carries a toxic string.h",
+        summary and summary["ok"] == 1 and summary["failed"] == 0,
+        f"summary={summary}",
+    )
+    check(".o produced", (gen / "foo.o").is_file())
+
+    rep = (gen / "compile_report.txt").read_text()
+    check(
+        "report's INCLUDE PATH header advertises the new scope",
+        "newly generated + verified scripts only" in rep
+        and "repo NOT swept" in rep,
+        "expected report banner to document the scope change",
+    )
+    check(
+        "report's INCLUDE PATH section never lists the toxic repo dir",
+        str(toxic_dir.resolve()) not in rep,
+        f"toxic dir {toxic_dir} leaked into report:\n{rep[:1000]}",
+    )
+    check(
+        "report's INCLUDE PATH section never lists ANY repo dir",
+        str(repo.resolve()) not in rep,
+        "any repo_dir path on the compile -I list is a regression",
+    )
+    check(
+        "report DOES list gen_dir on the -I path",
+        f"-I{gen.resolve()}" in rep,
+    )
+
+    # Also verify the live SSE message advertises the scope.
+    info_msgs = [e.get("message", "") for e in events if e.get("type") == "info"]
+    check(
+        "SSE info message documents the scope explicitly",
+        any(
+            "scoped to newly generated" in m
+            and "repository ZIP intentionally NOT" in m
+            for m in info_msgs
+        ),
+        f"info messages={info_msgs}",
+    )
+
+
+# ---------------------------------------------------------------
+# Make sure the scoping change still lets the gate find headers when a
+# `.c` lives in gen_dir but its only matching `.h` was uploaded by the
+# user and not regenerated (i.e. still in code_dir). This case used to
+# be covered transitively by sweeping repo_dir; it must keep working.
+print("\n=== Test 12: code_dir headers are findable when gen_dir has only .c ===")
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    sess, gen, code, repo = setup_session_dir(tmp)
+    # The .h is ONLY in code_dir; gen_dir has only the .c.
+    (gen / "foo.c").write_text(CLEAN_C)
+    (code / "foo.h").write_text(CLEAN_H)
+    (code / "foo.c").write_text(CLEAN_C)
+
+    events = drain(run_per_file_compile(
+        session_dir=sess, gen_dir=gen, code_dir=code, repo_dir=repo,
+        has_repo=False, change_spec="(stub)", repo_knowledge="",
+        is_resume=False, completed_stages=set(),
+        max_fix_attempts=1, compile_timeout=30,
+        cc_override=NATIVE_CC,
+    ))
+    summary = next((e for e in events if e["type"] == "compile_summary"), None)
+    check(
+        "gen_dir-only .c finds its .h fallback in code_dir",
+        summary and summary["ok"] == 1 and summary["failed"] == 0,
+        f"summary={summary}",
+    )
+    check(".o produced via code_dir header fallback",
+          (gen / "foo.o").is_file())
 
 
 # ---------------------------------------------------------------
