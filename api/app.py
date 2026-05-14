@@ -752,12 +752,19 @@ def _build_file_repo_context(
 
 
 def _build_source_scripts_context(
-    repo_dir: Path,
+    code_dir: Path,
     max_chars: int = SOURCE_SCRIPTS_MAX_CHARS,
 ) -> str:
     """Build a context containing the ACTUAL .c and .h source files.
 
-    This is the sole repository-level context used by the ICD-delta analysis
+    The input ``code_dir`` is the directory of UPLOADED user code files
+    (``session_dir / "original_code"``) — i.e. the very ``.c`` and ``.h``
+    files that will be refactored against the Target ICD.  Passing the
+    user's uploaded sources (instead of an entire repository ZIP) keeps
+    the LLM grounded in the precise files under change without being
+    diluted by unrelated repository code.
+
+    This is the sole code-scripts context used by the ICD-delta analysis
     stage: instead of a heuristic summary of identifiers, the LLM is given
     the real source so it can ground the *Impact on C code* portion of the
     change specification in concrete struct layouts, function bodies, enum
@@ -767,11 +774,11 @@ def _build_source_scripts_context(
     files, until the byte budget is exhausted.  The first section is a flat
     file tree so the model knows what exists even if some files get trimmed.
     """
-    all_files = sorted(p for p in repo_dir.rglob("*") if p.is_file())
+    all_files = sorted(p for p in code_dir.rglob("*") if p.is_file())
     if not all_files:
         return ""
 
-    tree_lines = [str(f.relative_to(repo_dir)) for f in all_files]
+    tree_lines = [str(f.relative_to(code_dir)) for f in all_files]
     headers = [f for f in all_files if f.suffix.lower() in _HEADER_EXTS]
     sources = [f for f in all_files if f.suffix.lower() in _SOURCE_EXTS]
     if not headers and not sources:
@@ -779,10 +786,11 @@ def _build_source_scripts_context(
 
     parts: list[str] = [
         "## Existing C Source Scripts (PRE-CHANGE \"OLD\" CODE)\n",
-        "The blocks below are the actual .c / .h files of the repository as "
-        "they exist BEFORE the ICD change. Treat them as the ground-truth "
-        "current implementation when assessing impact on C code.\n\n",
-        "### Repository File Structure\n```\n"
+        "The blocks below are the actual .c / .h files uploaded for "
+        "refactoring as they exist BEFORE the ICD change. Treat them as the "
+        "ground-truth current implementation when assessing impact on C "
+        "code.\n\n",
+        "### Uploaded Source Scripts File Structure\n```\n"
         + "\n".join(tree_lines[:120])
         + ("\n... (more files omitted)" if len(tree_lines) > 120 else "")
         + "\n```\n",
@@ -796,7 +804,7 @@ def _build_source_scripts_context(
             content = fp.read_text(errors="replace")
         except Exception:
             return True
-        rel = str(fp.relative_to(repo_dir))
+        rel = str(fp.relative_to(code_dir))
         entry = f"\n### {kind}: {rel}\n```c\n{content}\n```\n"
         if len(entry) <= budget:
             parts.append(entry)
@@ -3231,16 +3239,18 @@ async def process(session_id: str):
 
     repo_dir = session_dir / "repo_contents"
     has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
-    repo_source_scripts = ""
+    # The .c/.h scripts uploaded for refactoring are ALWAYS the
+    # authoritative pre-change source for the ICD-delta analysis,
+    # regardless of whether a broader repository ZIP was also provided.
+    code_source_scripts = _build_source_scripts_context(code_dir)
     repo_knowledge = ""
     if has_repo:
-        repo_source_scripts = _build_source_scripts_context(repo_dir)
         repo_knowledge = _build_repo_knowledge(repo_dir)
         (session_dir / "repo_knowledge.txt").write_text(repo_knowledge)
-        log.info(
-            "Source scripts for ICD analysis: %d chars, repo knowledge: %d chars",
-            len(repo_source_scripts), len(repo_knowledge),
-        )
+    log.info(
+        "Source scripts for ICD analysis: %d chars, repo knowledge: %d chars",
+        len(code_source_scripts), len(repo_knowledge),
+    )
 
     uploaded_names = {p.name for p in code_files}
     log.info(
@@ -3311,7 +3321,7 @@ async def process(session_id: str):
             })
 
             repo_analysis_hint = ""
-            if repo_source_scripts:
+            if code_source_scripts:
                 repo_analysis_hint = (
                     "\n\n"
                     "You are also given the ACTUAL existing C source code of the "
@@ -3333,7 +3343,7 @@ async def process(session_id: str):
                     "  * Flag any ICD requirements that have no clear hook in the "
                     "current code as 'NEW' so a downstream refactor agent knows to "
                     "create them rather than edit existing code.\n\n"
-                    f"{repo_source_scripts}\n"
+                    f"{code_source_scripts}\n"
                 )
 
             compare_system = (
@@ -3375,7 +3385,7 @@ async def process(session_id: str):
                         "authoritative pre-change implementation when filling in the "
                         "'Impact on C code' field — quote real file paths and real "
                         "symbol names, and explicitly mark anything brand-new."
-                        if repo_source_scripts else ""
+                        if code_source_scripts else ""
                     )
                     base_compare_prompt = (
                         "Compare these two complete ICD documents and produce a COMPLETE "
@@ -3530,7 +3540,7 @@ async def process(session_id: str):
                         "authoritative pre-change implementation when filling in the "
                         "'Impact on C code' field — quote real file paths and real "
                         "symbol names, and explicitly mark anything brand-new."
-                        if repo_source_scripts else ""
+                        if code_source_scripts else ""
                     )
                     base_compare_prompt = (
                         "Produce a COMPLETE and EXHAUSTIVE code-impact change specification "

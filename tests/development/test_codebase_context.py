@@ -210,7 +210,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     )
     check(
         "file tree present",
-        "Repository File Structure" in scripts,
+        "Uploaded Source Scripts File Structure" in scripts,
     )
     check(
         "headers section present",
@@ -256,6 +256,52 @@ with tempfile.TemporaryDirectory() as tmpdir:
     (nonc_repo / "README.md").write_text("hi")
     check("non-C repo -> empty context",
           _build_source_scripts_context(nonc_repo) == "")
+
+    # NEW USAGE: flat code_dir-style directory (mirrors what
+    # process_session now actually passes: session_dir/"original_code").
+    code_dir = Path(tmpdir) / "code_dir"
+    code_dir.mkdir()
+    (code_dir / "comm.h").write_text(
+        "#ifndef COMM_H\n#define COMM_H\n"
+        "typedef struct { int msg_id; } CommMessage_t;\n"
+        "int COMM_Init(void);\n"
+        "#endif\n"
+    )
+    (code_dir / "comm.c").write_text(
+        '#include "comm.h"\nint COMM_Init(void) { return 0; }\n'
+    )
+    code_ctx = _build_source_scripts_context(code_dir)
+    check("flat code_dir context non-empty", len(code_ctx) > 0)
+    check(
+        "flat code_dir labelled as PRE-CHANGE",
+        "PRE-CHANGE" in code_ctx,
+    )
+    check(
+        "flat code_dir tree heading uses new label",
+        "Uploaded Source Scripts File Structure" in code_ctx,
+    )
+    check(
+        "flat code_dir lists both files in tree",
+        "comm.h" in code_ctx and "comm.c" in code_ctx,
+    )
+    check(
+        "flat code_dir embeds header body",
+        "CommMessage_t" in code_ctx and "COMM_Init" in code_ctx,
+    )
+    check(
+        "flat code_dir embeds source body",
+        'COMM_Init(void) { return 0; }' in code_ctx,
+    )
+    check(
+        "flat code_dir uses Header before Source",
+        code_ctx.find("Headers (.h)") < code_ctx.find("Implementation Files (.c)"),
+    )
+    check(
+        "flat code_dir relative paths have NO directory prefix",
+        "### Header: comm.h" in code_ctx
+        and "### Source: comm.c" in code_ctx,
+        "code_dir is flat, so relative paths should be bare filenames",
+    )
 
 # ---------------------------------------------------------------
 print("\n=== Test 7: _estimate_tokens ===")
