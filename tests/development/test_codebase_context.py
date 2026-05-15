@@ -6,6 +6,7 @@ structural verification, and the end-to-end pipeline — no Docker/LLM needed.
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -29,6 +30,7 @@ from app import (
     _assemble_prompt,
     _extract_fenced,
     _looks_complete_c_file,
+    _run_sandbox_build,
     MAX_REPO_CONTEXT_CHARS,
     MAX_INPUT_TOKENS,
     CHARS_PER_TOKEN,
@@ -166,6 +168,44 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("finds sensor.h", found2 is not None)
     not_found = _find_repo_file(dest, "nonexistent.h")
     check("returns None for missing", not_found is None)
+
+# ---------------------------------------------------------------
+print("\n=== Test 4b: ZIP extraction blocks sibling path escape ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    zp = Path(tmpdir) / "escape.zip"
+    dest = Path(tmpdir) / "repo"
+    escaped = Path(tmpdir) / "repo_evil" / "pwned.c"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("../repo_evil/pwned.c", "int pwned;\n")
+        zf.writestr("ok.c", "int ok;\n")
+
+    stats = _safe_extract_zip(zp, dest)
+    check("only safe ZIP member extracted", stats["file_count"] == 1, str(stats))
+    check("safe file exists", (dest / "ok.c").exists())
+    check("sibling escape not written", not escaped.exists(), str(escaped))
+
+# ---------------------------------------------------------------
+print("\n=== Test 4c: sandbox build uses argv for hostile paths ===")
+if shutil.which("make"):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        sentinel = root / "sandbox_shell_injection_pwned"
+        build_dir = Path(str(root / "repo; touch ") + str(sentinel) + " #")
+        build_dir.mkdir(parents=True)
+        makefile = build_dir / "Makefile"
+        makefile.write_text(
+            "all:\n\t@echo safe-build\n"
+            "clean:\n\t@true\n"
+        )
+        ok, output = _run_sandbox_build(
+            root,
+            {"type": "make", "path": makefile, "build_dir": build_dir},
+            timeout=20,
+        )
+        check("hostile path build succeeds", ok, output)
+        check("hostile path did not execute shell", not sentinel.exists())
+else:
+    check("make unavailable; hostile path build test skipped", True)
 
 # ---------------------------------------------------------------
 print("\n=== Test 5: _build_file_repo_context (distilled) ===")
