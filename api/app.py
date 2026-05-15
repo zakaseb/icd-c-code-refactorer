@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 import uuid
 import shutil
@@ -471,13 +472,16 @@ def _estimate_tokens(text: str) -> int:
 def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> dict:
     """Extract a ZIP safely into *dest_dir*, returning file statistics."""
     dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_dir.resolve()
     file_count = 0
     with zipfile.ZipFile(zip_path, 'r') as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
             target = (dest_dir / info.filename).resolve()
-            if not str(target).startswith(str(dest_dir.resolve())):
+            try:
+                target.relative_to(dest_root)
+            except ValueError:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, open(target, 'wb') as dst:
@@ -1066,31 +1070,53 @@ def _run_sandbox_build(
     btype = build_info["type"]
     bdir = build_info["build_dir"]
     sandbox_cc = _detect_cross_compiler(build_info)
+    sandbox_cc_args = shlex.split(sandbox_cc)
+
+    def _output(proc: subprocess.CompletedProcess[str]) -> str:
+        return (proc.stdout or "") + (proc.stderr or "")
 
     if btype == "make":
-        full_cmd = (
-            f"make -C {bdir} CC='{sandbox_cc}' clean 2>/dev/null; "
-            f"make -C {bdir} CC='{sandbox_cc}' 2>&1"
-        )
+        build_cmd = ["make", "-C", str(bdir), f"CC={sandbox_cc}"]
     elif btype == "cmake":
         cmake_build = bdir / "_cmake_build"
-        cc_bin = sandbox_cc.split()[0]
-        cc_flags = " ".join(sandbox_cc.split()[1:])
-        full_cmd = (
-            f"cmake -S {bdir} -B {cmake_build} "
-            f"-DCMAKE_C_COMPILER={cc_bin} "
-            f'-DCMAKE_C_FLAGS="{cc_flags}" 2>&1 && '
-            f"cmake --build {cmake_build} 2>&1"
+        cc_bin = sandbox_cc_args[0]
+        cc_flags = " ".join(sandbox_cc_args[1:])
+        configure_cmd = (
+            ["cmake", "-S", str(bdir), "-B", str(cmake_build),
+             f"-DCMAKE_C_COMPILER={cc_bin}"]
+            + ([f"-DCMAKE_C_FLAGS={cc_flags}"] if cc_flags else [])
         )
+        build_cmd = ["cmake", "--build", str(cmake_build)]
     else:
         return False, "No supported build system detected in repository."
 
     try:
-        result = subprocess.run(
-            full_cmd, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=str(sandbox_dir),
-        )
-        output = (result.stdout or "") + (result.stderr or "")
+        output = ""
+        if btype == "make":
+            clean_cmd = build_cmd + ["clean"]
+            clean_result = subprocess.run(
+                clean_cmd, capture_output=True, text=True,
+                timeout=timeout, cwd=str(sandbox_dir),
+            )
+            output += _output(clean_result)
+            result = subprocess.run(
+                build_cmd, capture_output=True, text=True,
+                timeout=timeout, cwd=str(sandbox_dir),
+            )
+            output += _output(result)
+        else:
+            configure_result = subprocess.run(
+                configure_cmd, capture_output=True, text=True,
+                timeout=timeout, cwd=str(sandbox_dir),
+            )
+            output += _output(configure_result)
+            if configure_result.returncode != 0:
+                return False, output.strip()
+            result = subprocess.run(
+                build_cmd, capture_output=True, text=True,
+                timeout=timeout, cwd=str(sandbox_dir),
+            )
+            output += _output(result)
 
         if result.returncode == 0:
             return True, output.strip()
@@ -1105,36 +1131,28 @@ def _run_sandbox_build(
         if not c_sources:
             return False, output.strip()
 
-        include_dirs: set[str] = set()
-        for inc in bdir.rglob("*.h"):
-            include_dirs.add(str(inc.parent))
+        include_dirs = sorted({str(inc.parent) for inc in bdir.rglob("*.h")})
+        include_args = [f"-I{d}" for d in include_dirs]
 
-        # Write a shell script to compile each source individually,
-        # avoiding shell argument-length limits on large repos.
-        script = bdir / "_sandbox_compile.sh"
-        lines = ["#!/bin/sh", "set -e", f'CC="{sandbox_cc}"']
-        inc_args = " ".join(f'"-I{d}"' for d in sorted(include_dirs))
-        lines.append(f"INC={inc_args}")
         for src in c_sources:
             obj = src.with_suffix(".o")
-            lines.append(f'$CC $INC -c -o "{obj}" "{src}" 2>&1')
-        script.write_text("\n".join(lines) + "\n")
-        script.chmod(0o755)
-
-        result2 = subprocess.run(
-            ["sh", str(script)], capture_output=True, text=True,
-            timeout=timeout, cwd=str(sandbox_dir),
-        )
-        compile_output += (result2.stdout or "") + (result2.stderr or "")
-
-        if result2.returncode == 0:
-            compile_output += (
-                "\n\n--- Compile-only PASSED (all .c → .o succeeded) ---\n"
-                "Linking skipped: BSP libraries/linker scripts not in repository.\n"
+            compile_cmd = (
+                sandbox_cc_args + include_args
+                + ["-c", "-o", str(obj), str(src)]
             )
-            return True, compile_output.strip()
+            result2 = subprocess.run(
+                compile_cmd, capture_output=True, text=True,
+                timeout=timeout, cwd=str(sandbox_dir),
+            )
+            compile_output += _output(result2)
+            if result2.returncode != 0:
+                return False, compile_output.strip()
 
-        return False, compile_output.strip()
+        compile_output += (
+            "\n\n--- Compile-only PASSED (all .c -> .o succeeded) ---\n"
+            "Linking skipped: BSP libraries/linker scripts not in repository.\n"
+        )
+        return True, compile_output.strip()
 
     except subprocess.TimeoutExpired:
         return False, f"Build timed out after {timeout} seconds."
@@ -2353,14 +2371,15 @@ async def upload_code(session_id: str, files: List[UploadFile] = File(...)):
     code_dir = session_dir / "original_code"
     uploaded: list[str] = []
     for f in files:
-        if not f.filename or not (
-            f.filename.endswith(".c") or f.filename.endswith(".h")
+        safe_name = Path((f.filename or "").replace("\\", "/")).name
+        if not safe_name or not (
+            safe_name.endswith(".c") or safe_name.endswith(".h")
         ):
             continue
-        dest = code_dir / f.filename
+        dest = code_dir / safe_name
         content = await f.read()
         dest.write_bytes(content)
-        uploaded.append(f.filename)
+        uploaded.append(safe_name)
 
     status = json.loads((session_dir / "status.json").read_text())
     status["files"] = sorted(p.name for p in code_dir.iterdir() if p.is_file())
