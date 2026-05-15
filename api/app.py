@@ -2371,14 +2371,15 @@ async def upload_code(session_id: str, files: List[UploadFile] = File(...)):
     code_dir = session_dir / "original_code"
     uploaded: list[str] = []
     for f in files:
-        if not f.filename or not (
-            f.filename.endswith(".c") or f.filename.endswith(".h")
+        safe_name = Path((f.filename or "").replace("\\", "/")).name
+        if not safe_name or not (
+            safe_name.endswith(".c") or safe_name.endswith(".h")
         ):
             continue
-        dest = code_dir / f.filename
+        dest = code_dir / safe_name
         content = await f.read()
         dest.write_bytes(content)
-        uploaded.append(f.filename)
+        uploaded.append(safe_name)
 
     status = json.loads((session_dir / "status.json").read_text())
     status["files"] = sorted(p.name for p in code_dir.iterdir() if p.is_file())

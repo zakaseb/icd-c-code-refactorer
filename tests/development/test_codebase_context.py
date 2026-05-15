@@ -128,6 +128,27 @@ check("status 200", r.status_code == 200)
 data = r.json()
 session_id = data["session_id"]
 check("repo_zip field exists", "repo_zip" in client.get(f"/api/status/{session_id}").json())
+session_path = Path(os.environ["WORKSPACE_DIR"]) / "sessions" / session_id
+
+# ---------------------------------------------------------------
+print("\n=== Test 1b: Code upload normalizes path-like filenames ===")
+r = client.post(
+    f"/api/upload/code/{session_id}",
+    files={
+        "files": (
+            "../generated_code/evil.c",
+            io.BytesIO(b"int evil;\n"),
+            "text/plain",
+        )
+    },
+)
+check("path-like code upload 200", r.status_code == 200, r.text)
+check("uploaded basename reported", r.json().get("uploaded") == ["evil.c"], r.text)
+check(
+    "code upload stayed in original_code",
+    (session_path / "original_code" / "evil.c").exists()
+    and not (session_path / "generated_code" / "evil.c").exists(),
+)
 
 # ---------------------------------------------------------------
 print("\n=== Test 2: Upload repo ZIP ===")
