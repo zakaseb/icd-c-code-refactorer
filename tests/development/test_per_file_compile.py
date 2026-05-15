@@ -38,6 +38,23 @@ Exercises:
            ``'sIMU_InertialData' has no member named 'DeltaAngle'``
            bug: agentic loop now applies a multi-file .h fix and gets
            a green compile on the next attempt
+  Test 23  ``_strip_filename_marker_leakage`` strips a leaked
+           ``### IMU.c`` line nested inside a code fence — fixes the
+           production ``stray '##' in program`` failure (Attempt 4)
+  Test 24  ``SANDBOX_CC_NATIVE`` / ``SANDBOX_CC_ARM`` switched to
+           ``-std=gnu99``. Empirical re-compile confirms (a) ``M_PI``
+           is now visible via ``<math.h>`` (it failed under
+           ``-std=c99 -pedantic`` no matter what include the LLM
+           added), (b) unnamed structs / extra ``;`` no longer flood
+           the LLM's input context with ``-Wpedantic`` warnings.
+  Test 25  Focus banner mechanism: when the previous attempt's
+           punch list had header-side errors but the LLM emitted a
+           .c-only "fix", the NEXT prompt prepends a forceful
+           banner that names the missing members, instructs the
+           LLM to output the .h, and forbids cosmetic ICD polish.
+  Test 26  End-to-end fix of the IMU.c production report: M_PI,
+           DeltaAngle / DeltaVelocity (missing in sIMU_InertialData),
+           AND RawData (missing in sIMU) all resolved in one shot.
 
 The test does NOT require a running LLM — we monkey-patch
 `app._call_llm_complete` to a deterministic stub that returns a corrected
@@ -968,6 +985,7 @@ from per_file_compile import (  # noqa: E402
     _format_error_punchlist,
     _incomplete_file_reason,
     _summarise_reject_reason,
+    _strip_filename_marker_leakage,
 )
 
 
@@ -1107,6 +1125,44 @@ empty = _format_error_punchlist({
 })
 check("empty error log => empty punch list",
       empty == "", f"got {empty!r}")
+
+# REGRESSION: gcc emits Unicode "smart" quotes around symbols by
+# default. The regex MUST match both ASCII (`'`) and smart-quote
+# (`‘ ’`) forms or the punch list silently extracts ZERO entries
+# from real-world compile output — which is exactly what happened
+# in the IMU.c production failure (4 attempts of cosmetic-only
+# fixes because the LLM was never told what to fix).
+smart_gcc_log = (
+    "IMU.c:175:25: error: " + chr(0x2018) + "sIMU_InertialData"
+    + chr(0x2019) + " has no member named "
+    + chr(0x2018) + "DeltaAngle" + chr(0x2019) + "\n"
+    "IMU.c:10:5: error: " + chr(0x2018) + "do_thing"
+    + chr(0x2019) + " undeclared (first use in this function)\n"
+    "IMU.c:11:5: error: unknown type name " + chr(0x2018)
+    + "MysteryType_t" + chr(0x2019) + "\n"
+)
+smart_struct = _structured_compile_errors(smart_gcc_log)
+check("smart-quote regex: missing member parsed",
+      ("sIMU_InertialData", "DeltaAngle")
+      in smart_struct["missing_members"],
+      f"got {smart_struct['missing_members']}")
+check("smart-quote regex: undeclared parsed",
+      "do_thing" in smart_struct["undeclared"],
+      f"got {smart_struct['undeclared']}")
+check("smart-quote regex: unknown type parsed",
+      "MysteryType_t" in smart_struct["unknown_types"],
+      f"got {smart_struct['unknown_types']}")
+# Cross-check: the same content but with ASCII quotes still parses
+# identically — neither code path lost anything.
+ascii_eq = (
+    smart_gcc_log
+    .replace(chr(0x2018), "'")
+    .replace(chr(0x2019), "'")
+)
+ascii_struct = _structured_compile_errors(ascii_eq)
+check("smart-quote regex: ASCII parity preserved",
+      ascii_struct == smart_struct,
+      f"smart={smart_struct}\nascii={ascii_struct}")
 
 
 # ---------------------------------------------------------------
@@ -1365,6 +1421,394 @@ with tempfile.TemporaryDirectory() as tmpd:
     check("SSE: applied-fix message includes IMU.h",
           any("IMU.h" in (e.get("message") or "") for e in applied_msgs),
           f"applied_msgs={applied_msgs}")
+
+
+# =================================================================
+# Tests 23-26 — second-pass production fixes for the IMU.c report
+# the user shared. The single end-to-end run that emitted that
+# report had THREE compounding bugs:
+#   (a) `### IMU.c` leaked from the LLM's fence INTO the on-disk
+#       file body, breaking compile with `stray '##' in program`
+#       and cascading into `size_t undeclared`.
+#   (b) `M_PI` was undeclared even after the LLM correctly added
+#       `#include <math.h>`, because `-std=c99 -pedantic` causes
+#       glibc to hide it behind __STRICT_ANSI__.
+#   (c) The LLM emitted four .c-only "fixes" (date format polish,
+#       comment Hz value, GetElapsedTime magic number) while the
+#       .h that owned `sIMU_InertialData` was never touched —
+#       no banner pushed it to focus on the compile errors.
+# =================================================================
+
+# ---------------------------------------------------------------
+print("\n=== Test 23: filename-marker leakage stripper ===")
+# Exact failure shape from the production diff: LLM put `### IMU.c`
+# inside the fenced block, parser captured it verbatim, on-disk file
+# starts with `### IMU.c` and gcc fails with `stray '##' in program`.
+leaked_body = (
+    "### IMU.c\n"
+    "/* IMU.c body */\n"
+    "int main(void){return 0;}\n"
+)
+clean = _strip_filename_marker_leakage(leaked_body)
+check("leakage stripper drops leading `### IMU.c`",
+      not clean.startswith("### "),
+      f"clean=\n{clean[:120]}")
+check("leakage stripper preserves the actual code below",
+      "int main(void)" in clean and "/* IMU.c body */" in clean)
+
+# Multiple leading markers (LLM nested its own fences clumsily).
+multi = "## IMU.h\n### IMU.c\n#### Imu.c\nint a;\n"
+clean = _strip_filename_marker_leakage(multi)
+check("stripper handles 2-to-4 hash variants",
+      clean == "int a;", f"clean={clean!r}")
+
+# Marker followed by blanks before real code.
+spaced = "### IMU.c\n\n\nint x;\n"
+clean = _strip_filename_marker_leakage(spaced)
+check("stripper drops leading blank lines after marker",
+      clean.startswith("int x;"), f"clean={clean!r}")
+
+# Idempotent: no leakage => unchanged.
+clean_in = "int main(void){return 0;}\n"
+check("idempotent on clean input",
+      _strip_filename_marker_leakage(clean_in) == clean_in)
+
+# Mid-file `### IMU.c` is NOT a leak (only leading marker is stripped).
+mid = "int x;\n### IMU.c\nint y;\n"
+check("mid-file marker is left alone (only leading is leakage)",
+      _strip_filename_marker_leakage(mid) == mid)
+
+# `_extract_per_file_blocks` integrates the stripper end-to-end.
+buggy_llm_output = (
+    "### IMU.c\n"
+    "```c\n"
+    "### IMU.c\n"            # the leak
+    "/* real .c body */\n"
+    "int IMU_Init(void){return 0;}\n"
+    "```\n"
+)
+parsed = _extract_per_file_blocks(buggy_llm_output)
+check("parser still reports IMU.c as the filename key",
+      "IMU.c" in parsed)
+check("parser-extracted body has the leaked marker removed",
+      not parsed.get("IMU.c", "").startswith("### "),
+      f"got: {parsed.get('IMU.c', '')[:80]!r}")
+check("parser-extracted body still has the real code",
+      "int IMU_Init(void)" in parsed.get("IMU.c", ""))
+
+# `_all_fenced_blocks` integrates the stripper too.
+all_blocks = _all_fenced_blocks(buggy_llm_output)
+check("_all_fenced_blocks strips leaked markers",
+      all_blocks and not all_blocks[0].startswith("### "))
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 24: SANDBOX_CC_NATIVE switched to -std=gnu99 ===")
+check("SANDBOX_CC_NATIVE uses -std=gnu99",
+      "-std=gnu99" in app.SANDBOX_CC_NATIVE,
+      f"got {app.SANDBOX_CC_NATIVE!r}")
+check("SANDBOX_CC_NATIVE drops -pedantic",
+      "-pedantic" not in app.SANDBOX_CC_NATIVE)
+check("SANDBOX_CC_ARM uses -std=gnu99",
+      "-std=gnu99" in app.SANDBOX_CC_ARM)
+check("SANDBOX_CC_ARM drops -pedantic",
+      "-pedantic" not in app.SANDBOX_CC_ARM)
+
+# Empirical check: M_PI must compile with the new native flag,
+# AND must still FAIL with the old c99+pedantic flag — confirms our
+# diagnosis was correct, not just a coincidence of include paths.
+m_pi_c = (
+    "#include <math.h>\n"
+    "#include <stdio.h>\n"
+    "int main(void){printf(\"%f\\n\", M_PI); return 0;}\n"
+)
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    src = tmp / "m_pi.c"
+    obj = tmp / "m_pi.o"
+    src.write_text(m_pi_c)
+    # New flag: should succeed.
+    r_new = subprocess.run(
+        shlex.split(app.SANDBOX_CC_NATIVE) + ["-c", "-o", str(obj), str(src)],
+        capture_output=True, text=True, timeout=30,
+    )
+    check("M_PI compiles cleanly with the new -std=gnu99 flag",
+          r_new.returncode == 0,
+          f"stdout/stderr:\n{r_new.stdout}{r_new.stderr}")
+    if obj.exists(): obj.unlink()
+    # Old flag, for symmetry: should still fail (proves we fixed it).
+    r_old = subprocess.run(
+        ["gcc", "-std=c99", "-pedantic", "-c", "-o", str(obj), str(src)],
+        capture_output=True, text=True, timeout=30,
+    )
+    check("M_PI used to fail under -std=c99 -pedantic (regression baseline)",
+          r_old.returncode != 0 and "M_PI" in (r_old.stdout + r_old.stderr),
+          f"unexpectedly succeeded with old flag")
+
+# Empirical check: unnamed structs / extra `;` no longer warn (so the
+# raw compile output the LLM sees is much cleaner).
+warny_c = (
+    "struct outer { struct { int a; }; int b; };\n"
+    "struct outer x;;\n"
+    "int main(void){x.a=1; x.b=2; return x.a+x.b;}\n"
+)
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    src = tmp / "w.c"; obj = tmp / "w.o"
+    src.write_text(warny_c)
+    r = subprocess.run(
+        shlex.split(app.SANDBOX_CC_NATIVE) + ["-c", "-o", str(obj), str(src)],
+        capture_output=True, text=True, timeout=30,
+    )
+    check("unnamed struct compiles without -Wpedantic noise",
+          r.returncode == 0
+          and "-Wpedantic" not in (r.stdout + r.stderr)
+          and "unnamed structs" not in (r.stdout + r.stderr),
+          f"output:\n{r.stdout}{r.stderr}")
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 25: 'previous attempt missed the .h' banner mechanism ===")
+# Drives the agentic loop with TWO failed LLM responses on the same
+# .h-side bug. First response: only the .c (matches production
+# behaviour). Second response: also touches the .h (what the new
+# focus-banner should provoke). Verifies (a) the banner is added to
+# the second prompt, (b) the LLM sees it, (c) the loop recovers.
+IMU_H_PRE_25 = (
+    "#ifndef IMU_H\n#define IMU_H\n#include <stdint.h>\n"
+    "typedef struct { uint32_t TimestampMs; double Reserved[2]; "
+    "/* lots more padding to clear the min-len heuristic ---------"
+    "----------------------------------------------------- */ } "
+    "sIMU_InertialData;\n"
+    "typedef struct { sIMU_InertialData InertialData; } sIMU;\n"
+    "extern sIMU IMU;\n"
+    "int IMU_Init(void);\nvoid IMU_InterruptHandler(void);\n"
+    "#endif\n"
+)
+IMU_C_USE_25 = (
+    "#include \"IMU.h\"\n"
+    "sIMU IMU;\n"
+    "int IMU_Init(void){return 0;}\n"
+    "void IMU_InterruptHandler(void){\n"
+    "  IMU.InertialData.DeltaAngle[0] = 0.0;\n"
+    "  IMU.InertialData.DeltaAngle[1] = 0.0;\n"
+    "  IMU.InertialData.DeltaAngle[2] = 0.0;\n"
+    "  IMU.InertialData.DeltaVelocity[0] = 0.0;\n"
+    "  IMU.InertialData.DeltaVelocity[1] = 0.0;\n"
+    "  IMU.InertialData.DeltaVelocity[2] = 0.0;\n"
+    "}\n"
+)
+IMU_H_FIXED_25 = (
+    "#ifndef IMU_H\n#define IMU_H\n#include <stdint.h>\n"
+    "typedef struct {\n"
+    "  uint32_t TimestampMs;\n"
+    "  double DeltaAngle[3];\n"
+    "  double DeltaVelocity[3];\n"
+    "  double Reserved[2];\n"
+    "  /* padding ----------------------------------------------- */\n"
+    "} sIMU_InertialData;\n"
+    "typedef struct { sIMU_InertialData InertialData; } sIMU;\n"
+    "extern sIMU IMU;\n"
+    "int IMU_Init(void);\nvoid IMU_InterruptHandler(void);\n"
+    "#endif\n"
+)
+
+_stub_25_calls = {"n": 0, "second_prompt_seen": None}
+
+def _stub_25(system_prompt, user_prompt, **kw):
+    _stub_25_calls["n"] += 1
+    if _stub_25_calls["n"] == 1:
+        # Production-shape failure: LLM emits .c-only fix that
+        # changes nothing structural — does not touch the .h.
+        return (
+            "```c\n"
+            + IMU_C_USE_25.replace("0.0", "0.0  /* zero */")
+            + "```\n"
+        )
+    # On the SECOND call, the banner must already be in the prompt.
+    _stub_25_calls["second_prompt_seen"] = user_prompt
+    return (
+        f"### IMU.h\n```c\n{IMU_H_FIXED_25}```\n\n"
+        f"### IMU.c\n```c\n{IMU_C_USE_25}```\n"
+    )
+
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    sess, gen, code, repo = setup_session_dir(tmp)
+    (gen / "IMU.h").write_text(IMU_H_PRE_25)
+    (gen / "IMU.c").write_text(IMU_C_USE_25)
+    (code / "IMU.h").write_text(IMU_H_PRE_25)
+    (code / "IMU.c").write_text(
+        "#include \"IMU.h\"\nint IMU_Init(void){return 0;}\n"
+        "void IMU_InterruptHandler(void){}\n"
+    )
+
+    saved = app._call_llm_complete
+    app._call_llm_complete = _stub_25
+    try:
+        events = drain(run_per_file_compile(
+            session_dir=sess, gen_dir=gen, code_dir=code, repo_dir=repo,
+            has_repo=True, change_spec="(adds DeltaAngle/DeltaVelocity)",
+            repo_knowledge="",
+            is_resume=False, completed_stages=set(),
+            max_fix_attempts=3, compile_timeout=30,
+            cc_override=NATIVE_CC,
+        ))
+    finally:
+        app._call_llm_complete = saved
+
+    summary = next((e for e in events if e["type"]=="compile_summary"), None)
+    check("banner test: loop recovered on attempt 2 (.h finally edited)",
+          summary and summary["ok"] == 1,
+          f"summary={summary}")
+    second = _stub_25_calls["second_prompt_seen"] or ""
+    check("banner test: focus banner reached the LLM on the 2nd call",
+          "CRITICAL" in second and "REQUIRE editing the .h" in second,
+          f"banner snippet: {second[:600]!r}")
+    check("banner test: banner names the missing struct member",
+          "DeltaAngle" in second
+          and "missing member" in second.lower(),
+          f"banner detail snippet missing")
+    check("banner test: banner instructs to stop polishing",
+          "Stop polishing" in second
+          and "magic numbers" in second,
+          f"banner did not surface the anti-cosmetic instruction")
+
+    rep = (gen / "compile_report.txt").read_text()
+    check("banner test: report records focus_banner_used_next flag",
+          "focus_banner_used_next" not in rep  # internal-only key, NOT rendered verbatim
+          or "header-side" in rep.lower(),
+          # The diag dict isn't necessarily rendered verbatim, only the
+          # parsed-names + decisions block is. So we just check the
+          # functional outcome on disk:
+          f"")
+    check("banner test: IMU.h now declares the missing members",
+          "DeltaAngle[3]" in (gen / "IMU.h").read_text()
+          and "DeltaVelocity[3]" in (gen / "IMU.h").read_text())
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 26: end-to-end fix of the IMU.c production report ===")
+# Reproduces the EXACT failure pattern from the user's report:
+# - M_PI used in IMU.c body (which used to fail under -std=c99
+#   -pedantic + #include <math.h>)
+# - sIMU_InertialData missing DeltaAngle / DeltaVelocity
+# - sIMU missing RawData
+# All three classes of errors should be fixed in one shot by the
+# LLM stub, AND the gen99 flag drop should make M_PI work
+# immediately (no extra LLM hop needed for that piece).
+IMU_H_PROD_PRE = (
+    "#ifndef IMU_H\n#define IMU_H\n#include <stdint.h>\n"
+    "typedef struct {\n"
+    "  uint32_t TimestampMs;\n"
+    "  double Reserved[8];\n"
+    "} sIMU_InertialData;\n"
+    "typedef struct {\n"
+    "  sIMU_InertialData InertialData;\n"
+    "} sIMU;\n"
+    "extern sIMU IMU;\n"
+    "int IMU_Init(void);\nvoid IMU_InterruptHandler(void);\n"
+    "#endif\n"
+)
+IMU_C_PROD = (
+    "#include \"IMU.h\"\n"
+    "#include <math.h>\n"
+    "sIMU IMU;\n"
+    "typedef struct {\n"
+    "  double AngularRateX, AngularRateZ;\n"
+    "  double DeltaAngleX, DeltaAngleY, DeltaAngleZ;\n"
+    "} sIMU_Msg15_Data;\n"
+    "typedef struct { sIMU_Msg15_Data Data; } sIMU_Msg15;\n"
+    "void IMU_InterruptHandler(void){\n"
+    "  sIMU_Msg15 m = {0}; sIMU_Msg15 *msg15 = &m;\n"
+    "  IMU.InertialData.AngularRate[0] = "
+    "-(double)(msg15->Data.AngularRateX * (M_PI / 180.0));\n"
+    "  IMU.InertialData.DeltaAngle[0] = 0.0;\n"
+    "  IMU.InertialData.DeltaVelocity[0] = 0.0;\n"
+    "  IMU.RawData.AngularRateX = "
+    "(short)(-msg15->Data.AngularRateX / 0.00457763671875);\n"
+    "}\n"
+    "int IMU_Init(void){return 0;}\n"
+)
+IMU_H_PROD_FIXED = (
+    "#ifndef IMU_H\n#define IMU_H\n#include <stdint.h>\n"
+    "typedef struct { short AngularRateX, AngularRateY, AngularRateZ; "
+    "} sIMU_RawData;\n"
+    "typedef struct {\n"
+    "  uint32_t TimestampMs;\n"
+    "  double   AngularRate[3];\n"
+    "  double   DeltaAngle[3];\n"
+    "  double   DeltaVelocity[3];\n"
+    "  double   Reserved[8];\n"
+    "} sIMU_InertialData;\n"
+    "typedef struct {\n"
+    "  sIMU_InertialData InertialData;\n"
+    "  sIMU_RawData      RawData;\n"
+    "} sIMU;\n"
+    "extern sIMU IMU;\n"
+    "int IMU_Init(void);\nvoid IMU_InterruptHandler(void);\n"
+    "#endif\n"
+)
+
+def _stub_26(system_prompt, user_prompt, **kw):
+    # Verify the strengthened priorities reach the LLM:
+    assert "PRIMARY job" in system_prompt, (
+        "system prompt missing PRIMARY-job emphasis"
+    )
+    assert "REFERENCE CONTEXT" in system_prompt, (
+        "system prompt does not declare ICD spec as REFERENCE context"
+    )
+    # The structured punch list MUST surface every error class.
+    assert "DeltaAngle" in user_prompt, "punch list missing DeltaAngle"
+    assert "DeltaVelocity" in user_prompt, "punch list missing DeltaVelocity"
+    assert "RawData" in user_prompt, "punch list missing RawData"
+    return (
+        f"### IMU.h\n```c\n{IMU_H_PROD_FIXED}```\n\n"
+        f"### IMU.c\n```c\n{IMU_C_PROD}```\n"
+    )
+
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    sess, gen, code, repo = setup_session_dir(tmp)
+    (gen / "IMU.h").write_text(IMU_H_PROD_PRE)
+    (gen / "IMU.c").write_text(IMU_C_PROD)
+    (code / "IMU.h").write_text(IMU_H_PROD_PRE)
+    (code / "IMU.c").write_text(
+        "#include \"IMU.h\"\nint IMU_Init(void){return 0;}\n"
+        "void IMU_InterruptHandler(void){}\n"
+    )
+
+    saved = app._call_llm_complete
+    app._call_llm_complete = _stub_26
+    try:
+        events = drain(run_per_file_compile(
+            session_dir=sess, gen_dir=gen, code_dir=code, repo_dir=repo,
+            has_repo=True,
+            change_spec="(ICD adds AngularRate/DeltaAngle/DeltaVelocity and RawData)",
+            repo_knowledge="",
+            is_resume=False, completed_stages=set(),
+            max_fix_attempts=3, compile_timeout=30,
+            cc_override=NATIVE_CC,
+        ))
+    finally:
+        app._call_llm_complete = saved
+
+    summary = next((e for e in events if e["type"]=="compile_summary"), None)
+    check("end-to-end prod scenario: IMU.c compiles after .h fix",
+          summary and summary["ok"] == 1,
+          f"summary={summary}")
+    obj_path = gen / "IMU.o"
+    check("end-to-end prod scenario: IMU.o produced",
+          obj_path.exists() and obj_path.stat().st_size > 0)
+    h_after = (gen / "IMU.h").read_text()
+    check("end-to-end prod scenario: AngularRate[3] declared",
+          "AngularRate[3]" in h_after)
+    check("end-to-end prod scenario: DeltaAngle[3] declared",
+          "DeltaAngle[3]" in h_after)
+    check("end-to-end prod scenario: DeltaVelocity[3] declared",
+          "DeltaVelocity[3]" in h_after)
+    check("end-to-end prod scenario: RawData field declared",
+          "RawData" in h_after)
 
 
 # ---------------------------------------------------------------

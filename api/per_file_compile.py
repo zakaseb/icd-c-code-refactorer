@@ -427,23 +427,38 @@ def _looks_compile_clean(output: str) -> bool:
 # Patterns gcc emits that we can convert into a clear, structured punch
 # list for the agentic LLM. Each pattern captures the identifier(s)
 # the LLM needs to either add, declare, or otherwise resolve.
+#
+# IMPORTANT: gcc emits diagnostics with Unicode "smart" quotes by
+# default (U+2018 `‘`, U+2019 `’`) — only ``-fno-diagnostics-color
+# -fdiagnostics-format=plain`` or ``LC_ALL=C`` falls back to ASCII.
+# Real user runs always show ``‘foo’``, so every quote-based regex
+# below accepts BOTH ASCII single quotes and the smart-quote pair.
+# Without this, the structured punch list silently extracted ZERO
+# missing-member errors from real compile logs and the focus banner
+# never fired (the IMU.c production failure spent four attempts on
+# cosmetic .c edits because the LLM was never told what to fix).
+_Q_OPEN  = r"['\u2018\u201A\u2039\u00AB`]"
+_Q_CLOSE = r"['\u2019\u201B\u203A\u00BB`]"
+_QUOTED  = rf"{_Q_OPEN}([^'\u2018\u2019\u201A\u201B\u2039\u203A\u00AB\u00BB`]+){_Q_CLOSE}"
+
 _MISSING_MEMBER_RE = re.compile(
-    r"'([^']+)'\s+has no member named\s+'([^']+)'",
+    rf"{_QUOTED}\s+has no member named\s+{_QUOTED}",
 )
 _UNDECLARED_RE = re.compile(
-    r"'([^']+)'\s+undeclared(?:\s+\(first use in this function\))?",
+    rf"{_QUOTED}\s+undeclared(?:\s+\(first use in this function\))?",
 )
 _UNKNOWN_TYPE_RE = re.compile(
-    r"unknown type name\s+'([^']+)'",
+    rf"unknown type name\s+{_QUOTED}",
 )
 _IMPLICIT_DECL_RE = re.compile(
-    r"implicit declaration of function\s+'([^']+)'",
+    rf"implicit declaration of function\s+{_QUOTED}",
 )
 _CONFLICTING_TYPES_RE = re.compile(
-    r"conflicting types for\s+'([^']+)'",
+    rf"conflicting types for\s+{_QUOTED}",
 )
 _INCOMPATIBLE_PTR_RE = re.compile(
-    r"incompatible (?:pointer )?type[^']*'([^']+)'\s+(?:to|from)\s+'([^']+)'",
+    rf"incompatible (?:pointer )?type[^'\u2018\u2019]*{_QUOTED}"
+    rf"\s+(?:to|from)\s+{_QUOTED}",
 )
 _NO_FILE_RE = re.compile(
     r"fatal error:\s+([^:\n]+):\s+No such file or directory",
@@ -881,11 +896,22 @@ def run_per_file_compile(
         "- The compiler errors\n"
         "- The ICD change specification\n"
         "- Repository dependency headers and codebase knowledge\n\n"
-        "Your job: produce a corrected version that applies ALL ICD changes "
-        "AND compiles cleanly with the per-file compile command shown.\n\n"
+        "Your PRIMARY job is to make this single .c file (and its "
+        "matching .h, if both need edits) COMPILE CLEANLY with the "
+        "per-file compile command shown. The ICD change specification "
+        "is REFERENCE CONTEXT for understanding intent, NOT a checklist "
+        "to apply in this attempt — every ICD change visible in the "
+        "current transformed code must be PRESERVED, but do NOT spend "
+        "this attempt polishing comments, dates, magic numbers, or "
+        "other cosmetic ICD wording. The user can see the green compile "
+        "they need; cosmetic polish can come later. Every single "
+        "compiler error in the output below MUST be addressed in your "
+        "rewrite.\n\n"
         f"TARGET COMPILER:\n- {sandbox_cc}\n"
         f"- Cross-compile: {'yes' if is_cross else 'no'}\n"
-        "- C standard: C99 (-std=c99 compatible)\n"
+        "- C standard: C99 with GCC extensions (-std=gnu99) — M_PI, "
+        "unnamed structs/unions, `__attribute__`, and statement "
+        "expressions are ACCEPTED here\n"
         "- Use <stdint.h> fixed-width types\n\n"
         "OUTPUT FORMAT (MUST follow exactly — the parser is strict):\n"
         "1. Output ONLY the COMPLETE final file(s). NEVER patches, diffs, "
@@ -958,6 +984,13 @@ def run_per_file_compile(
         prev_sig: Optional[str] = None
         stall = 0
         result: dict = {"status": "unknown"}
+        # Tracks whether the previous attempt's punch list had
+        # missing-member / undeclared / unknown-type errors but the
+        # LLM's response did NOT touch the .h. Set true when the LLM
+        # ignored an obvious header-side fix; surfaces a forceful
+        # banner at the TOP of the next prompt.
+        prev_missed_h_side: bool = False
+        prev_missed_details: list[str] = []
 
         yield _sse({
             "type": "info",
@@ -1078,6 +1111,40 @@ def run_per_file_compile(
             err_struct = _structured_compile_errors(output)
             sec_punchlist = _format_error_punchlist(err_struct)
 
+            # If the PREVIOUS attempt's punch list contained
+            # missing-member / undeclared / unknown-type errors that
+            # should have triggered a .h-side fix and the LLM emitted
+            # zero `.h` blocks, hoist a very visible banner to the
+            # TOP of this attempt's prompt. The IMU.c production
+            # failure was the LLM emitting four .c-only "fixes" in a
+            # row (date format, magic numbers, cosmetic ICD polish)
+            # while the .h that owned ``sIMU_InertialData`` was
+            # never opened.
+            sec_focus_banner = ""
+            if prev_missed_h_side:
+                sec_focus_banner = (
+                    "## CRITICAL — READ FIRST\n"
+                    "Your PREVIOUS rewrite attempt only touched the .c "
+                    "file. The compiler errors below STILL list "
+                    "header-side problems that REQUIRE editing the .h, "
+                    "not the .c.\n\n"
+                    "Symptoms the previous attempt failed to address:\n"
+                    + "\n".join(f"  - {d}" for d in prev_missed_details)
+                    + "\n\n"
+                    "On this attempt you MUST output BOTH:\n"
+                    "  ### "
+                    + fname
+                    + "\n  ```c\n  ...the FULL .c...\n  ```\n\n"
+                    "  ### "
+                    + (companion_h.name if companion_h else fname.replace(".c", ".h"))
+                    + "\n  ```c\n  ...the FULL .h with the missing "
+                    "declarations / typedefs / struct members ADDED...\n"
+                    "  ```\n\n"
+                    "Stop polishing dates, comments, prose, or "
+                    "ICD-cosmetic magic numbers — those are zero-priority "
+                    "until the compile is green.\n"
+                )
+
             sec_original = (
                 f"## Original Working Code ({fname})\n"
                 f"This code compiled cleanly before ICD changes:\n"
@@ -1165,6 +1232,10 @@ def run_per_file_compile(
             sys_tokens = _estimate_tokens(fix_system)
             fix_prompt = _assemble_prompt(
                 [
+                    # The focus banner must always reach the LLM if it
+                    # exists; it's tiny and disposable if there's
+                    # nothing to say.
+                    ("focus", sec_focus_banner, 0),
                     ("original", sec_original, 0),
                     ("current", sec_current, 0),
                     ("header", sec_header, 0),
@@ -1245,9 +1316,21 @@ def run_per_file_compile(
                             new_files[guess] = body
                 # Fallback B: single fenced block -> fname
                 if not new_files:
-                    single = _extract_fenced(fix_output, "c").strip()
+                    single = _strip_filename_marker_leakage(
+                        _extract_fenced(fix_output, "c").strip()
+                    )
                     if single:
                         new_files = {fname: single}
+
+            # Defence in depth: re-strip every block right before the
+            # decision loop. Even if a future code path introduces a
+            # new fallback that forgets to call the stripper, a leaked
+            # `### IMU.c` line can NEVER reach the on-disk file.
+            new_files = {
+                k: _strip_filename_marker_leakage(v)
+                for k, v in new_files.items()
+                if _strip_filename_marker_leakage(v)
+            }
 
             applied: list[str] = []
             decisions: list[dict] = []  # per-target audit trail
@@ -1296,6 +1379,43 @@ def run_per_file_compile(
                     "reason": "passed completeness heuristic",
                 })
 
+            # Did the punch list point at header-side problems and did
+            # the LLM actually touch the .h on this attempt?
+            had_header_side_errors = bool(
+                err_struct["missing_members"]
+                or err_struct["unknown_types"]
+                or err_struct["implicit_decls"]
+                or err_struct["conflicting_types"]
+            )
+            touched_h = any(t.endswith(".h") for t in applied)
+            if had_header_side_errors and not touched_h:
+                prev_missed_h_side = True
+                prev_missed_details = []
+                for s, m in err_struct["missing_members"]:
+                    prev_missed_details.append(
+                        f"struct `{s}` is missing member `{m}` "
+                        f"(declared in the .h, not the .c)"
+                    )
+                for t in err_struct["unknown_types"]:
+                    prev_missed_details.append(
+                        f"type `{t}` is undeclared (typedef belongs in a .h)"
+                    )
+                for f_ in err_struct["implicit_decls"]:
+                    prev_missed_details.append(
+                        f"`{f_}()` used without a prototype "
+                        f"(prototype belongs in a .h)"
+                    )
+                for t in err_struct["conflicting_types"]:
+                    prev_missed_details.append(
+                        f"`{t}` has conflicting types — header "
+                        f"declaration must be updated to match"
+                    )
+                # Cap the list to keep the banner readable.
+                prev_missed_details = prev_missed_details[:8]
+            else:
+                prev_missed_h_side = False
+                prev_missed_details = []
+
             # Record LLM diagnostics for the report + post-mortem debugging.
             llm_preview = fix_output if len(fix_output) <= 1800 else (
                 fix_output[:900] + "\n\n[... LLM output truncated ...]\n\n"
@@ -1309,6 +1429,9 @@ def run_per_file_compile(
                 "decisions": decisions,
                 "applied": applied,
                 "preview": llm_preview,
+                "had_header_side_errors": had_header_side_errors,
+                "touched_h": touched_h,
+                "focus_banner_used_next": had_header_side_errors and not touched_h,
             }
 
             if not applied:
@@ -1563,6 +1686,64 @@ def _looks_like_c_filename(token: str) -> Optional[str]:
     return candidate
 
 
+# A leading `### <name>.<c-ext>` line inside a fenced block has only
+# one possible origin: the LLM mis-nested its own filename marker
+# inside the code fence. C/C++ grammar can never start with three
+# hashes, so it's an unambiguous parser-corruption signal. We strip
+# any such leading lines (and any blanks they leave behind) to
+# prevent the marker from being written verbatim to disk and
+# triggering ``error: stray '##' in program`` on the very next
+# compile (the IMU.c production failure).
+_LEAKED_FILENAME_MARKER_RE = re.compile(
+    r"^\s*#{2,6}\s+\S+\.(?:c|h|cc|hh|cpp|hpp|cxx|hxx|inc)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_filename_marker_leakage(body: str) -> str:
+    """Drop any leading `### foo.c` / `### foo.h` lines (and the blank
+    lines that follow them) from a fenced-block body. Idempotent and
+    safe to call on every extracted block. Returns the body unchanged
+    when nothing leaks.
+    """
+    if not body:
+        return body
+    lines = body.splitlines()
+    changed = False
+    while lines and _LEAKED_FILENAME_MARKER_RE.match(lines[0]):
+        lines.pop(0)
+        changed = True
+    # Drop one or more blank lines the marker may have left behind so
+    # the resulting file doesn't start with a stray blank.
+    while lines and not lines[0].strip():
+        lines.pop(0)
+        changed = True
+    if not changed:
+        return body
+    return "\n".join(lines)
+
+
+def _fenced_spans(text: str) -> list[tuple[int, int]]:
+    """Return ``[(start, end), ...]`` for every triple-fenced region in
+    *text*. Spans cover the opening ``` and the closing ``` so any
+    position strictly inside the span is "inside a code fence".
+    Used by :func:`_extract_per_file_blocks` to ignore `###` markers
+    the LLM nested inside its own code fence (the IMU.c production
+    failure: the LLM repeated `### IMU.c` *inside* its ``` block,
+    which confused the strict parser into returning empty).
+    """
+    return [
+        (m.start(), m.end())
+        for m in re.finditer(
+            r"```[^\n]*\n.*?\n```", text, flags=re.DOTALL,
+        )
+    ]
+
+
+def _pos_in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
+
 def _extract_per_file_blocks(text: str) -> dict[str, str]:
     """Parse multi-file LLM output of the form::
 
@@ -1579,12 +1760,22 @@ def _extract_per_file_blocks(text: str) -> dict[str, str]:
     Returns a ``{filename: code}`` dict.  Filename headers whose name
     does NOT look like a C-family source/header filename are treated
     as ordinary markdown section headers and ignored (no false-positive
-    parse of `### Analysis` / `### Fix` etc.).  Missing or unparseable
-    input ⇒ empty dict (caller should fall back to a single fenced
-    block).
+    parse of `### Analysis` / `### Fix` etc.).  `###` markers that fall
+    INSIDE an already-open code fence are also ignored — they are
+    LLM-side mistakes that previously broke chunk slicing.  Missing or
+    unparseable input ⇒ empty dict (caller should fall back to a single
+    fenced block).
+
+    Each extracted body is also stripped of any leading `### filename`
+    lines the LLM may have mistakenly nested INSIDE the code fence
+    (see :func:`_strip_filename_marker_leakage`).
     """
     out: dict[str, str] = {}
-    headers = list(_PER_FILE_HEADER_RE.finditer(text))
+    spans = _fenced_spans(text)
+    headers = [
+        m for m in _PER_FILE_HEADER_RE.finditer(text)
+        if not _pos_in_spans(m.start(), spans)
+    ]
     if not headers:
         return out
     for i, m in enumerate(headers):
@@ -1599,19 +1790,28 @@ def _extract_per_file_blocks(text: str) -> dict[str, str]:
             chunk, flags=re.DOTALL,
         )
         if fence:
-            out[cleaned] = fence.group(1).strip()
+            body = _strip_filename_marker_leakage(fence.group(1).strip())
+            if body:
+                out[cleaned] = body
     return out
 
 
 def _all_fenced_blocks(text: str) -> list[str]:
-    """Return every triple-fence body in *text* (in source order)."""
-    return [
-        m.group(1).strip()
-        for m in re.finditer(
-            r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n```",
-            text, flags=re.DOTALL,
-        )
-    ]
+    """Return every triple-fence body in *text* (in source order).
+
+    Each body is post-processed by :func:`_strip_filename_marker_leakage`
+    so a leaked `### IMU.c` at the top of a fenced block can never end
+    up written to disk.
+    """
+    out: list[str] = []
+    for m in re.finditer(
+        r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n```",
+        text, flags=re.DOTALL,
+    ):
+        body = _strip_filename_marker_leakage(m.group(1).strip())
+        if body:
+            out.append(body)
+    return out
 
 
 def _incomplete_file_reason(generated: str, original: str, filename: str) -> str:

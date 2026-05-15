@@ -1210,8 +1210,35 @@ def _find_file_in_repo(repo_dir: Path, filename: str) -> list[Path]:
     return matches
 
 
-SANDBOX_CC_NATIVE = "gcc -std=c99 -pedantic"
-SANDBOX_CC_ARM = "arm-none-eabi-gcc -std=c99 -pedantic"
+# Per-file compile + sandbox build flags.
+#
+# We deliberately use ``-std=gnu99`` (NOT ``-std=c99 -pedantic``) for
+# two reasons that came out of the IMU.c production failure:
+#
+#  1. Glibc's ``<math.h>`` only exposes ``M_PI`` / ``M_E`` / etc. when
+#     ``__USE_MISC`` is defined, which requires ``_DEFAULT_SOURCE`` /
+#     ``_BSD_SOURCE``. Under ``-std=c99`` glibc sets ``__STRICT_ANSI__``
+#     and hides those macros — so the perfectly-correct fix
+#     ``#include <math.h>; ...M_PI...`` still fails to compile and
+#     the agentic loop has to guess at workarounds. ``-std=gnu99``
+#     drops ``__STRICT_ANSI__`` and ``M_PI`` becomes visible
+#     immediately.
+#
+#  2. Real-world embedded C uses GCC extensions extensively (unnamed
+#     structs/unions, ``__attribute__``, statement expressions, extra
+#     ``;``s after struct typedefs). Under ``-pedantic`` each of those
+#     constructs floods the compile log with ``-Wpedantic`` warnings,
+#     which then crowd the structured punch list and the LLM's input
+#     context with non-actionable noise. ``-std=gnu99`` keeps the
+#     C99 semantics we want for correctness checks while making the
+#     compile gate match the way the user's actual toolchain (e.g.
+#     ``arm-xilinx-eabi-gcc``) is configured in practice.
+#
+# Real errors (missing struct members, wrong types, missing
+# declarations, missing headers) are still caught — they're language
+# semantics, not portability warnings.
+SANDBOX_CC_NATIVE = "gcc -std=gnu99"
+SANDBOX_CC_ARM = "arm-none-eabi-gcc -std=gnu99"
 
 _CC_RE = re.compile(
     r"^\s*CC\s*[:?]?=\s*(.+?)\s*$", re.MULTILINE,
@@ -1611,7 +1638,10 @@ def _sandbox_build_iterate(
         "TARGET TOOLCHAIN:\n"
         f"- Compiler: {sandbox_cc}\n"
         "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
-        "- C standard: C99 (-std=c99 compatible constructs only)\n"
+        "- C standard: C99 with GCC extensions (-std=gnu99) — "
+        "GCC-specific constructs commonly used in embedded code are "
+        "ACCEPTED, including unnamed structs/unions, `__attribute__`, "
+        "statement expressions, and M_PI / M_E from <math.h>\n"
         "- C library: newlib (NOT glibc)\n"
         "- Use <stdint.h> fixed-width types\n"
         "- No POSIX headers — embedded freestanding\n"
@@ -3699,7 +3729,11 @@ async def process(session_id: str):
                 "Documents.\n\n"
                 "TARGET TOOLCHAIN:\n"
                 "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
-                "- C standard: C99 (use -std=c99 compatible constructs only)\n"
+                "- C standard: C99 with GCC extensions (-std=gnu99) — "
+                "GCC-specific constructs commonly used in embedded code "
+                "are ACCEPTED, including unnamed structs/unions, "
+                "`__attribute__`, statement expressions, and M_PI / M_E "
+                "from <math.h>\n"
                 "- C library: newlib (NOT glibc) — do NOT use glibc-specific "
                 "functions (e.g. asprintf, getline, strdup, strndup, vasprintf)\n"
                 "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
@@ -4553,7 +4587,11 @@ async def regenerate(session_id: str):
                 "and interface implementations governed by Interface Control Documents.\n\n"
                 "TARGET TOOLCHAIN:\n"
                 "- Xilinx SDK 2018.x with GCC 7.3.1 (arm-none-eabi / mb-gcc)\n"
-                "- C standard: C99 (use -std=c99 compatible constructs only)\n"
+                "- C standard: C99 with GCC extensions (-std=gnu99) — "
+                "GCC-specific constructs commonly used in embedded code "
+                "are ACCEPTED, including unnamed structs/unions, "
+                "`__attribute__`, statement expressions, and M_PI / M_E "
+                "from <math.h>\n"
                 "- C library: newlib (NOT glibc) — do NOT use glibc-specific "
                 "functions (e.g. asprintf, getline, strdup, strndup, vasprintf)\n"
                 "- Use <stdint.h> fixed-width types (uint8_t, uint16_t, uint32_t)\n"
