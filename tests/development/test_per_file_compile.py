@@ -24,6 +24,20 @@ Exercises:
            never added to -I, never copied into a shim
   Test 17  Helper unit tests (_is_toxic_include_dir, _index_repo_headers,
            _quoted_includes_in_dir)
+  Test 18  Filename parser ignores markdown `### Analysis` / `### Fix`
+           headers and accepts dressed-up filenames (`### `IMU.c``,
+           `### **IMU.h**`, `### src/IMU.c`)
+  Test 19  Content-sniff fallback identifies .h / .c blocks when the
+           LLM forgot the `### filename` markers entirely
+  Test 20  Structured compile-error punch list extracts missing
+           struct members, unknown types, implicit decls, missing
+           headers, conflicting types — and forbids silent ICD rollback
+  Test 21  Precise rejection diagnostics: empty / no-fences / wrong-name
+           / incomplete-file each surface a distinct human-readable reason
+  Test 22  End-to-end REGRESSION for the production
+           ``'sIMU_InertialData' has no member named 'DeltaAngle'``
+           bug: agentic loop now applies a multi-file .h fix and gets
+           a green compile on the next attempt
 
 The test does NOT require a running LLM — we monkey-patch
 `app._call_llm_complete` to a deterministic stub that returns a corrected
@@ -934,6 +948,423 @@ with tempfile.TemporaryDirectory() as tmpd:
     check("quoted-include parser finds sub/Bar.h", "sub/Bar.h" in qs)
     check("quoted-include parser IGNORES angle <stdio.h>",
           "stdio.h" not in qs)
+
+
+# =================================================================
+# Tests 18-22 — agentic-loop robustness fixes for the IMU.c
+# "did not yield a complete usable rewrite" production bug:
+#   * markdown-header false positives in the filename parser
+#   * empty fallback when parser found wrong names
+#   * no structured punch list of missing struct members
+#   * opaque rejection diagnostics
+#   * silent ICD rollback when the LLM was told to fix a .c
+# =================================================================
+
+from per_file_compile import (  # noqa: E402
+    _looks_like_c_filename,
+    _all_fenced_blocks,
+    _guess_filename_for_block,
+    _structured_compile_errors,
+    _format_error_punchlist,
+    _incomplete_file_reason,
+    _summarise_reject_reason,
+)
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 18: filename parser ignores markdown ### headers ===")
+# This is the EXACT shape that broke the agentic loop in production:
+# the LLM prefaced its fix with an `### Analysis` heading, our parser
+# misread it as a filename, then the actual `### IMU.c` block got lost.
+markdown_pre = (
+    "### Analysis\n\n"
+    "The error is because the struct is missing two members.\n\n"
+    "### Fix\n\n"
+    "```c\n"
+    "/* this should NOT be attributed to either Analysis or Fix */\n"
+    "int dummy(void){return 0;}\n"
+    "```\n\n"
+    "### IMU.c\n"
+    "```c\n"
+    "#include \"IMU.h\"\nint IMU_Init(void){return 0;}\n"
+    "```\n"
+)
+parsed = _extract_per_file_blocks(markdown_pre)
+check("parser ignores `### Analysis` markdown header",
+      "Analysis" not in parsed,
+      f"parsed keys: {sorted(parsed.keys())}")
+check("parser ignores `### Fix` markdown header",
+      "Fix" not in parsed,
+      f"parsed keys: {sorted(parsed.keys())}")
+check("parser still finds the real `### IMU.c`",
+      "IMU.c" in parsed,
+      f"parsed keys: {sorted(parsed.keys())}")
+
+# A handful of LLM-style filename dressings the parser must tolerate.
+check("filename helper accepts plain IMU.c",
+      _looks_like_c_filename("IMU.c") == "IMU.c")
+check("filename helper accepts backtick-wrapped `IMU.c`",
+      _looks_like_c_filename("`IMU.c`") == "IMU.c")
+check("filename helper accepts bold **IMU.h**",
+      _looks_like_c_filename("**IMU.h**") == "IMU.h")
+check("filename helper strips trailing annotation",
+      _looks_like_c_filename("IMU.c  (corrected)") == "IMU.c")
+check("filename helper takes basename of paths",
+      _looks_like_c_filename("src/IMU.c") == "IMU.c")
+check("filename helper rejects markdown 'Analysis'",
+      _looks_like_c_filename("Analysis") is None)
+check("filename helper rejects markdown 'Fix'",
+      _looks_like_c_filename("Fix") is None)
+check("filename helper rejects 'Summary'",
+      _looks_like_c_filename("Summary") is None)
+check("filename helper accepts .hpp",
+      _looks_like_c_filename("widget.hpp") == "widget.hpp")
+check("filename helper rejects an empty token",
+      _looks_like_c_filename("") is None)
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 19: content-sniff fallback when filename headers are missing ===")
+# Two fenced blocks, NO `### filename` headers — used to drop both.
+guard_h_body = (
+    "#ifndef IMU_H\n#define IMU_H\n"
+    "typedef struct {\n  double DeltaAngle[3];\n} sIMU_InertialData;\n"
+    "int IMU_Init(void);\n"
+    "#endif\n"
+)
+c_body = (
+    "#include \"IMU.h\"\n"
+    "int IMU_Init(void){return 0;}\n"
+)
+two_blocks_unmarked = (
+    "Here is the fix:\n\n"
+    f"```c\n{guard_h_body}```\n\n"
+    f"```c\n{c_body}```\n"
+)
+blocks = _all_fenced_blocks(two_blocks_unmarked)
+check("two-block extraction returns 2", len(blocks) == 2,
+      f"got {len(blocks)}")
+guessed_h = _guess_filename_for_block(
+    blocks[0], c_name="IMU.c", h_name="IMU.h",
+)
+guessed_c = _guess_filename_for_block(
+    blocks[1], c_name="IMU.c", h_name="IMU.h",
+)
+check("content sniff identifies the .h via include guard",
+      guessed_h == "IMU.h", f"got {guessed_h!r}")
+check("content sniff identifies the .c via function body",
+      guessed_c == "IMU.c", f"got {guessed_c!r}")
+# Don't false-positive a non-C block as either file.
+check("content sniff returns None for plain prose",
+      _guess_filename_for_block(
+          "Just a sentence with no code shape.",
+          c_name="IMU.c", h_name="IMU.h",
+      ) is None)
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 20: structured error punch list (missing members et al.) ===")
+gcc_log = (
+    "/tmp/IMU.c: In function 'IMU_InterruptHandler':\n"
+    "/tmp/IMU.c:157:25: error: 'sIMU_InertialData' has no member named 'DeltaAngle'\n"
+    "  157 |         IMU.InertialData.DeltaAngle[0] = ...\n"
+    "/tmp/IMU.c:160:25: error: 'sIMU_InertialData' has no member named 'DeltaVelocity'\n"
+    "/tmp/Foo.c:10:5: error: 'undeclared_thing' undeclared (first use in this function)\n"
+    "/tmp/Foo.c:11:5: error: unknown type name 'MysteryType_t'\n"
+    "/tmp/Foo.c:12:5: warning: implicit declaration of function 'do_thing'\n"
+    "/tmp/Foo.c:13:5: error: conflicting types for 'bar'\n"
+    "/tmp/Foo.c:14:5: fatal error: NotHere.h: No such file or directory\n"
+)
+struct = _structured_compile_errors(gcc_log)
+check("punch list captures both missing members",
+      ("sIMU_InertialData", "DeltaAngle") in struct["missing_members"]
+      and ("sIMU_InertialData", "DeltaVelocity") in struct["missing_members"],
+      f"missing_members={struct['missing_members']}")
+check("punch list captures undeclared identifier",
+      "undeclared_thing" in struct["undeclared"])
+check("punch list captures unknown type",
+      "MysteryType_t" in struct["unknown_types"])
+check("punch list captures implicit decl",
+      "do_thing" in struct["implicit_decls"])
+check("punch list captures conflicting types",
+      "bar" in struct["conflicting_types"])
+check("punch list captures missing header",
+      "NotHere.h" in struct["missing_headers"])
+
+rendered = _format_error_punchlist(struct)
+check("rendered punch list names the struct",
+      "sIMU_InertialData" in rendered,
+      f"rendered:\n{rendered}")
+check("rendered punch list names both missing members",
+      "DeltaAngle" in rendered and "DeltaVelocity" in rendered)
+check("rendered punch list explicitly forbids rollback",
+      "DO NOT silently remove" in rendered or "do not silently".lower() in rendered.lower())
+# Empty struct => empty rendered string (no header noise in prompt).
+empty = _format_error_punchlist({
+    "missing_members": [], "undeclared": [], "unknown_types": [],
+    "implicit_decls": [], "conflicting_types": [],
+    "incompatible_pointers": [], "missing_headers": [],
+})
+check("empty error log => empty punch list",
+      empty == "", f"got {empty!r}")
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 21: precise rejection diagnostics for empty / wrong-name LLM output ===")
+allowed = {"IMU.c", "IMU.h"}
+
+# A) LLM returned absolutely nothing.
+r = _summarise_reject_reason(
+    fix_output="",
+    parsed_names=[],
+    decisions=[],
+    allowed=allowed,
+)
+check("empty LLM output -> 'empty response'",
+      "empty" in r.lower(), r)
+
+# B) LLM returned prose only, no fences.
+r = _summarise_reject_reason(
+    fix_output="I think you should fix the header.",
+    parsed_names=[],
+    decisions=[],
+    allowed=allowed,
+)
+check("no fences -> 'no triple-fenced code blocks'",
+      "fenced" in r, r)
+
+# C) LLM wrapped its single fenced block under wrong markdown header.
+r = _summarise_reject_reason(
+    fix_output="### Fix\n```c\nint x;\n```",
+    parsed_names=[],
+    decisions=[{
+        "target": "Wrong.c", "decision": "skipped_unknown_name",
+        "reason": "name not in {IMU.c, IMU.h}",
+    }],
+    allowed=allowed,
+)
+check("wrong target name -> mentions the wrong name",
+      "Wrong.c" in r, r)
+
+# D) LLM produced a usable name but file was rejected as incomplete.
+r = _summarise_reject_reason(
+    fix_output="### IMU.c\n```c\nint x;\n```",
+    parsed_names=["IMU.c"],
+    decisions=[{
+        "target": "IMU.c", "decision": "rejected_incomplete",
+        "reason": "too short (8 chars < 120 required ...)",
+    }],
+    allowed=allowed,
+)
+check("incomplete -> mentions completeness check",
+      "completeness" in r and "IMU.c" in r, r)
+
+
+# Per-file completeness diagnostic explains WHY the file failed.
+ref_long = "x" * 500
+check("_incomplete_file_reason: empty",
+      "empty" in _incomplete_file_reason("", ref_long, "IMU.c"))
+check("_incomplete_file_reason: too short",
+      "short" in _incomplete_file_reason("int x;", ref_long, "IMU.c"))
+check("_incomplete_file_reason: unbalanced braces",
+      "brace" in _incomplete_file_reason(
+          ("int x;\n" * 50) + "void foo(void){",
+          ref_long, "IMU.c",
+      ))
+check("_incomplete_file_reason: missing #endif on .h",
+      "endif" in _incomplete_file_reason(
+          # Deliberately well-formed apart from the missing #endif:
+          # no stray unbalanced /*, balanced braces, > min_len chars,
+          # last line ends with `;`. The ONLY breakage is the absent
+          # closing #endif — so that branch must be the reported one.
+          ("#ifndef FOO_H\n#define FOO_H\n"
+           + ("int field;\n" * 80)),
+          ref_long, "IMU.h",
+      ).lower())
+# A properly formed file should pass.
+ok_h = (
+    "#ifndef IMU_H\n#define IMU_H\n"
+    + "int field" + ("_" * 200) + ";\n"
+    + "#endif\n"
+)
+check("_incomplete_file_reason: clean file passes",
+      _incomplete_file_reason(ok_h, ref_long, "IMU.h") == "passes")
+
+
+# ---------------------------------------------------------------
+print("\n=== Test 22: end-to-end fix of the sIMU_InertialData missing-member bug ===")
+# Reproduce the exact production failure: regenerated IMU.c uses
+# `IMU.InertialData.DeltaAngle[...]` but the IMU.h in gen_dir is the
+# pre-change shape (no DeltaAngle / DeltaVelocity). Compile fails with
+# the user-reported 'has no member named' errors.  The agentic loop is
+# now expected to (a) parse the structured punch list, (b) emit a
+# clean ### IMU.h fix from the (mocked) LLM, (c) apply it, and (d)
+# get a green compile on the next attempt.
+IMU_H_PRE = (
+    "#ifndef IMU_H\n"
+    "#define IMU_H\n"
+    "#include <stdint.h>\n"
+    "/* pre-change struct shape - the new .c references members that\n"
+    " * do not exist here; the fix is to ADD them to this header. */\n"
+    "typedef struct {\n"
+    "  uint32_t TimestampMs;\n"
+    "  double Reserved[2];\n"
+    "} sIMU_InertialData;\n"
+    "typedef struct {\n"
+    "  sIMU_InertialData InertialData;\n"
+    "} sIMU;\n"
+    "extern sIMU IMU;\n"
+    "int IMU_Init(void);\n"
+    "void IMU_InterruptHandler(void);\n"
+    "#endif\n"
+)
+IMU_C_POST = (
+    "#include \"IMU.h\"\n"
+    "#define IMU_SF_ANGLE_X 1.0\n"
+    "#define IMU_SF_ANGLE_Y 1.0\n"
+    "#define IMU_SF_ANGLE_Z 1.0\n"
+    "#define IMU_SF_VEL_X   1.0\n"
+    "#define IMU_SF_VEL_Y   1.0\n"
+    "#define IMU_SF_VEL_Z   1.0\n"
+    "sIMU IMU;\n"
+    "typedef struct {\n"
+    "  double DeltaAngleX;\n"
+    "  double DeltaAngleY;\n"
+    "  double DeltaAngleZ;\n"
+    "  double DeltaVelocityX;\n"
+    "  double DeltaVelocityY;\n"
+    "  double DeltaVelocityZ;\n"
+    "} sIMU_Msg_Data;\n"
+    "typedef struct {\n"
+    "  sIMU_Msg_Data Data;\n"
+    "} sIMU_Msg;\n"
+    "int IMU_Init(void){return 0;}\n"
+    "void IMU_InterruptHandler(void){\n"
+    "  sIMU_Msg m={0};\n"
+    "  sIMU_Msg *msg=&m;\n"
+    "  IMU.InertialData.DeltaAngle[0] = (double) msg->Data.DeltaAngleX * IMU_SF_ANGLE_X;\n"
+    "  IMU.InertialData.DeltaAngle[1] = (double) msg->Data.DeltaAngleY * IMU_SF_ANGLE_Y;\n"
+    "  IMU.InertialData.DeltaAngle[2] = (double) msg->Data.DeltaAngleZ * IMU_SF_ANGLE_Z;\n"
+    "  IMU.InertialData.DeltaVelocity[0] = (double) msg->Data.DeltaVelocityX * IMU_SF_VEL_X;\n"
+    "  IMU.InertialData.DeltaVelocity[1] = (double) msg->Data.DeltaVelocityY * IMU_SF_VEL_Y;\n"
+    "  IMU.InertialData.DeltaVelocity[2] = (double) msg->Data.DeltaVelocityZ * IMU_SF_VEL_Z;\n"
+    "}\n"
+)
+IMU_H_FIXED = (
+    "#ifndef IMU_H\n"
+    "#define IMU_H\n"
+    "#include <stdint.h>\n"
+    "/* post-fix shape: DeltaAngle/DeltaVelocity ADDED to satisfy the\n"
+    " * ICD-mandated changes the .c relies on. */\n"
+    "typedef struct {\n"
+    "  uint32_t TimestampMs;\n"
+    "  double   DeltaAngle[3];\n"
+    "  double   DeltaVelocity[3];\n"
+    "  double   Reserved[2];\n"
+    "} sIMU_InertialData;\n"
+    "typedef struct {\n"
+    "  sIMU_InertialData InertialData;\n"
+    "} sIMU;\n"
+    "extern sIMU IMU;\n"
+    "int IMU_Init(void);\n"
+    "void IMU_InterruptHandler(void);\n"
+    "#endif\n"
+)
+
+
+def _stub_imu_h_fix(system_prompt: str, user_prompt: str, **kw) -> str:
+    """LLM stub that returns a multi-file fix in EXACTLY the format
+    the strengthened prompt demands. We deliberately put a noisy
+    `### Notes` markdown header BEFORE the real headers to prove the
+    parser ignores it, AND we put the .h block first to prove order
+    doesn't matter."""
+    # Sanity-check the prompt: the structured punch list and the
+    # explicit anti-rollback rule MUST be reaching the LLM. If either
+    # is missing, fail loudly so the regression is obvious.
+    assert "DeltaAngle" in user_prompt, "punch list missing DeltaAngle"
+    assert "DeltaVelocity" in user_prompt, "punch list missing DeltaVelocity"
+    assert "ICD-mandated" in system_prompt or "NEVER silently" in system_prompt, \
+        "system prompt missing the anti-rollback rule"
+    return (
+        "### Notes\n"
+        "I am adding the two missing struct members to the header. "
+        "The .c file already uses the correct names so I keep it as-is.\n\n"
+        f"### IMU.h\n```c\n{IMU_H_FIXED}```\n\n"
+        f"### IMU.c\n```c\n{IMU_C_POST}```\n"
+    )
+
+
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    sess, gen, code, repo = setup_session_dir(tmp)
+    (gen / "IMU.h").write_text(IMU_H_PRE)
+    (gen / "IMU.c").write_text(IMU_C_POST)
+    # `code_dir` carries the pre-ICD-change versions of the file.
+    (code / "IMU.h").write_text(IMU_H_PRE)
+    (code / "IMU.c").write_text(
+        "#include \"IMU.h\"\nint IMU_Init(void){return 0;}\n"
+        "void IMU_InterruptHandler(void){}\n"
+    )
+
+    # Hot-swap the LLM call site for both possible paths (the function
+    # is imported by both `app` and `per_file_compile`).
+    saved_app = app._call_llm_complete
+    saved_pfc = getattr(per_file_compile, "_call_llm_complete", None)
+    app._call_llm_complete = _stub_imu_h_fix
+    if saved_pfc is not None:
+        per_file_compile._call_llm_complete = _stub_imu_h_fix
+    try:
+        events = drain(run_per_file_compile(
+            session_dir=sess, gen_dir=gen, code_dir=code, repo_dir=repo,
+            has_repo=True, change_spec="(stub ICD change adds DeltaAngle/DeltaVelocity)",
+            repo_knowledge="",
+            is_resume=False, completed_stages=set(),
+            max_fix_attempts=3, compile_timeout=30,
+            cc_override=NATIVE_CC,
+        ))
+    finally:
+        app._call_llm_complete = saved_app
+        if saved_pfc is not None:
+            per_file_compile._call_llm_complete = saved_pfc
+
+    summary = next((e for e in events if e["type"] == "compile_summary"), None)
+    check("end-to-end: IMU.c compiles after .h-fix",
+          summary and summary["ok"] == 1 and summary["failed"] == 0,
+          f"summary={summary}")
+    h_after = (gen / "IMU.h").read_text()
+    check("end-to-end: IMU.h now declares DeltaAngle[3]",
+          "DeltaAngle[3]" in h_after,
+          f"IMU.h:\n{h_after}")
+    check("end-to-end: IMU.h now declares DeltaVelocity[3]",
+          "DeltaVelocity[3]" in h_after,
+          f"IMU.h:\n{h_after}")
+    obj_path = gen / "IMU.o"
+    check("end-to-end: IMU.o produced on disk",
+          obj_path.exists() and obj_path.stat().st_size > 0,
+          f"obj={obj_path} exists={obj_path.exists()}")
+
+    rep = (gen / "compile_report.txt").read_text()
+    check("report records LLM diagnostics (parsed names)",
+          "parsed names" in rep,
+          f"report tail:\n{rep[-3000:]}")
+    check("report records per-target decisions",
+          "per-target decisions" in rep,
+          f"report tail:\n{rep[-3000:]}")
+    check("report mentions the structured punch list reached the LLM",
+          "DeltaAngle" in rep,
+          f"report tail:\n{rep[-3000:]}")
+    check("report does NOT misparse `### Notes` as a filename",
+          "### Notes" not in rep or "Notes: " not in rep)
+
+    # Make sure the SSE channel surfaced a positive 'Applied LLM fix' line.
+    applied_msgs = [
+        e for e in events
+        if e.get("type") == "info"
+        and "Applied LLM fix to" in (e.get("message") or "")
+    ]
+    check("SSE: applied-fix message includes IMU.h",
+          any("IMU.h" in (e.get("message") or "") for e in applied_msgs),
+          f"applied_msgs={applied_msgs}")
 
 
 # ---------------------------------------------------------------

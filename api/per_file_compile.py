@@ -424,6 +424,149 @@ def _looks_compile_clean(output: str) -> bool:
     return not bool(_ERR_KEY_RE.search(output or ""))
 
 
+# Patterns gcc emits that we can convert into a clear, structured punch
+# list for the agentic LLM. Each pattern captures the identifier(s)
+# the LLM needs to either add, declare, or otherwise resolve.
+_MISSING_MEMBER_RE = re.compile(
+    r"'([^']+)'\s+has no member named\s+'([^']+)'",
+)
+_UNDECLARED_RE = re.compile(
+    r"'([^']+)'\s+undeclared(?:\s+\(first use in this function\))?",
+)
+_UNKNOWN_TYPE_RE = re.compile(
+    r"unknown type name\s+'([^']+)'",
+)
+_IMPLICIT_DECL_RE = re.compile(
+    r"implicit declaration of function\s+'([^']+)'",
+)
+_CONFLICTING_TYPES_RE = re.compile(
+    r"conflicting types for\s+'([^']+)'",
+)
+_INCOMPATIBLE_PTR_RE = re.compile(
+    r"incompatible (?:pointer )?type[^']*'([^']+)'\s+(?:to|from)\s+'([^']+)'",
+)
+_NO_FILE_RE = re.compile(
+    r"fatal error:\s+([^:\n]+):\s+No such file or directory",
+)
+
+
+def _structured_compile_errors(output: str) -> dict[str, list]:
+    """Parse a gcc/clang output into a structured punch list of common
+    error categories. Returned dict keys (each a list of unique tuples):
+
+      ``missing_members``       : list[(struct_name, member_name)]
+      ``undeclared``            : list[symbol]
+      ``unknown_types``         : list[type_name]
+      ``implicit_decls``        : list[function_name]
+      ``conflicting_types``     : list[symbol]
+      ``incompatible_pointers`` : list[(lhs_type, rhs_type)]
+      ``missing_headers``       : list[header_name]
+
+    Empty lists are kept so callers can render a consistent layout.
+    """
+    def _uniq(seq: list) -> list:
+        seen: set = set()
+        out: list = []
+        for item in seq:
+            key = item if isinstance(item, str) else tuple(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    text = output or ""
+    return {
+        "missing_members": _uniq(
+            [(m.group(1), m.group(2)) for m in _MISSING_MEMBER_RE.finditer(text)]
+        ),
+        "undeclared": _uniq(
+            [m.group(1) for m in _UNDECLARED_RE.finditer(text)]
+        ),
+        "unknown_types": _uniq(
+            [m.group(1) for m in _UNKNOWN_TYPE_RE.finditer(text)]
+        ),
+        "implicit_decls": _uniq(
+            [m.group(1) for m in _IMPLICIT_DECL_RE.finditer(text)]
+        ),
+        "conflicting_types": _uniq(
+            [m.group(1) for m in _CONFLICTING_TYPES_RE.finditer(text)]
+        ),
+        "incompatible_pointers": _uniq(
+            [(m.group(1), m.group(2)) for m in _INCOMPATIBLE_PTR_RE.finditer(text)]
+        ),
+        "missing_headers": _uniq(
+            [m.group(1).strip() for m in _NO_FILE_RE.finditer(text)]
+        ),
+    }
+
+
+def _format_error_punchlist(struct: dict[str, list]) -> str:
+    """Render the output of :func:`_structured_compile_errors` as a
+    Markdown punch list suitable for inclusion in the agentic-fix LLM
+    prompt. Returns an empty string when nothing actionable was found
+    (i.e. callers can do ``if punchlist: prompt += punchlist``).
+    """
+    lines: list[str] = []
+    if struct["missing_members"]:
+        lines.append(
+            "Missing struct/union members — the FIX is to ADD each member "
+            "to the named struct in its declaring header (e.g. `### IMU.h`). "
+            "DO NOT silently remove the member's usage from the .c — that "
+            "would undo an ICD-mandated change:"
+        )
+        for s, m in struct["missing_members"]:
+            lines.append(f"  - struct `{s}` is missing member `{m}`")
+    if struct["unknown_types"]:
+        lines.append(
+            "Unknown type names — either typedef them in the appropriate "
+            "header or add the right `#include`:"
+        )
+        for t in struct["unknown_types"]:
+            lines.append(f"  - `{t}`")
+    if struct["undeclared"]:
+        lines.append(
+            "Undeclared identifiers — declare them or add the right "
+            "`#include` (these may also be the result of a missing macro "
+            "or a typo to fix in the .c):"
+        )
+        for s in struct["undeclared"]:
+            lines.append(f"  - `{s}`")
+    if struct["implicit_decls"]:
+        lines.append(
+            "Functions used without a declaration — add a prototype to "
+            "the matching header (or include the header that already "
+            "provides it):"
+        )
+        for s in struct["implicit_decls"]:
+            lines.append(f"  - `{s}()`")
+    if struct["conflicting_types"]:
+        lines.append(
+            "Conflicting types — the symbol is declared with two "
+            "different signatures. Make the declaration in the header "
+            "match the new signature mandated by the ICD change:"
+        )
+        for s in struct["conflicting_types"]:
+            lines.append(f"  - `{s}`")
+    if struct["incompatible_pointers"]:
+        lines.append(
+            "Incompatible pointer assignments — adjust the type of "
+            "either the variable or the pointed-to value so they match:"
+        )
+        for a, b in struct["incompatible_pointers"]:
+            lines.append(f"  - `{a}` vs `{b}`")
+    if struct["missing_headers"]:
+        lines.append(
+            "Headers that could not be resolved (drop the include OR "
+            "rename it to a header that actually exists in the project):"
+        )
+        for h in struct["missing_headers"]:
+            lines.append(f"  - `{h}`")
+    if not lines:
+        return ""
+    return "## Structured Error Punch List\n" + "\n".join(lines)
+
+
 def run_per_file_compile(
     *,
     session_dir: Path,
@@ -744,13 +887,44 @@ def run_per_file_compile(
         f"- Cross-compile: {'yes' if is_cross else 'no'}\n"
         "- C standard: C99 (-std=c99 compatible)\n"
         "- Use <stdint.h> fixed-width types\n\n"
-        "RULES:\n"
-        "1. Output ONLY the complete, corrected file\n"
-        "2. Fix EVERY compiler error\n"
-        "3. Preserve naming conventions and #include paths\n"
-        "4. If both .c and .h need changes, output exactly two fenced blocks "
-        "labelled with `### <filename>` headers, otherwise output one fenced block\n"
-        "5. Wrap each file in ```c ... ``` fences"
+        "OUTPUT FORMAT (MUST follow exactly — the parser is strict):\n"
+        "1. Output ONLY the COMPLETE final file(s). NEVER patches, diffs, "
+        "ellipses, '...', '// unchanged', or partial code.\n"
+        "2. If exactly one file needs editing, output exactly one fenced\n"
+        "   block wrapped in ```c ... ``` (no header line needed).\n"
+        "3. If BOTH the .c and the .h need editing, output TWO fenced "
+        "blocks. Each block MUST be immediately preceded by a single-line "
+        "filename header of the form:\n"
+        "       ### <filename>\n"
+        "   e.g. `### IMU.c` then ```c ... ``` then `### IMU.h` then "
+        "```c ... ```. The filename MUST end in `.c` or `.h` and match "
+        "the file you are rewriting.\n"
+        "4. NEVER add any other `###` (or `##` / `####`) section headers "
+        "anywhere in your reply — no `### Analysis`, `### Reasoning`, "
+        "`### Summary`, `### Fix`, etc. They will be interpreted as "
+        "filename markers and silently break the parser.\n"
+        "5. NO prose, NO numbered lists, NO commentary outside the "
+        "fenced code blocks. The only allowed content outside fences is "
+        "the `### <filename>` markers themselves.\n"
+        "\n"
+        "FIX RULES:\n"
+        "A. Fix EVERY compiler error visible in the build output.\n"
+        "B. Preserve all naming conventions and `#include` paths that "
+        "already work — only add or rename what the errors demand.\n"
+        "C. NEVER silently delete or roll back ICD-mandated changes "
+        "from the .c to make the compile pass. If the error says a "
+        "struct/union member is missing, ADD that member to the struct "
+        "in its declaring header. If the error says a function is "
+        "undeclared, ADD a prototype to the header (or include the "
+        "header that already declares it).\n"
+        "D. When the error says `'X' has no member named 'Y'`, the "
+        "correct fix is almost always to output BOTH the `### <name>.c` "
+        "and `### <name>.h` blocks — the .c unchanged (or only the new "
+        "uses preserved) and the .h with the missing fields added to "
+        "struct X.\n"
+        "E. The .h must keep its include guards (`#ifndef <BASE>_H` / "
+        "`#define <BASE>_H` ... `#endif`). The .c must keep its "
+        "`#include \"<base>.h\"` (or equivalent) if it had one."
     )
 
     for cs in c_sources:
@@ -897,6 +1071,13 @@ def run_per_file_compile(
 
             errors_trimmed = output if len(output) <= 4000 else (output[-4000:])
 
+            # Pre-parse the compile output into a structured "missing
+            # symbols / type mismatches" punch list so the LLM has a
+            # short, unambiguous action list instead of having to
+            # re-derive it from raw gcc output.
+            err_struct = _structured_compile_errors(output)
+            sec_punchlist = _format_error_punchlist(err_struct)
+
             sec_original = (
                 f"## Original Working Code ({fname})\n"
                 f"This code compiled cleanly before ICD changes:\n"
@@ -928,11 +1109,16 @@ def run_per_file_compile(
             )
             sec_change = f"## Change Specification\n{change_spec}"
             sec_instr = (
-                "## Output format\n"
+                "## Output format reminder\n"
                 "Output ONLY the complete file(s) inside ```c fences. "
-                "When two files need to change, prefix each block with "
-                "`### <filename>` on its own line so the names can be "
-                "extracted reliably."
+                "When TWO files need to change, prefix each block with "
+                "`### <filename>` (e.g. `### "
+                f"{fname}` then ```c ... ``` then `### "
+                f"{companion_h.name if companion_h else fname.replace('.c', '.h')}`"
+                " then ```c ... ```). The filename MUST end in `.c` or "
+                "`.h`. Do NOT add any other `###` headings anywhere "
+                "in your reply (`### Analysis`, `### Fix`, `### Notes`, "
+                "etc. will be parsed as filenames and silently dropped)."
             )
 
             # Surface the include-resolution audit so the LLM can react to
@@ -984,6 +1170,10 @@ def run_per_file_compile(
                     ("header", sec_header, 0),
                     ("command", sec_cmd, 0),
                     ("errors", sec_errors, 0),
+                    # The structured punch list is a tiny, high-signal
+                    # summary of the raw error log — keep it at top
+                    # priority so it always fits in the prompt budget.
+                    ("punchlist", sec_punchlist, 0),
                     ("resolutions", sec_resolutions, 0),
                     ("instructions", sec_instr, 0),
                     ("repo_ctx", sec_repo_ctx, 1),
@@ -1011,29 +1201,83 @@ def run_per_file_compile(
             except Exception as e:
                 log.warning("per_file_compile: LLM fix failed for %s: %s", fname, e)
                 attempts_log[-1]["diff"] = f"(LLM fix raised: {e})"
+                attempts_log[-1]["llm_diagnostics"] = {
+                    "error": f"LLM call raised: {e}",
+                }
+                yield _sse({
+                    "type": "info",
+                    "stage": "compile",
+                    "file": fname,
+                    "message": (
+                        f"LLM fix call for {fname} failed ({type(e).__name__})"
+                        f" — keeping current file."
+                    ),
+                })
                 continue
 
-            # Try to extract per-file blocks first (### <filename> headers),
-            # fall back to a single fenced block (mapped to fname).
-            new_files = _extract_per_file_blocks(fix_output)
+            # ---- Parse + fall-back strategy ----
+            # (1) Try strict `### <filename>.<ext>` parsing.
+            # (2) If that yields no usable mapping, look at every fenced
+            #     block in the output and assign each by content sniff
+            #     (.h via include-guard pattern, .c via function-body
+            #     pattern). This rescues the very common LLM failure
+            #     mode of forgetting / mangling filename headers.
+            # (3) Final fallback: single fenced block -> fname.
+            allowed = {fname}
+            if companion_h is not None:
+                allowed.add(companion_h.name)
+
+            parsed = _extract_per_file_blocks(fix_output)
+            parsed_filtered = {k: v for k, v in parsed.items() if k in allowed}
+
+            new_files: dict[str, str] = dict(parsed_filtered)
+
             if not new_files:
-                single = _extract_fenced(fix_output, "c").strip()
-                if single:
-                    new_files = {fname: single}
+                # Fallback A: split every fenced block by content sniff
+                fenced = _all_fenced_blocks(fix_output)
+                if len(fenced) >= 2:
+                    for body in fenced:
+                        guess = _guess_filename_for_block(
+                            body, c_name=fname,
+                            h_name=(companion_h.name if companion_h else None),
+                        )
+                        if guess and guess not in new_files:
+                            new_files[guess] = body
+                # Fallback B: single fenced block -> fname
+                if not new_files:
+                    single = _extract_fenced(fix_output, "c").strip()
+                    if single:
+                        new_files = {fname: single}
 
             applied: list[str] = []
+            decisions: list[dict] = []  # per-target audit trail
             for target_name, new_code in new_files.items():
-                target_path = gen_dir / target_name
                 # Only touch files that we own / that the LLM was supposed to edit.
-                if target_name not in (fname, companion_h.name if companion_h else None):
+                if target_name not in allowed:
+                    decisions.append({
+                        "target": target_name,
+                        "decision": "skipped_unknown_name",
+                        "reason": (
+                            f"name not in {{{', '.join(sorted(allowed))}}}"
+                        ),
+                    })
                     continue
                 # Sanity-check completeness with the same heuristic the
                 # transform step uses.
                 ref = snapshots.get(target_name, "") or original_code
                 if not _looks_complete_c_file(new_code, ref, target_name):
-                    log.info("per_file_compile: %s LLM output looked incomplete",
-                             target_name)
+                    detail = _incomplete_file_reason(new_code, ref, target_name)
+                    log.info(
+                        "per_file_compile: %s LLM output rejected: %s",
+                        target_name, detail,
+                    )
+                    decisions.append({
+                        "target": target_name,
+                        "decision": "rejected_incomplete",
+                        "reason": detail,
+                    })
                     continue
+                target_path = gen_dir / target_name
                 prev_text = target_path.read_text() if target_path.exists() else ""
                 target_path.write_text(new_code)
                 diff = _generate_diff(
@@ -1046,15 +1290,41 @@ def run_per_file_compile(
                     + (("\n\n" if attempts_log[-1].get("diff") else "") + diff)
                 )
                 applied.append(target_name)
+                decisions.append({
+                    "target": target_name,
+                    "decision": "applied",
+                    "reason": "passed completeness heuristic",
+                })
+
+            # Record LLM diagnostics for the report + post-mortem debugging.
+            llm_preview = fix_output if len(fix_output) <= 1800 else (
+                fix_output[:900] + "\n\n[... LLM output truncated ...]\n\n"
+                + fix_output[-900:]
+            )
+            attempts_log[-1]["llm_diagnostics"] = {
+                "length": len(fix_output),
+                "parsed_names": sorted(parsed.keys()),
+                "fenced_block_count": len(_all_fenced_blocks(fix_output)),
+                "considered_files": sorted(new_files.keys()),
+                "decisions": decisions,
+                "applied": applied,
+                "preview": llm_preview,
+            }
 
             if not applied:
+                reason = _summarise_reject_reason(
+                    fix_output=fix_output,
+                    parsed_names=list(parsed.keys()),
+                    decisions=decisions,
+                    allowed=allowed,
+                )
                 yield _sse({
                     "type": "info",
                     "stage": "compile",
                     "file": fname,
                     "message": (
-                        f"LLM fix attempt for {fname} did not yield a "
-                        f"complete usable rewrite — keeping current file."
+                        f"LLM fix attempt for {fname} not applied "
+                        f"({reason}) — keeping current file."
                     ),
                 })
             else:
@@ -1167,6 +1437,46 @@ def run_per_file_compile(
                 "  Output:",
                 "    " + a["output"].replace("\n", "\n    ")[:6000],
             ])
+            if a.get("llm_diagnostics"):
+                diag = a["llm_diagnostics"]
+                if "error" in diag:
+                    rep.append(
+                        f"  LLM diagnostics: ERROR — {diag['error']}"
+                    )
+                else:
+                    rep.append("  LLM diagnostics:")
+                    rep.append(
+                        f"    response length     : {diag.get('length', '?')} chars"
+                    )
+                    rep.append(
+                        f"    fenced code blocks  : {diag.get('fenced_block_count', '?')}"
+                    )
+                    rep.append(
+                        "    parsed names        : "
+                        + (", ".join(diag.get("parsed_names") or []) or "(none)")
+                    )
+                    rep.append(
+                        "    considered files    : "
+                        + (", ".join(diag.get("considered_files") or []) or "(none)")
+                    )
+                    rep.append(
+                        "    applied             : "
+                        + (", ".join(diag.get("applied") or []) or "(none)")
+                    )
+                    if diag.get("decisions"):
+                        rep.append("    per-target decisions:")
+                        for d in diag["decisions"]:
+                            rep.append(
+                                f"      - {d['target']}: {d['decision']} "
+                                f"({d['reason']})"
+                            )
+                    preview = diag.get("preview") or ""
+                    if preview:
+                        rep.append("    LLM output preview:")
+                        rep.append(
+                            "      "
+                            + preview.replace("\n", "\n      ")[:6000]
+                        )
             if a.get("diff"):
                 rep.append("  Diff applied after this attempt:")
                 rep.append("    " + a["diff"].replace("\n", "\n    ")[:6000])
@@ -1193,9 +1503,64 @@ def run_per_file_compile(
 
 
 _PER_FILE_HEADER_RE = re.compile(
-    r"^###\s+([^\n]+?)\s*$",
+    # Match 2-to-6 hashes (covers `## file`, `### file`, etc. — some LLMs
+    # over- or under-shoot when asked for `###`). The captured group is
+    # the entire text after the hashes, which we then strip and validate.
+    r"^#{2,6}\s+([^\n]+?)\s*$",
     re.MULTILINE,
 )
+# Recognises the C-family extensions we accept as filename markers. Any
+# `###`-prefixed line whose payload does NOT end in one of these (after
+# stripping wrappers) is treated as a markdown section header and
+# IGNORED — this stops the parser from misreading `### Analysis` /
+# `### Fix` / `### Reasoning` etc. as filenames and silently dropping
+# the actual fenced code block.
+_ALLOWED_C_EXTS_RE = re.compile(
+    r"\.(?:c|h|cc|hh|cpp|hpp|cxx|hxx|inc)$",
+    re.IGNORECASE,
+)
+# Characters LLMs often wrap filenames in: backticks, asterisks, quotes,
+# angle brackets, italic underscores, trailing colons / dashes / spaces.
+_FILENAME_WRAPPER_CHARS = "`*\"'<>_ \t:-—–·•"
+
+
+def _looks_like_c_filename(token: str) -> Optional[str]:
+    """Return the cleaned-up filename if *token* looks like a C-family
+    source/header filename, else ``None``.
+
+    Handles common LLM dressings:
+
+      - ``### IMU.c`` -> ``"IMU.c"``
+      - ``### `IMU.c```` -> ``"IMU.c"``
+      - ``### **IMU.h**`` -> ``"IMU.h"``
+      - ``### src/IMU.c`` -> ``"IMU.c"`` (basename)
+      - ``### "IMU.c":`` -> ``"IMU.c"``
+      - ``### IMU.c  (corrected)`` -> ``"IMU.c"`` (drops trailing junk)
+      - ``### Analysis`` -> ``None``  (no C extension)
+      - ``### Fix`` -> ``None``
+      - ``### # IMU.c`` -> ``"IMU.c"`` (handles extra leading hashes)
+    """
+    if not token:
+        return None
+    # 1. Drop trailing parenthetical/inline annotations the LLM
+    # sometimes adds: `### IMU.c  (corrected)` or `### IMU.c : fixed`.
+    for sep in ("(", "[", ":", " - ", " — ", "  "):
+        idx = token.find(sep)
+        if idx != -1:
+            token = token[:idx]
+    # 2. Pick the first whitespace-separated token (after the strip
+    # above, this is usually the entire payload).
+    parts = token.split()
+    if not parts:
+        return None
+    candidate = parts[0].strip(_FILENAME_WRAPPER_CHARS)
+    # 3. Reduce any directory prefix to a bare basename.
+    candidate = candidate.replace("\\", "/").rsplit("/", 1)[-1]
+    if not candidate:
+        return None
+    if not _ALLOWED_C_EXTS_RE.search(candidate):
+        return None
+    return candidate
 
 
 def _extract_per_file_blocks(text: str) -> dict[str, str]:
@@ -1211,15 +1576,21 @@ def _extract_per_file_blocks(text: str) -> dict[str, str]:
         ...code...
         ```
 
-    Returns a ``{filename: code}`` dict.  Missing or unparseable input ⇒
-    empty dict (caller should fall back to a single fenced block).
+    Returns a ``{filename: code}`` dict.  Filename headers whose name
+    does NOT look like a C-family source/header filename are treated
+    as ordinary markdown section headers and ignored (no false-positive
+    parse of `### Analysis` / `### Fix` etc.).  Missing or unparseable
+    input ⇒ empty dict (caller should fall back to a single fenced
+    block).
     """
     out: dict[str, str] = {}
     headers = list(_PER_FILE_HEADER_RE.finditer(text))
     if not headers:
         return out
     for i, m in enumerate(headers):
-        name = m.group(1).strip().split()[0]
+        cleaned = _looks_like_c_filename(m.group(1))
+        if not cleaned:
+            continue
         start = m.end()
         end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
         chunk = text[start:end]
@@ -1228,5 +1599,146 @@ def _extract_per_file_blocks(text: str) -> dict[str, str]:
             chunk, flags=re.DOTALL,
         )
         if fence:
-            out[name] = fence.group(1).strip()
+            out[cleaned] = fence.group(1).strip()
     return out
+
+
+def _all_fenced_blocks(text: str) -> list[str]:
+    """Return every triple-fence body in *text* (in source order)."""
+    return [
+        m.group(1).strip()
+        for m in re.finditer(
+            r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n```",
+            text, flags=re.DOTALL,
+        )
+    ]
+
+
+def _incomplete_file_reason(generated: str, original: str, filename: str) -> str:
+    """Mirror :func:`api.app._looks_complete_c_file` but return a short
+    human-readable label describing the FIRST failed check (or
+    ``"passes"`` if the file passes all heuristics). Used to surface
+    actionable diagnostics instead of the opaque
+    "did not yield a complete usable rewrite" message.
+    """
+    text = (generated or "").strip()
+    if not text:
+        return "LLM output was empty"
+    if "[... TRUNCATED" in text or text.endswith("..."):
+        return "LLM output looked truncated (ends with ellipsis)"
+    if text.count("{") != text.count("}"):
+        return (
+            f"unbalanced braces (got {text.count('{')} `{{` vs "
+            f"{text.count('}')} `}}`)"
+        )
+    if text.count("/*") > text.count("*/"):
+        return "unbalanced /* ... */ block comment"
+    if filename.endswith(".h"):
+        has_ifndef = re.search(r"^\s*#\s*ifn?def\b", text, flags=re.MULTILINE)
+        has_endif = re.search(r"^\s*#\s*endif\b", text, flags=re.MULTILINE)
+        if has_ifndef and not has_endif:
+            return "include guard opened with `#ifndef` but no matching `#endif`"
+    min_len = max(120, int(len((original or "").strip()) * 0.35))
+    if len(text) < min_len:
+        return (
+            f"too short ({len(text)} chars < {min_len} required relative "
+            f"to the original {len((original or '').strip())}-char file)"
+        )
+    last = text.splitlines()[-1].strip() if text.splitlines() else ""
+    if not (
+        last.endswith("}")
+        or last.endswith(";")
+        or last.endswith("*/")
+        or last.startswith("#endif")
+    ):
+        return (
+            f"last line does not look like a terminator: "
+            f"{last[:60]!r}"
+        )
+    return "passes"
+
+
+def _summarise_reject_reason(
+    *,
+    fix_output: str,
+    parsed_names: list[str],
+    decisions: list[dict],
+    allowed: set,
+) -> str:
+    """Build a short, precise summary of WHY the LLM fix attempt
+    produced no usable rewrite — for SSE clients and the report.
+    """
+    if not fix_output.strip():
+        return "LLM returned an empty response"
+    fenced = _all_fenced_blocks(fix_output)
+    if not fenced and not parsed_names:
+        return "no triple-fenced code blocks found in LLM output"
+    if not decisions:
+        # We parsed blocks but none ever entered the decision loop —
+        # i.e. every parsed name was something other than the allowed
+        # set AND the content-sniff/single-fence fallbacks all failed.
+        return (
+            "LLM output had fenced code but no block could be attributed "
+            f"to {fname_summary(allowed)} "
+            f"(parser saw filenames {parsed_names or 'none'})"
+        )
+    rejected_incomplete = [
+        d for d in decisions if d["decision"] == "rejected_incomplete"
+    ]
+    skipped_unknown = [
+        d for d in decisions if d["decision"] == "skipped_unknown_name"
+    ]
+    if rejected_incomplete:
+        first = rejected_incomplete[0]
+        return (
+            f"rewrite of {first['target']} failed completeness check "
+            f"({first['reason']})"
+        )
+    if skipped_unknown:
+        names = ", ".join(sorted({d["target"] for d in skipped_unknown}))
+        return (
+            f"LLM rewrote {names!r} but neither is in "
+            f"{fname_summary(allowed)}"
+        )
+    return "no applicable rewrite produced"
+
+
+def fname_summary(allowed: set) -> str:
+    """Render a small set of allowed filenames as ``{IMU.c, IMU.h}``."""
+    return "{" + ", ".join(sorted(allowed)) + "}"
+
+
+def _guess_filename_for_block(
+    body: str,
+    *,
+    c_name: str,
+    h_name: Optional[str],
+) -> Optional[str]:
+    """Decide whether a fenced block looks like the .c or the .h file.
+
+    Used as a last-resort fallback when the LLM emitted code blocks but
+    forgot to mark them with `### <filename>` headers.  Heuristics:
+
+      - A typical .h has an include guard (``#ifndef <BASE>_H`` /
+        ``#define <BASE>_H`` ... ``#endif``).
+      - A typical .c does ``#include "<base>.h"`` and contains
+        function bodies (``int foo(...) {`` patterns).
+    """
+    if not body or not c_name:
+        return None
+    base = Path(c_name).stem.upper()
+    h_guard = re.search(
+        rf"#\s*ifn?def\s+{re.escape(base)}_H\b", body, flags=re.IGNORECASE,
+    )
+    h_endif = re.search(r"#\s*endif\b", body)
+    looks_like_h = bool(h_guard and h_endif) and h_name is not None
+    if looks_like_h:
+        return h_name
+    # Cheap "this looks like a .c" check: at least one function body
+    # opener with `{` on a non-comment line.
+    looks_like_c = bool(
+        re.search(r"^\s*[A-Za-z_][\w\s\*]*\([^;]*\)\s*\{", body, re.MULTILINE)
+    )
+    if looks_like_c:
+        return c_name
+    return None
