@@ -1683,6 +1683,14 @@ def _sandbox_build_iterate(
                     "version of the repository for download."
                 ),
             })
+            synced_generated = _sync_generated_from_sandbox(
+                gen_dir, replacement_map,
+            )
+            if synced_generated:
+                build_log_lines.append(
+                    "Synced best-effort generated files from sandbox: "
+                    + ", ".join(synced_generated)
+                )
             yield _sse({
                 "type": "info",
                 "stage": "sandbox_build",
@@ -1721,6 +1729,14 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "message": "Packaging built repository…",
         })
+        synced_generated = _sync_generated_from_sandbox(
+            gen_dir, replacement_map,
+        )
+        if synced_generated:
+            build_log_lines.append(
+                "Synced generated files from sandbox: "
+                + ", ".join(synced_generated)
+            )
         _package_sandbox_zip(session_dir, sandbox_dir)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2156,6 +2172,35 @@ def _sandbox_build_iterate(
         "iterations": iteration,
         "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
+
+
+def _sync_generated_from_sandbox(
+    gen_dir: Path,
+    replacement_map: dict[str, Path],
+) -> list[str]:
+    """Copy sandbox-fixed generated C/H files back to session output files."""
+    synced: list[str] = []
+    for fname, sandbox_path in sorted(replacement_map.items()):
+        if suffix := Path(fname).suffix:
+            if suffix not in (".c", ".h"):
+                continue
+        if not sandbox_path.exists() or not sandbox_path.is_file():
+            log.warning(
+                "Cannot sync generated file %s; sandbox path missing: %s",
+                fname, sandbox_path,
+            )
+            continue
+        try:
+            code = sandbox_path.read_text(errors="replace")
+            (gen_dir / fname).write_text(code)
+        except OSError as e:
+            log.warning(
+                "Failed to sync generated file %s from sandbox: %s",
+                fname, e,
+            )
+            continue
+        synced.append(fname)
+    return synced
 
 
 def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
