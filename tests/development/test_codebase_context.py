@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "api"))
 
 os.environ["WORKSPACE_DIR"] = tempfile.mkdtemp(prefix="icd_test_")
 
+import app as app_module
 from fastapi.testclient import TestClient
 from app import (
     app,
@@ -315,6 +316,63 @@ check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
 check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+
+# ---------------------------------------------------------------
+print("\n=== Test 15: Orchestrator sandbox fixes sync to generated files ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    root = Path(tmpdir)
+    session_dir = root / "session"
+    gen_dir = session_dir / "generated_code"
+    repo_dir = session_dir / "repo_contents"
+    gen_dir.mkdir(parents=True)
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "foo.c").write_text(
+        "int value(void) {\n    return 0;\n}\n"
+    )
+    (repo_dir / "Makefile").write_text("all:\n\t@true\n")
+    (gen_dir / "foo.c").write_text("int value(void) {\n    return 1;\n}\n")
+
+    old_orchestrator = app_module._run_orchestrator
+    old_use_orchestrator = app_module.SANDBOX_USE_ORCHESTRATOR
+
+    def fake_orchestrator(**kwargs):
+        sandbox_dir = kwargs["sandbox_dir"]
+        (sandbox_dir / "src" / "foo.c").write_text(
+            "int value(void) {\n    return 42;\n}\n"
+        )
+        yield {
+            "type": "done",
+            "success": True,
+            "reason": "fake orchestrator patched generated file",
+            "steps": 1,
+            "builds": 1,
+        }
+
+    try:
+        app_module._run_orchestrator = fake_orchestrator
+        app_module.SANDBOX_USE_ORCHESTRATOR = True
+        events = list(app_module._sandbox_build_iterate(
+            session_dir=session_dir,
+            gen_dir=gen_dir,
+            repo_dir=repo_dir,
+            change_spec="change return value",
+            uploaded_names=set(),
+            has_repo=True,
+        ))
+    finally:
+        app_module._run_orchestrator = old_orchestrator
+        app_module.SANDBOX_USE_ORCHESTRATOR = old_use_orchestrator
+
+    synced_code = (gen_dir / "foo.c").read_text()
+    check("generated_code receives sandbox fix", "return 42" in synced_code,
+          synced_code)
+    check("sandbox build result emitted",
+          any('"type": "sandbox_build_result"' in evt and '"success": true' in evt
+              for evt in events))
+    with zipfile.ZipFile(session_dir / "built_repo.zip") as zf:
+        built_code = zf.read("src/foo.c").decode()
+    check("built repo contains sandbox fix", "return 42" in built_code,
+          built_code)
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")
