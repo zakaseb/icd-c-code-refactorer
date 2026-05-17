@@ -1688,6 +1688,7 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "message": "Packaging best-effort repository…",
             })
+            _sync_generated_from_sandbox(gen_dir, replacement_map)
             _package_sandbox_zip(session_dir, sandbox_dir)
             build_log_path = session_dir / "sandbox_build_log.txt"
             build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -1721,6 +1722,7 @@ def _sandbox_build_iterate(
             "stage": "sandbox_build",
             "message": "Packaging built repository…",
         })
+        _sync_generated_from_sandbox(gen_dir, replacement_map)
         _package_sandbox_zip(session_dir, sandbox_dir)
         build_log_path = session_dir / "sandbox_build_log.txt"
         build_log_path.write_text("\n".join(build_log_lines) + "\n")
@@ -2156,6 +2158,22 @@ def _sandbox_build_iterate(
         "iterations": iteration,
         "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
+
+
+def _sync_generated_from_sandbox(gen_dir: Path, replacement_map: dict[str, Path]) -> None:
+    """Copy final sandbox versions of generated files back to session output."""
+    gen_root = gen_dir.resolve()
+    for filename, sandbox_path in replacement_map.items():
+        if not sandbox_path.exists() or not sandbox_path.is_file():
+            log.warning("Cannot sync missing generated file from sandbox: %s", sandbox_path)
+            continue
+        target = (gen_dir / filename).resolve()
+        try:
+            target.relative_to(gen_root)
+        except ValueError:
+            log.warning("Refusing to sync generated file outside output dir: %s", filename)
+            continue
+        target.write_text(sandbox_path.read_text(errors="replace"))
 
 
 def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:

@@ -4,6 +4,7 @@ Tests repo ZIP upload, distilled context building, budget-aware prompts,
 structural verification, and the end-to-end pipeline — no Docker/LLM needed.
 """
 import io
+import importlib
 import json
 import os
 import sys
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "api"))
 os.environ["WORKSPACE_DIR"] = tempfile.mkdtemp(prefix="icd_test_")
 
 from fastapi.testclient import TestClient
+app_module = importlib.import_module("app")
 from app import (
     app,
     _build_repo_context,
@@ -315,6 +317,78 @@ check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
 check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+
+# ---------------------------------------------------------------
+print("\n=== Test 15: Orchestrator syncs generated file outputs ===")
+with tempfile.TemporaryDirectory() as tmpdir:
+    root = Path(tmpdir)
+    session_dir = root / "session"
+    gen_dir = session_dir / "generated_code"
+    repo_dir = root / "repo"
+    gen_dir.mkdir(parents=True)
+    (repo_dir / "include").mkdir(parents=True)
+    (repo_dir / "src").mkdir(parents=True)
+
+    initial_header = (
+        "#ifndef COMM_H\n#define COMM_H\n"
+        "#define COMM_VERSION 1\n"
+        "#endif\n"
+    )
+    fixed_header = (
+        "#ifndef COMM_H\n#define COMM_H\n"
+        "#define COMM_VERSION 2\n"
+        "#endif\n"
+    )
+    (gen_dir / "comm.h").write_text(initial_header)
+    (repo_dir / "include" / "comm.h").write_text(initial_header)
+    (repo_dir / "src" / "main.c").write_text(
+        '#include "comm.h"\nint main(void) { return COMM_VERSION; }\n'
+    )
+    (repo_dir / "Makefile").write_text(
+        "CC = gcc\n"
+        "all:\n"
+        "\t$(CC) -Iinclude -c src/main.c\n"
+    )
+
+    old_orchestrator = app_module._run_orchestrator
+    old_use_orchestrator = app_module.SANDBOX_USE_ORCHESTRATOR
+
+    def fake_orchestrator(**kwargs):
+        sandbox_dir = kwargs["sandbox_dir"]
+        (sandbox_dir / "include" / "comm.h").write_text(fixed_header)
+        yield {
+            "type": "done",
+            "success": True,
+            "reason": "fake success",
+            "steps": 1,
+            "builds": 1,
+        }
+
+    try:
+        app_module._run_orchestrator = fake_orchestrator
+        app_module.SANDBOX_USE_ORCHESTRATOR = True
+        list(app_module._sandbox_build_iterate(
+            session_dir=session_dir,
+            gen_dir=gen_dir,
+            repo_dir=repo_dir,
+            change_spec="Bump COMM_VERSION to 2",
+            uploaded_names={"comm.h"},
+            has_repo=True,
+            repo_knowledge="",
+        ))
+    finally:
+        app_module._run_orchestrator = old_orchestrator
+        app_module.SANDBOX_USE_ORCHESTRATOR = old_use_orchestrator
+
+    check(
+        "generated_code contains orchestrator fix",
+        (gen_dir / "comm.h").read_text() == fixed_header,
+        (gen_dir / "comm.h").read_text(),
+    )
+    built_repo = session_dir / "built_repo.zip"
+    with zipfile.ZipFile(built_repo, "r") as zf:
+        packaged_header = zf.read("include/comm.h").decode()
+    check("built repo contains same fix", packaged_header == fixed_header, packaged_header)
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")
