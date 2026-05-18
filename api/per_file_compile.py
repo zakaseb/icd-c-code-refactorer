@@ -591,6 +591,7 @@ def run_per_file_compile(
     has_repo: bool,
     change_spec: str,
     repo_knowledge: str,
+    gitnexus_report: str = "",
     is_resume: bool,
     completed_stages: set[str],
     max_fix_attempts: int = 4,
@@ -1174,6 +1175,10 @@ def run_per_file_compile(
                 f"## Repository Codebase Knowledge\n{repo_knowledge}"
                 if repo_knowledge else ""
             )
+            sec_gitnexus = (
+                f"## GitNexus Codebase Understanding\n{gitnexus_report}"
+                if gitnexus_report else ""
+            )
             sec_change = f"## Change Specification\n{change_spec}"
             sec_instr = (
                 "## Output format reminder\n"
@@ -1248,6 +1253,7 @@ def run_per_file_compile(
                     ("resolutions", sec_resolutions, 0),
                     ("instructions", sec_instr, 0),
                     ("repo_ctx", sec_repo_ctx, 1),
+                    ("gitnexus", sec_gitnexus, 2),
                     ("knowledge", sec_knowledge, 2),
                     ("change_spec", sec_change, 3),
                 ],

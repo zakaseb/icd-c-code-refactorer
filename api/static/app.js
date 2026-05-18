@@ -243,6 +243,7 @@
     let verificationStep = null;
     let compileStep = null;
     let sandboxStep = null;
+    let gitnexusStep = null;
     let hasSandboxBuild = false;
 
     let es = new EventSource('/api/process/' + sessionId);
@@ -255,6 +256,7 @@
         case 'token': {
           let step;
           if (msg.stage === 'analysis') step = analysisStep;
+          else if (msg.stage === 'gitnexus') step = gitnexusStep;
           else if (msg.stage === 'verification') step = verificationStep;
           else if (msg.stage === 'compile') step = compileStep;
           else if (msg.stage === 'sandbox_build') step = sandboxStep;
@@ -275,6 +277,12 @@
             setStepStatus(s, 'running');
             s.querySelector('.step-output').classList.add('visible');
             fileSteps[msg.file] = s;
+          } else if (msg.stage === 'gitnexus' && !gitnexusStep) {
+            gitnexusStep = createStep('gitnexus',
+              'GitNexus: extracting codebase understanding\u2026');
+            pipelineSteps.appendChild(gitnexusStep);
+            setStepStatus(gitnexusStep, 'running');
+            gitnexusStep.querySelector('.step-output').classList.add('visible');
           } else if (msg.stage === 'verification' && !verificationStep) {
             verificationStep = createStep('verification',
               'Verifying generated code against ICDs & repository\u2026');
@@ -340,6 +348,10 @@
           if (msg.stage === 'analysis') {
             setStepStatus(analysisStep, 'complete');
             analysisStep.querySelector('.step-label').textContent = 'ICD analysis complete';
+          } else if (msg.stage === 'gitnexus' && gitnexusStep) {
+            setStepStatus(gitnexusStep, 'complete');
+            gitnexusStep.querySelector('.step-label').textContent =
+              'GitNexus codebase report complete';
           } else if (msg.stage === 'verification' && verificationStep) {
             setStepStatus(verificationStep, 'complete');
             verificationStep.querySelector('.step-label').textContent = 'Verification complete';
@@ -377,6 +389,10 @@
           if (msg.stage === 'analysis') {
             const out = analysisStep.querySelector('.step-output');
             if (out.textContent.startsWith('Connecting to LLM')) out.textContent = '';
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+          } else if (msg.stage === 'gitnexus' && gitnexusStep) {
+            const out = gitnexusStep.querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
           } else if (msg.stage === 'verification' && verificationStep) {

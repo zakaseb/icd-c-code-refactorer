@@ -649,6 +649,7 @@ def build_brief(
     repo_knowledge: str,
     initial_build_output: str,
     notes: list[str],
+    gitnexus_report: str = "",
 ) -> str:
     """Compose the user message that frames the task each turn."""
     rel_build = (
@@ -690,6 +691,18 @@ def build_brief(
             "## Repository codebase knowledge",
             _truncate(repo_knowledge, 3000),
         ])
+    if gitnexus_report:
+        parts.extend([
+            "",
+            "## GitNexus codebase understanding",
+            "Embedded-systems-specific relationships (ISR/task wiring, "
+            "drivers/peripherals, RTOS or superloop, state machines, "
+            "communication stacks, memory ownership, HAL boundary, "
+            "bootloader/firmware-update hooks, safety chains, "
+            "cross-module #include graph, global variable read/write "
+            "graph, build-script deps). Honor these when patching.",
+            _truncate(gitnexus_report, 4000),
+        ])
     parts.extend([
         "",
         "## Reminder",
@@ -726,6 +739,7 @@ def run_orchestrator(
     max_builds: int = DEFAULT_MAX_BUILDS,
     max_input_tokens: int = 24_000,
     max_output_tokens: int = 1024,
+    gitnexus_report: str = "",
 ) -> Iterator[dict]:
     """Drive the debugging loop. Yields events for SSE forwarding.
 
@@ -794,6 +808,7 @@ def run_orchestrator(
             repo_knowledge=repo_knowledge,
             initial_build_output=last_build_output,
             notes=ctx.notes,
+            gitnexus_report=gitnexus_report,
         )
         transcript = render_transcript(history)
         char_budget = max_input_tokens * 4

@@ -41,6 +41,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from per_file_compile import run_per_file_compile
+try:
+    from api.gitnexus import build_gitnexus_report as _build_gitnexus_report
+except ImportError:  # tolerate flat layout (uvicorn app.app:app)
+    from gitnexus import build_gitnexus_report as _build_gitnexus_report
 
 app = FastAPI(title="ICD C Code Refactorer", docs_url=None, redoc_url=None)
 
@@ -1484,6 +1488,7 @@ def _sandbox_build_iterate(
     uploaded_names: set[str],
     has_repo: bool,
     repo_knowledge: str = "",
+    gitnexus_report: str = "",
 ):
     """Generator that yields SSE dicts for the sandbox build loop.
 
@@ -1761,6 +1766,7 @@ def _sandbox_build_iterate(
                     gen_files=gen_files_brief,
                     change_spec=change_spec,
                     repo_knowledge=repo_knowledge,
+                    gitnexus_report=gitnexus_report,
                     file_index=_file_index,
                     snapshots=original_repo_files,
                     build_runner=runner,
@@ -2094,6 +2100,7 @@ def _sandbox_build_iterate(
                     gen_files=gen_files_brief,
                     change_spec=change_spec,
                     repo_knowledge=repo_knowledge,
+                    gitnexus_report=gitnexus_report,
                     file_index=_file_index,
                     snapshots=original_repo_files,
                     build_runner=runner,
@@ -2521,6 +2528,10 @@ def _sandbox_build_iterate(
                 f"## Repository Codebase Knowledge\n{repo_knowledge}"
                 if repo_knowledge else ""
             )
+            sec_gitnexus_fix = (
+                f"## GitNexus Codebase Understanding\n{gitnexus_report}"
+                if gitnexus_report else ""
+            )
             sec_change = f"## Change Specification\n{change_spec}"
 
             sec_escalation = ""
@@ -2540,6 +2551,7 @@ def _sandbox_build_iterate(
                 ("errors", sec_errors, 0),
                 ("escalation", sec_escalation, 0) if sec_escalation else ("escalation", "", 99),
                 ("repo_ctx", sec_repo_ctx, 1),
+                ("gitnexus", sec_gitnexus_fix, 2),
                 ("knowledge", sec_knowledge, 2),
                 ("change_spec", sec_change, 3),
             ]
@@ -3428,6 +3440,29 @@ async def process(session_id: str):
                 "message": "Loaded prior change_spec.txt, target_summary.txt, and icd_analysis.txt.",
             })
             yield _sse({"type": "stage_complete", "stage": "analysis"})
+
+            # GitNexus is re-emitted on resume so the UI still surfaces the
+            # stage and the in-memory `gitnexus_report` is available to the
+            # subsequent transform/verify/compile prompts.
+            gitnexus_report_path = session_dir / "gitnexus_report.txt"
+            if gitnexus_report_path.exists():
+                gitnexus_report = gitnexus_report_path.read_text()
+                yield _sse({
+                    "type": "stage",
+                    "stage": "gitnexus",
+                    "message": "Resuming: reusing prior GitNexus codebase report...",
+                })
+                yield _sse({
+                    "type": "info",
+                    "stage": "gitnexus",
+                    "message": (
+                        f"Loaded prior gitnexus_report.txt "
+                        f"({len(gitnexus_report):,} chars)."
+                    ),
+                })
+                yield _sse({"type": "stage_complete", "stage": "gitnexus"})
+            else:
+                gitnexus_report = ""
         else:
             # ---- Step 1: Analyse ICD delta --------------------------------
             yield _sse({
@@ -3769,6 +3804,56 @@ async def process(session_id: str):
             (gen_dir / "icd_analysis.txt").write_text(full_analysis)
             yield _sse({"type": "stage_complete", "stage": "analysis"})
 
+            # ---- Step 1b: GitNexus codebase understanding ----------------
+            # Runs immediately after the ICD change_spec.  The resulting
+            # report is added to the context every subsequent .c/.h
+            # generation, verification, per-file compile fix, sandbox
+            # build and regeneration prompt sees.
+            yield _sse({
+                "type": "stage",
+                "stage": "gitnexus",
+                "message": (
+                    "GitNexus: extracting embedded-systems codebase context "
+                    "(ISR/task wiring, drivers, RTOS, state machines, "
+                    "comm stacks, memory ownership, HAL boundary, "
+                    "bootloader, FW update, safety chains, cross-module "
+                    "deps, global var graph, script deps)\u2026"
+                ),
+            })
+            try:
+                gitnexus_report = _build_gitnexus_report(
+                    repo_dir=repo_dir if has_repo else None,
+                    code_dir=code_dir,
+                )
+            except Exception as e:                  # noqa: BLE001
+                log.warning("GitNexus extraction failed: %s", e)
+                gitnexus_report = (
+                    "GITNEXUS — CODEBASE UNDERSTANDING REPORT\n"
+                    f"(extraction failed: {e})\n"
+                )
+                yield _sse({
+                    "type": "info",
+                    "stage": "gitnexus",
+                    "message": f"GitNexus extraction failed: {e}",
+                })
+            (session_dir / "gitnexus_report.txt").write_text(gitnexus_report)
+            (gen_dir / "gitnexus_report.txt").write_text(gitnexus_report)
+            log.info(
+                "GitNexus report: %d chars (saved to gitnexus_report.txt)",
+                len(gitnexus_report),
+            )
+            yield _sse({
+                "type": "info",
+                "stage": "gitnexus",
+                "message": (
+                    f"GitNexus report ready ({len(gitnexus_report):,} chars). "
+                    "It will be added as additional context to all .c/.h "
+                    "generation, verification, compile-fix and regeneration "
+                    "prompts."
+                ),
+            })
+            yield _sse({"type": "stage_complete", "stage": "gitnexus"})
+
 
         # Gather cross-file context (the uploaded source files)
         all_code_ctx = ""
@@ -3879,6 +3964,21 @@ async def process(session_id: str):
                     f"from the repository. Use these as ground truth for naming, "
                     f"types, and conventions.\n\n{repo_knowledge}"
                 )
+            sec_gitnexus = ""
+            if gitnexus_report:
+                sec_gitnexus = (
+                    f"## GitNexus Codebase Understanding\n"
+                    f"Embedded-systems-specific relationships extracted from the "
+                    f"uploaded repository (ISR/task wiring, drivers/peripherals, "
+                    f"RTOS or superloop, state machines, communication stacks, "
+                    f"memory ownership, HAL boundaries, bootloader/firmware-update "
+                    f"hooks, safety chains, cross-module #include graph, global "
+                    f"variable read/write graph, build-script deps). Honor the "
+                    f"relationships listed here when modifying ISRs, drivers, "
+                    f"shared globals, comm-stack callers, state-machine "
+                    f"dispatch tables and safety-critical paths.\n\n"
+                    f"{gitnexus_report}"
+                )
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             sec_file = (
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
@@ -3896,6 +3996,7 @@ async def process(session_id: str):
                 ("file_to_transform", sec_file, 0),
                 ("repo_dependencies", sec_repo, 1),
                 ("change_spec", sec_change, 1),
+                ("gitnexus", sec_gitnexus, 2),
                 ("repo_knowledge", sec_knowledge, 2),
                 ("target_summary", sec_target, 3),
                 ("cross_file_ctx", sec_code, 4),
@@ -4092,6 +4193,10 @@ async def process(session_id: str):
                         if verify_repo else ""
                     )
                     sec_spec_v = f"## Change Specification (must be applied)\n{change_spec}"
+                    sec_gitnexus_v = (
+                        f"## GitNexus Codebase Understanding\n{gitnexus_report}"
+                        if gitnexus_report else ""
+                    )
                     sec_code_v = (
                         f"## Code to Verify ({gfname})\n```c\n{generated_code}\n```\n\n"
                         "Output the verified/corrected file."
@@ -4103,6 +4208,7 @@ async def process(session_id: str):
                             ("code_to_verify", sec_code_v, 0),
                             ("issues", sec_issues, 1),
                             ("repo_headers", sec_repo_v, 2),
+                            ("gitnexus", sec_gitnexus_v, 2),
                             ("change_spec", sec_spec_v, 3),
                         ],
                         max_input_tokens=MAX_INPUT_TOKENS - v_sys_tokens,
@@ -4294,6 +4400,7 @@ async def process(session_id: str):
             has_repo=has_repo,
             change_spec=change_spec,
             repo_knowledge=repo_knowledge,
+            gitnexus_report=gitnexus_report,
             is_resume=is_resume,
             completed_stages=completed_now,
         ):
@@ -4344,7 +4451,8 @@ async def process(session_id: str):
                         change_spec=change_spec,
                         uploaded_names=uploaded_names,
                         has_repo=has_repo,
-                        repo_knowledge=repo_knowledge
+                        repo_knowledge=repo_knowledge,
+                        gitnexus_report=gitnexus_report,
                     )
                 )
                 for evt in build_iter:
@@ -4404,6 +4512,7 @@ async def download_all(session_id: str):
         session_dir / "change_spec.txt",
         session_dir / "target_summary.txt",
         session_dir / "repo_knowledge.txt",
+        session_dir / "gitnexus_report.txt",
         session_dir / "sandbox_build_log.txt",
         session_dir / PAUSE_SUMMARY_FILE,
         session_dir / PIPELINE_EVENTS_FILE,
@@ -4411,6 +4520,7 @@ async def download_all(session_id: str):
         gen_dir / "verification_report.txt",
         gen_dir / "compile_report.txt",
         gen_dir / "icd_analysis.txt",
+        gen_dir / "gitnexus_report.txt",
     ]
     if not files and not any(p.exists() for p in report_candidates):
         raise HTTPException(status_code=404, detail="No generated files or reports found")
@@ -4418,7 +4528,8 @@ async def download_all(session_id: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
-            if f.name in ("icd_analysis.txt", "verification_report.txt"):
+            if f.name in ("icd_analysis.txt", "verification_report.txt",
+                          "gitnexus_report.txt"):
                 continue
             zf.write(f, f.name)
         for candidate in [gen_dir / "icd_analysis.txt",
@@ -4429,6 +4540,14 @@ async def download_all(session_id: str):
                 break
         else:
             log.warning("icd_analysis.txt not found for session %s", session_id[:8])
+        for candidate in [gen_dir / "gitnexus_report.txt",
+                          session_dir / "gitnexus_report.txt"]:
+            if candidate.exists():
+                zf.write(candidate, "gitnexus_report.txt")
+                log.info("Added gitnexus_report.txt from %s", candidate)
+                break
+        else:
+            log.info("gitnexus_report.txt not found for session %s", session_id[:8])
         vr = gen_dir / "verification_report.txt"
         if vr.exists():
             zf.write(vr, "verification_report.txt")
@@ -4615,6 +4734,20 @@ async def regenerate(session_id: str):
         repo_knowledge = _build_repo_knowledge(repo_dir)
         repo_knowledge_path.write_text(repo_knowledge)
 
+    gitnexus_path = session_dir / "gitnexus_report.txt"
+    gitnexus_report = gitnexus_path.read_text() if gitnexus_path.exists() else ""
+    if not gitnexus_report:
+        try:
+            gitnexus_report = _build_gitnexus_report(
+                repo_dir=repo_dir if has_repo else None,
+                code_dir=code_dir,
+            )
+            gitnexus_path.write_text(gitnexus_report)
+            (gen_dir / "gitnexus_report.txt").write_text(gitnexus_report)
+        except Exception as e:                      # noqa: BLE001
+            log.warning("Regenerate: GitNexus extraction failed: %s", e)
+            gitnexus_report = ""
+
     prev_dir = session_dir / f"generated_code_v{regen_count - 1}"
     if not prev_dir.exists():
         shutil.copytree(gen_dir, prev_dir)
@@ -4750,6 +4883,20 @@ async def regenerate(session_id: str):
                     f"from the repository. Use these as ground truth for naming, "
                     f"types, and conventions.\n\n{repo_knowledge}"
                 )
+            sec_gitnexus = ""
+            if gitnexus_report:
+                sec_gitnexus = (
+                    f"## GitNexus Codebase Understanding\n"
+                    f"Embedded-systems-specific relationships extracted from the "
+                    f"uploaded repository (ISR/task wiring, drivers/peripherals, "
+                    f"RTOS or superloop, state machines, communication stacks, "
+                    f"memory ownership, HAL boundary, bootloader/firmware-update "
+                    f"hooks, safety chains, cross-module #include graph, global "
+                    f"variable read/write graph, build-script deps). Honor these "
+                    f"relationships when fixing user-reported errors so the "
+                    f"correction does not break shared globals, ISR/task wiring "
+                    f"or comm-stack callers.\n\n{gitnexus_report}"
+                )
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             sec_file = (
                 f"## Original File: {fname}\n\n```c\n{original}\n```\n\n"
@@ -4768,6 +4915,7 @@ async def regenerate(session_id: str):
                     ("change_spec", sec_change, 1),
                     ("previous_generated", sec_prev, 1),
                     ("repo_dependencies", sec_repo, 2),
+                    ("gitnexus", sec_gitnexus, 2),
                     ("repo_knowledge", sec_knowledge, 2),
                     ("target_summary", sec_target_v, 3),
                     ("cross_file_ctx", sec_code, 4),
@@ -4954,6 +5102,10 @@ async def regenerate(session_id: str):
                         if verify_repo else ""
                     )
                     sec_spec_v = f"## Change Specification (must be applied)\n{change_spec}"
+                    sec_gitnexus_rv = (
+                        f"## GitNexus Codebase Understanding\n{gitnexus_report}"
+                        if gitnexus_report else ""
+                    )
                     sec_conv_v = conversation_ctx
                     sec_code_v = (
                         f"## Code to Verify ({gfname})\n```c\n{generated_code}\n```\n\n"
@@ -4967,6 +5119,7 @@ async def regenerate(session_id: str):
                             ("issues", sec_issues, 1),
                             ("user_feedback", sec_conv_v, 1),
                             ("repo_headers", sec_repo_v, 2),
+                            ("gitnexus", sec_gitnexus_rv, 2),
                             ("change_spec", sec_spec_v, 3),
                         ],
                         max_input_tokens=MAX_INPUT_TOKENS - v_sys_tokens,
@@ -5159,7 +5312,8 @@ async def regenerate(session_id: str):
                     change_spec=change_spec,
                     uploaded_names=uploaded_names,
                     has_repo=has_repo,
-                    repo_knowledge=repo_knowledge
+                    repo_knowledge=repo_knowledge,
+                    gitnexus_report=gitnexus_report,
                 )
             )
             for evt in build_iter:
