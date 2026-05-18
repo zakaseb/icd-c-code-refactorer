@@ -138,6 +138,17 @@ SSE_UI_TOKEN_BATCH_MAX_BURST_CHARS = int(
     os.environ.get("SSE_UI_TOKEN_BATCH_MAX_BURST_CHARS", "98304")
 )
 
+# ---------------------------------------------------------------------------
+# Remote build configuration (feature/remote-xilinx-build)
+# ---------------------------------------------------------------------------
+REMOTE_BUILD_ENABLED = os.environ.get("REMOTE_BUILD_ENABLED", "0").strip().lower() \
+    not in ("0", "false", "no", "off")
+REMOTE_BUILD_HOST    = os.environ.get("REMOTE_BUILD_HOST", "")
+REMOTE_BUILD_USER    = os.environ.get("REMOTE_BUILD_USER", "")
+REMOTE_BUILD_PASS    = os.environ.get("REMOTE_BUILD_PASS", "")
+REMOTE_BUILD_SRC     = os.environ.get("REMOTE_BUILD_SRC", "")
+REMOTE_BUILD_SCRIPT  = os.environ.get("REMOTE_BUILD_SCRIPT", "python build.py")
+REMOTE_BUILD_MODE    = os.environ.get("REMOTE_BUILD_MODE", "debug")   # "debug" | "release"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2764,6 +2775,81 @@ def _sandbox_build_iterate(
         "message": f"Sandbox build succeeded on attempt {iteration} — repository packaged.",
     })
 
+def _remote_build_iterate(
+    session_dir: Path,
+    gen_dir: Path,
+    workspace_path: str,   # local abs path that maps to the session workspace
+):
+    """
+    Generator yielding SSE dicts.
+    Mirrors _sandbox_build_iterate()'s event contract so the caller
+    (process / regenerate endpoints) works unchanged.
+    """
+    import paramiko   # lazy import — only required when remote build is used
+
+    yield _sse({"type": "info", "stage": "sandbox_build",
+                "message": "Remote build: connecting via SSH…"})
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(REMOTE_BUILD_HOST, username=REMOTE_BUILD_USER,
+                    password=REMOTE_BUILD_PASS)
+    except Exception as e:
+        yield _sse({"type": "error",
+                    "message": f"Remote build: SSH connection failed — {e}"})
+        return
+
+    sftp = ssh.open_sftp()
+
+    # 1. Copy modified files to remote
+    gen_files = sorted(p for p in gen_dir.iterdir()
+                       if p.is_file() and p.suffix in ('.c', '.h'))
+    for gf in gen_files:
+        remote_path = f"{REMOTE_BUILD_SRC}/src/{gf.name}"   # adjust mapping as needed
+        local_path  = str(session_dir / "generated_code" / gf.name)
+        yield _sse({"type": "info", "stage": "sandbox_build",
+                    "message": f"Remote build: uploading {gf.name}…"})
+        try:
+            sftp.put(local_path, remote_path)
+        except Exception as e:
+            yield _sse({"type": "error",
+                        "message": f"Remote build: SFTP put {gf.name} failed — {e}"})
+            ssh.close(); return
+
+    # 2. Trigger build
+    build_arg = "release" if REMOTE_BUILD_MODE == "release" else ""
+    cmd = f"cd {REMOTE_BUILD_SRC} && {REMOTE_BUILD_SCRIPT} {build_arg}"
+    yield _sse({"type": "info", "stage": "sandbox_build",
+                "message": f"Remote build: running `{cmd}`…"})
+
+    stdin, stdout, stderr = ssh.exec_command(cmd)
+    output_lines = []
+    for line in stdout:
+        stripped = line.strip()
+        output_lines.append(stripped)
+        yield _sse({"type": "token", "stage": "sandbox_build", "token": stripped + "\n"})
+
+    errors = stderr.read().decode()
+    exit_status = stdout.channel.recv_exit_status()
+    ssh.close()
+
+    success = (exit_status == 0)
+    if errors:
+        yield _sse({"type": "token", "stage": "sandbox_build",
+                    "token": f"\nSTDERR:\n{errors}"})
+
+    yield _sse({
+        "type": "sandbox_build_result",
+        "stage": "sandbox_build",
+        "success": success,
+        "iterations": 1,
+        "message": (
+            "Remote Xilinx SDK build succeeded."
+            if success else
+            f"Remote build failed (exit {exit_status}). See output above."
+        ),
+    })
 
 def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
     """Write the sandbox directory to ``session_dir/built_repo.zip``."""
@@ -4215,7 +4301,7 @@ async def process(session_id: str):
 
         # ---- Step 4: Sandbox build ------------------------------------
         sandbox_build_success = None
-        if has_repo:
+        if has_repo or REMOTE_BUILD_ENABLED:
             sandbox_done = (
                 is_resume
                 and "sandbox_build" in set(
@@ -4248,15 +4334,20 @@ async def process(session_id: str):
                     "stage": "sandbox_build",
                     "message": "Building generated code inside repository sandbox…",
                 })
-                for evt in _sandbox_build_iterate(
-                    session_dir=session_dir,
-                    gen_dir=gen_dir,
-                    repo_dir=repo_dir,
-                    change_spec=change_spec,
-                    uploaded_names=uploaded_names,
-                    has_repo=has_repo,
-                    repo_knowledge=repo_knowledge,
-                ):
+                build_iter = (
+                    _remote_build_iterate(session_dir, gen_dir, workspace_path=str(session_dir))
+                    if REMOTE_BUILD_ENABLED
+                    else _sandbox_build_iterate(
+                        session_dir=session_dir,
+                        gen_dir=gen_dir,
+                        repo_dir=repo_dir,
+                        change_spec=change_spec,
+                        uploaded_names=uploaded_names,
+                        has_repo=has_repo,
+                        repo_knowledge=repo_knowledge
+                    )
+                )
+                for evt in build_iter:
                     yield evt
                     try:
                         payload = json.loads(
@@ -5051,21 +5142,27 @@ async def regenerate(session_id: str):
 
         # ---- Sandbox build (re-generation) ----
         sandbox_build_success = None
-        if has_repo:
+        if has_repo or REMOTE_BUILD_ENABLED:
             yield _sse({
                 "type": "stage",
                 "stage": "sandbox_build",
                 "message": "Building re-generated code inside repository sandbox\u2026",
             })
-            for evt in _sandbox_build_iterate(
-                session_dir=session_dir,
-                gen_dir=gen_dir,
-                repo_dir=repo_dir,
-                change_spec=change_spec,
-                uploaded_names=uploaded_names,
-                has_repo=has_repo,
-                repo_knowledge=repo_knowledge,
-            ):
+
+            build_iter = (
+                _remote_build_iterate(session_dir, gen_dir, workspace_path=str(session_dir))
+                if REMOTE_BUILD_ENABLED
+                else _sandbox_build_iterate(
+                    session_dir=session_dir,
+                    gen_dir=gen_dir,
+                    repo_dir=repo_dir,
+                    change_spec=change_spec,
+                    uploaded_names=uploaded_names,
+                    has_repo=has_repo,
+                    repo_knowledge=repo_knowledge
+                )
+            )
+            for evt in build_iter:
                 yield evt
                 try:
                     payload = json.loads(
