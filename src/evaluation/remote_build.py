@@ -18,12 +18,12 @@ sftp = ssh.open_sftp()
 
 # COPY GENERATED FILES TO WINDOWS
 print("Copying modified files...")
-gen_files = sorted(p for p in (WORKSPACE_PATH/"original_code").iterdir() if p.is_file() and p.suffix in ('.c', '.h'))
+gen_files = sorted(p for p in (WORKSPACE_PATH/"generated_code").iterdir() if p.is_file() and p.suffix in ('.c', '.h'))
 for gf in gen_files:
     print(gf.name)
     remote_path = f"{REMOTE_BUILD_SRC}/src/{gf.name}"
     print(remote_path)
-    local_path  = str(WORKSPACE_PATH / "original_code" / gf.name)
+    local_path  = str(WORKSPACE_PATH / "generated_code" / gf.name)
     sftp.put(local_path, remote_path)
     print(f"  {local_path} -> {remote_path}")
 
