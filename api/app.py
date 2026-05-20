@@ -850,13 +850,31 @@ def _build_source_scripts_context(
     return _truncate_text(result, max_chars, "source_scripts")
 
 
-def _build_repo_knowledge(repo_dir: Path, max_chars: int = 10_000) -> str:
+def _build_repo_knowledge(
+    repo_dir: Path,
+    max_chars: int = 10_000,
+    *,
+    full: bool = False,
+) -> str:
     """Extract comprehensive high-level and low-level knowledge from the repo.
 
     High-level: file structure, module organisation, naming conventions.
     Low-level: struct/union definitions with fields, enum definitions with
     values, full function signatures, global variable declarations, and
     macro definitions with their values.
+
+    Two flavours are supported:
+
+      * ``full=False`` (default) — the **distilled** view fed into LLM
+        prompts.  Per-category lists are capped (30 structs, 20 enums,
+        40 function signatures, 30 globals, 40 macros, 100 tree lines)
+        and the final string is clipped to ``max_chars`` so the prompt
+        budget stays under control.
+
+      * ``full=True`` — the **untruncated** view written to
+        ``repo_knowledge.txt`` and shipped in the downloadable ZIP for
+        QA review.  No per-category caps are applied and ``max_chars``
+        is intentionally ignored.
     """
     all_files = sorted(p for p in repo_dir.rglob("*") if p.is_file())
     code_exts = _HEADER_EXTS | _SOURCE_EXTS
@@ -906,37 +924,84 @@ def _build_repo_knowledge(repo_dir: Path, max_chars: int = 10_000) -> str:
         for m in define_re.finditer(content):
             macros.append(f"  {m.group(1)} = {m.group(2).strip()}")
 
-    structs = structs[:30]
-    enums = enums[:20]
-    func_sigs = sorted(set(func_sigs))[:40]
-    global_vars = sorted(set(global_vars))[:30]
-    macros = macros[:40]
+    func_sigs_sorted = sorted(set(func_sigs))
+    global_vars_sorted = sorted(set(global_vars))
+    if full:
+        structs_out = structs
+        enums_out = enums
+        func_sigs_out = func_sigs_sorted
+        global_vars_out = global_vars_sorted
+        macros_out = macros
+        tree_out = tree_lines
+    else:
+        structs_out = structs[:30]
+        enums_out = enums[:20]
+        func_sigs_out = func_sigs_sorted[:40]
+        global_vars_out = global_vars_sorted[:30]
+        macros_out = macros[:40]
+        tree_out = tree_lines[:100]
 
+    flavour = "FULL (untruncated, QA download)" if full else "DISTILLED (LLM context)"
     parts = [
         "=" * 65 + "\n",
-        "REPOSITORY CODEBASE KNOWLEDGE\n",
+        f"REPOSITORY CODEBASE KNOWLEDGE [{flavour}]\n",
         "=" * 65 + "\n\n",
         "## High-Level: File Structure & Organisation\n```\n",
-        "\n".join(tree_lines[:100]),
+        "\n".join(tree_out),
         "\n```\n",
     ]
-    if structs:
+    if not full and len(tree_lines) > len(tree_out):
+        parts.append(
+            f"_(file tree truncated to first {len(tree_out)} of "
+            f"{len(tree_lines)} entries — full list in repo_knowledge.txt)_\n"
+        )
+    if structs_out:
         parts.append("\n## Low-Level: Struct / Union Definitions\n")
-        parts.append("\n".join(structs) + "\n")
-    if enums:
+        parts.append("\n".join(structs_out) + "\n")
+        if not full and len(structs) > len(structs_out):
+            parts.append(
+                f"_(+{len(structs) - len(structs_out)} more in "
+                f"repo_knowledge.txt)_\n"
+            )
+    if enums_out:
         parts.append("\n## Low-Level: Enum Definitions\n")
-        parts.append("\n".join(enums) + "\n")
-    if func_sigs:
+        parts.append("\n".join(enums_out) + "\n")
+        if not full and len(enums) > len(enums_out):
+            parts.append(
+                f"_(+{len(enums) - len(enums_out)} more in "
+                f"repo_knowledge.txt)_\n"
+            )
+    if func_sigs_out:
         parts.append("\n## Low-Level: Function Signatures\n")
-        parts.append("\n".join(func_sigs) + "\n")
-    if global_vars:
+        parts.append("\n".join(func_sigs_out) + "\n")
+        if not full and len(func_sigs_sorted) > len(func_sigs_out):
+            parts.append(
+                f"_(+{len(func_sigs_sorted) - len(func_sigs_out)} more in "
+                f"repo_knowledge.txt)_\n"
+            )
+    if global_vars_out:
         parts.append("\n## Low-Level: Global Variable Declarations\n")
-        parts.append("\n".join(global_vars) + "\n")
-    if macros:
+        parts.append("\n".join(global_vars_out) + "\n")
+        if not full and len(global_vars_sorted) > len(global_vars_out):
+            parts.append(
+                f"_(+{len(global_vars_sorted) - len(global_vars_out)} more in "
+                f"repo_knowledge.txt)_\n"
+            )
+    if macros_out:
         parts.append("\n## Low-Level: Macro Definitions\n")
-        parts.append("\n".join(macros) + "\n")
+        parts.append("\n".join(macros_out) + "\n")
+        if not full and len(macros) > len(macros_out):
+            parts.append(
+                f"_(+{len(macros) - len(macros_out)} more in "
+                f"repo_knowledge.txt)_\n"
+            )
 
     result = "".join(parts)
+    # ``full`` reports are never length-clipped — that flavour is the
+    # canonical record for the downloadable QA report.  Only the
+    # distilled flavour is bounded by ``max_chars``.
+    if full:
+        return result
     return _truncate_text(result, max_chars, "repo_knowledge")
 
 
@@ -3371,13 +3436,25 @@ async def process(session_id: str):
     # authoritative pre-change source for the ICD-delta analysis,
     # regardless of whether a broader repository ZIP was also provided.
     code_source_scripts = _build_source_scripts_context(code_dir)
+    # Two flavours of repo_knowledge are produced:
+    #
+    #   * ``repo_knowledge_full`` — every extracted fact, no caps and no
+    #     ``max_chars`` clip.  This is what gets persisted to
+    #     ``repo_knowledge.txt`` and shipped in the downloadable QA ZIP.
+    #
+    #   * ``repo_knowledge``      — the distilled view (per-category caps
+    #     plus the ``max_chars`` budget) used by every LLM prompt so the
+    #     context window stays under control.
+    repo_knowledge_full = ""
     repo_knowledge = ""
     if has_repo:
-        repo_knowledge = _build_repo_knowledge(repo_dir)
-        (session_dir / "repo_knowledge.txt").write_text(repo_knowledge)
+        repo_knowledge_full = _build_repo_knowledge(repo_dir, full=True)
+        repo_knowledge = _build_repo_knowledge(repo_dir, full=False)
+        (session_dir / "repo_knowledge.txt").write_text(repo_knowledge_full)
     log.info(
-        "Source scripts for ICD analysis: %d chars, repo knowledge: %d chars",
-        len(code_source_scripts), len(repo_knowledge),
+        "Source scripts for ICD analysis: %d chars, repo knowledge: "
+        "distilled=%d chars, full=%d chars (saved to repo_knowledge.txt)",
+        len(code_source_scripts), len(repo_knowledge), len(repo_knowledge_full),
     )
 
     uploaded_names = {p.name for p in code_files}
@@ -3441,12 +3518,60 @@ async def process(session_id: str):
             })
             yield _sse({"type": "stage_complete", "stage": "analysis"})
 
-            # GitNexus is re-emitted on resume so the UI still surfaces the
-            # stage and the in-memory `gitnexus_report` is available to the
-            # subsequent transform/verify/compile prompts.
+            # GitNexus is re-emitted on resume so the UI still surfaces
+            # the stage and the in-memory ``gitnexus_report`` is
+            # available to the subsequent transform/verify/compile
+            # prompts.  The saved ``gitnexus_report.txt`` on disk is the
+            # FULL (untruncated, QA download) flavour, so we don't read
+            # it back into memory — that would defeat the prompt-budget
+            # protection.  Instead we re-derive the DISTILLED flavour
+            # from the live ``repo_dir`` / ``code_dir`` (a cheap
+            # regex pass) and only fall back to the saved file when
+            # neither source is available.
             gitnexus_report_path = session_dir / "gitnexus_report.txt"
-            if gitnexus_report_path.exists():
+            gitnexus_report = ""
+            has_live_source = (
+                (has_repo and repo_dir.exists())
+                or (code_dir and code_dir.exists())
+            )
+            if has_live_source:
+                try:
+                    gitnexus_report = _build_gitnexus_report(
+                        repo_dir=repo_dir if has_repo else None,
+                        code_dir=code_dir,
+                        full=False,
+                    )
+                except Exception as e:               # noqa: BLE001
+                    log.warning(
+                        "Resume: GitNexus re-distillation failed: %s — "
+                        "falling back to saved gitnexus_report.txt", e,
+                    )
+                    if gitnexus_report_path.exists():
+                        gitnexus_report = gitnexus_report_path.read_text()
+                # Regenerate the saved FULL flavour if it's missing so
+                # the QA download is never empty after a resume.
+                if not gitnexus_report_path.exists():
+                    try:
+                        full_again = _build_gitnexus_report(
+                            repo_dir=repo_dir if has_repo else None,
+                            code_dir=code_dir,
+                            full=True,
+                        )
+                        gitnexus_report_path.write_text(full_again)
+                        (gen_dir / "gitnexus_report.txt").write_text(full_again)
+                    except Exception as e:           # noqa: BLE001
+                        log.warning(
+                            "Resume: could not regenerate full "
+                            "gitnexus_report.txt: %s", e,
+                        )
+            elif gitnexus_report_path.exists():
+                # No live source to re-distill from — best-effort use of
+                # the saved full report for prompts.  This puts more
+                # pressure on the context window but is preferable to
+                # losing the GitNexus context entirely.
                 gitnexus_report = gitnexus_report_path.read_text()
+
+            if gitnexus_report or gitnexus_report_path.exists():
                 yield _sse({
                     "type": "stage",
                     "stage": "gitnexus",
@@ -3456,13 +3581,12 @@ async def process(session_id: str):
                     "type": "info",
                     "stage": "gitnexus",
                     "message": (
-                        f"Loaded prior gitnexus_report.txt "
-                        f"({len(gitnexus_report):,} chars)."
+                        f"GitNexus on resume: distilled "
+                        f"{len(gitnexus_report):,} chars for LLM prompts; "
+                        f"full report available at gitnexus_report.txt."
                     ),
                 })
                 yield _sse({"type": "stage_complete", "stage": "gitnexus"})
-            else:
-                gitnexus_report = ""
         else:
             # ---- Step 1: Analyse ICD delta --------------------------------
             yield _sse({
@@ -3796,8 +3920,13 @@ async def process(session_id: str):
             (session_dir / "change_spec.txt").write_text(change_spec)
             (session_dir / "target_summary.txt").write_text(target_summary)
 
+            # ``icd_analysis.txt`` is a downloadable QA artefact, so it
+            # embeds the FULL repo_knowledge (no caps / no clip), not the
+            # distilled view fed into LLM prompts.
             analysis_report_parts = [change_spec]
-            if repo_knowledge:
+            if repo_knowledge_full:
+                analysis_report_parts.append("\n\n" + repo_knowledge_full)
+            elif repo_knowledge:
                 analysis_report_parts.append("\n\n" + repo_knowledge)
             full_analysis = "\n".join(analysis_report_parts)
             (session_dir / "icd_analysis.txt").write_text(full_analysis)
@@ -3820,36 +3949,51 @@ async def process(session_id: str):
                     "deps, global var graph, script deps)\u2026"
                 ),
             })
+            # Build two flavours of the GitNexus report (one extraction
+            # pass each is cheap: deterministic regex over a handful of
+            # files).  The FULL flavour is the canonical record written
+            # to disk and shipped in the downloadable ZIP for QA; the
+            # DISTILLED flavour is what every downstream LLM prompt
+            # actually consumes so the context window stays bounded.
             try:
+                gitnexus_report_full = _build_gitnexus_report(
+                    repo_dir=repo_dir if has_repo else None,
+                    code_dir=code_dir,
+                    full=True,
+                )
                 gitnexus_report = _build_gitnexus_report(
                     repo_dir=repo_dir if has_repo else None,
                     code_dir=code_dir,
+                    full=False,
                 )
             except Exception as e:                  # noqa: BLE001
                 log.warning("GitNexus extraction failed: %s", e)
-                gitnexus_report = (
-                    "GITNEXUS — CODEBASE UNDERSTANDING REPORT\n"
+                gitnexus_report_full = (
+                    "GITNEXUS — CODEBASE UNDERSTANDING REPORT [FULL]\n"
                     f"(extraction failed: {e})\n"
                 )
+                gitnexus_report = gitnexus_report_full
                 yield _sse({
                     "type": "info",
                     "stage": "gitnexus",
                     "message": f"GitNexus extraction failed: {e}",
                 })
-            (session_dir / "gitnexus_report.txt").write_text(gitnexus_report)
-            (gen_dir / "gitnexus_report.txt").write_text(gitnexus_report)
+            (session_dir / "gitnexus_report.txt").write_text(gitnexus_report_full)
+            (gen_dir / "gitnexus_report.txt").write_text(gitnexus_report_full)
             log.info(
-                "GitNexus report: %d chars (saved to gitnexus_report.txt)",
-                len(gitnexus_report),
+                "GitNexus report: distilled=%d chars (LLM prompts), "
+                "full=%d chars (saved to gitnexus_report.txt)",
+                len(gitnexus_report), len(gitnexus_report_full),
             )
             yield _sse({
                 "type": "info",
                 "stage": "gitnexus",
                 "message": (
-                    f"GitNexus report ready ({len(gitnexus_report):,} chars). "
-                    "It will be added as additional context to all .c/.h "
-                    "generation, verification, compile-fix and regeneration "
-                    "prompts."
+                    f"GitNexus report ready: full {len(gitnexus_report_full):,} "
+                    f"chars saved to gitnexus_report.txt for QA download; "
+                    f"distilled {len(gitnexus_report):,} chars will be added "
+                    "as additional context to all .c/.h generation, "
+                    "verification, compile-fix and regeneration prompts."
                 ),
             })
             yield _sse({"type": "stage_complete", "stage": "gitnexus"})
@@ -4728,25 +4872,70 @@ async def regenerate(session_id: str):
         )
     )
 
+    # ``repo_knowledge.txt`` and ``gitnexus_report.txt`` on disk are
+    # intentionally the FULL (untruncated, QA download) flavour, so we
+    # cannot just read them into memory — that would defeat the
+    # prompt-budget protection.  Instead we always re-derive the
+    # DISTILLED flavour from the live ``repo_dir`` / ``code_dir`` (a
+    # cheap regex pass) when source is available, and only fall back to
+    # the saved file when source is missing.  We also regenerate the
+    # saved FULL flavour if it's missing so the downloadable ZIP stays
+    # complete across regeneration rounds.
     repo_knowledge_path = session_dir / "repo_knowledge.txt"
-    repo_knowledge = repo_knowledge_path.read_text() if repo_knowledge_path.exists() else ""
-    if not repo_knowledge and has_repo:
-        repo_knowledge = _build_repo_knowledge(repo_dir)
-        repo_knowledge_path.write_text(repo_knowledge)
+    repo_knowledge = ""
+    if has_repo and repo_dir.exists():
+        repo_knowledge = _build_repo_knowledge(repo_dir, full=False)
+        if not repo_knowledge_path.exists():
+            try:
+                full = _build_repo_knowledge(repo_dir, full=True)
+                repo_knowledge_path.write_text(full)
+            except Exception as e:                   # noqa: BLE001
+                log.warning(
+                    "Regenerate: could not regenerate full "
+                    "repo_knowledge.txt: %s", e,
+                )
+    elif repo_knowledge_path.exists():
+        # No live repo to re-distill from — best-effort use of the
+        # saved full report.  This puts more pressure on the prompt
+        # budget but is preferable to losing repo knowledge entirely.
+        repo_knowledge = repo_knowledge_path.read_text()
 
     gitnexus_path = session_dir / "gitnexus_report.txt"
-    gitnexus_report = gitnexus_path.read_text() if gitnexus_path.exists() else ""
-    if not gitnexus_report:
+    gitnexus_report = ""
+    has_live_source = (
+        (has_repo and repo_dir.exists())
+        or (code_dir and code_dir.exists())
+    )
+    if has_live_source:
         try:
             gitnexus_report = _build_gitnexus_report(
                 repo_dir=repo_dir if has_repo else None,
                 code_dir=code_dir,
+                full=False,
             )
-            gitnexus_path.write_text(gitnexus_report)
-            (gen_dir / "gitnexus_report.txt").write_text(gitnexus_report)
-        except Exception as e:                      # noqa: BLE001
-            log.warning("Regenerate: GitNexus extraction failed: %s", e)
-            gitnexus_report = ""
+        except Exception as e:                       # noqa: BLE001
+            log.warning(
+                "Regenerate: GitNexus re-distillation failed: %s — "
+                "falling back to saved gitnexus_report.txt", e,
+            )
+            if gitnexus_path.exists():
+                gitnexus_report = gitnexus_path.read_text()
+        if not gitnexus_path.exists():
+            try:
+                full_gn = _build_gitnexus_report(
+                    repo_dir=repo_dir if has_repo else None,
+                    code_dir=code_dir,
+                    full=True,
+                )
+                gitnexus_path.write_text(full_gn)
+                (gen_dir / "gitnexus_report.txt").write_text(full_gn)
+            except Exception as e:                   # noqa: BLE001
+                log.warning(
+                    "Regenerate: could not regenerate full "
+                    "gitnexus_report.txt: %s", e,
+                )
+    elif gitnexus_path.exists():
+        gitnexus_report = gitnexus_path.read_text()
 
     prev_dir = session_dir / f"generated_code_v{regen_count - 1}"
     if not prev_dir.exists():

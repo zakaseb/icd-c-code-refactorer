@@ -362,16 +362,221 @@ def test_empty_repo_yields_marker() -> None:
 
 
 def test_max_chars_truncation() -> None:
-    print("\n[3] max_chars truncation marker")
+    print("\n[3] max_chars truncation marker (distilled flavour only)")
     repo = Path(tempfile.mkdtemp(prefix="gitnexus_big_"))
     make_repo(repo)
     report = build_gitnexus_report(repo_dir=repo, code_dir=None,
                                    max_chars=2_000)
-    check("Heavily clipped report carries truncation marker",
+    check("Heavily clipped distilled report carries truncation marker",
           "GITNEXUS report truncated" in report)
-    check("Heavily clipped report fits inside max_chars + slack",
+    check("Heavily clipped distilled report fits inside max_chars + slack",
           len(report) <= 2_100,
           f"len={len(report)}")
+
+    # The full flavour must IGNORE max_chars — it is the QA download.
+    report_full = build_gitnexus_report(
+        repo_dir=repo, code_dir=None, max_chars=2_000, full=True,
+    )
+    check("Full flavour ignores max_chars",
+          "GITNEXUS report truncated" not in report_full)
+    check("Full flavour clearly exceeds the distilled budget when source is rich",
+          len(report_full) > 2_100,
+          f"len_full={len(report_full)} len_distilled={len(report)}")
+
+
+# ---------------------------------------------------------------------------
+# Full vs distilled — synthetic large repo that triggers per-section caps
+# ---------------------------------------------------------------------------
+
+def _make_oversized_repo(root: Path) -> None:
+    """Build a synthetic repo big enough to trip every per-section cap.
+
+    - 12-member state enum (cap = 8)
+    - 50+ globals in a single file (cap = 10 per file)
+    - 20+ peripheral BASEADDR references in a single file (cap = 8)
+    - 50+ #defines (cap = 40 in repo_knowledge)
+    """
+    make_repo(root)  # start from the standard fixture
+    (root / "stress").mkdir(parents=True, exist_ok=True)
+
+    # 12-member state enum -> _extract_state_machines members cap = 8.
+    state_lines = ["typedef enum {"]
+    for i in range(12):
+        state_lines.append(f"    BIG_STATE_{i:02d},")
+    state_lines.append("} BigState_e;\n")
+    state_lines.append("static BigState_e g_big = BIG_STATE_00;\n")
+    state_lines.append("void BigStep(void){\n")
+    for i in range(12):
+        state_lines.append(f"    g_big = BIG_STATE_{i:02d};\n")
+    state_lines.append("}\n")
+    (root / "stress" / "big_state.c").write_text("\n".join(state_lines))
+
+    # 50 globals + 25 peripheral BASEADDR hits in one file ->
+    # globals cap = 10 per file, peripheral cap = 8.
+    g_lines = ["#include <stdint.h>", "#include \"xparameters.h\""]
+    for i in range(50):
+        g_lines.append(f"static volatile uint32_t g_stress_var_{i:02d} = 0u;")
+    g_lines.append("void StressTouch(void) {")
+    for i in range(25):
+        g_lines.append(
+            f"    Xil_Out32(STRESS_{i:02d}_BASEADDR + 0x10u, "
+            f"g_stress_var_{i:02d});"
+        )
+    g_lines.append("}")
+    (root / "stress" / "big_globals.c").write_text("\n".join(g_lines) + "\n")
+
+    # 60+ macros (repo_knowledge macros cap = 40).
+    m_lines = []
+    for i in range(60):
+        m_lines.append(f"#define STRESS_MACRO_{i:02d} {i}")
+    (root / "stress" / "big_macros.h").write_text("\n".join(m_lines) + "\n")
+
+
+def test_gitnexus_full_vs_distilled() -> None:
+    print("\n[3b] GitNexus full vs distilled on an oversized synthetic repo")
+    repo = Path(tempfile.mkdtemp(prefix="gitnexus_full_vs_dist_"))
+    _make_oversized_repo(repo)
+
+    distilled = build_gitnexus_report(
+        repo_dir=repo, code_dir=None, max_chars=16_000, full=False,
+    )
+    full = build_gitnexus_report(
+        repo_dir=repo, code_dir=None, max_chars=16_000, full=True,
+    )
+
+    check("Distilled flavour banner mentions DISTILLED",
+          "[DISTILLED" in distilled)
+    check("Full flavour banner mentions FULL",
+          "[FULL" in full)
+    check("Full report is strictly longer than distilled",
+          len(full) > len(distilled),
+          f"len_full={len(full)} len_distilled={len(distilled)}")
+
+    check("Full report shows ALL 12 BigState members",
+          all(f"BIG_STATE_{i:02d}" in full for i in range(12)))
+    check("Distilled report drops some BigState members (cap=8)",
+          not all(f"BIG_STATE_{i:02d}" in distilled for i in range(12)))
+    check("Distilled report shows a '(+N more)' marker for state members",
+          "more)" in distilled)
+
+    check("Full report carries no '+N more' truncation suffix",
+          " more)" not in full and "report truncated" not in full)
+
+    check("Full report shows all 50 stress globals",
+          all(f"g_stress_var_{i:02d}" in full for i in range(50)))
+    check("Distilled report shows at most 10 stress globals per file",
+          sum(
+              f"g_stress_var_{i:02d}" in distilled for i in range(50)
+          ) <= 10)
+
+
+def test_repo_knowledge_full_vs_distilled() -> None:
+    print("\n[3c] _build_repo_knowledge full vs distilled")
+    from app import _build_repo_knowledge
+
+    repo = Path(tempfile.mkdtemp(prefix="repo_knowledge_full_vs_dist_"))
+    _make_oversized_repo(repo)
+
+    distilled = _build_repo_knowledge(repo, full=False)
+    full = _build_repo_knowledge(repo, full=True)
+
+    check("Distilled repo_knowledge banner mentions DISTILLED",
+          "[DISTILLED" in distilled)
+    check("Full repo_knowledge banner mentions FULL",
+          "[FULL" in full)
+    check("Full repo_knowledge is strictly longer than distilled",
+          len(full) > len(distilled),
+          f"len_full={len(full)} len_distilled={len(distilled)}")
+
+    check("Full repo_knowledge shows all 60 STRESS_MACRO_* macros",
+          all(f"STRESS_MACRO_{i:02d}" in full for i in range(60)))
+    check("Distilled repo_knowledge caps macros (<= 40 STRESS_MACRO_* shown)",
+          sum(
+              f"STRESS_MACRO_{i:02d}" in distilled for i in range(60)
+          ) <= 40)
+
+    # Use a deliberately small max_chars budget that the distilled
+    # flavour would honour; the full flavour must ignore it.
+    full_small = _build_repo_knowledge(repo, max_chars=500, full=True)
+    distilled_small = _build_repo_knowledge(repo, max_chars=500, full=False)
+    check("Full repo_knowledge ignores max_chars budget",
+          len(full_small) > 1_000 and len(full_small) == len(full),
+          f"full_small={len(full_small)} full={len(full)}")
+    check("Distilled repo_knowledge respects max_chars budget",
+          len(distilled_small) <= 600,
+          f"distilled_small={len(distilled_small)}")
+
+
+def test_session_disk_artefacts_are_full_flavour() -> None:
+    print("\n[3d] session-on-disk repo_knowledge.txt + gitnexus_report.txt "
+          "are the FULL flavour")
+    from app import (
+        SESSIONS_DIR, _build_repo_knowledge,
+    )
+    from gitnexus import build_gitnexus_report as gn_build
+
+    # Build a session manually (without invoking process(), which needs an
+    # LLM) and emulate what process() now does for the report artefacts.
+    r = client.post("/api/session/create")
+    check("POST /api/session/create returns 200", r.status_code == 200,
+          getattr(r, "text", ""))
+    session_id = r.json()["session_id"]
+    repo_bytes = _make_repo_zip_bytes_oversized()
+    r = client.post(
+        f"/api/upload/repo-zip/{session_id}",
+        files={"file": ("repo.zip", repo_bytes, "application/zip")},
+    )
+    check("POST /api/upload/repo-zip returns 200", r.status_code == 200,
+          getattr(r, "text", ""))
+
+    session_dir = Path(SESSIONS_DIR) / session_id
+    repo_dir = session_dir / "repo_contents"
+
+    # Emulate the process()-time emission: save FULL flavour to disk.
+    full_rk = _build_repo_knowledge(repo_dir, full=True)
+    (session_dir / "repo_knowledge.txt").write_text(full_rk)
+    full_gn = gn_build(repo_dir=repo_dir, code_dir=None, full=True)
+    (session_dir / "gitnexus_report.txt").write_text(full_gn)
+
+    on_disk_rk = (session_dir / "repo_knowledge.txt").read_text()
+    on_disk_gn = (session_dir / "gitnexus_report.txt").read_text()
+
+    check("repo_knowledge.txt on disk uses [FULL ...] banner",
+          "[FULL" in on_disk_rk)
+    check("gitnexus_report.txt on disk uses [FULL ...] banner",
+          "[FULL" in on_disk_gn)
+    # The FULL banner intentionally contains the word "untruncated", so
+    # we look for the specific per-category truncation markers the
+    # distilled flavour would emit (e.g. "(+N more in repo_knowledge"
+    # for repo_knowledge, "report truncated" + " more)" for gitnexus).
+    check("repo_knowledge.txt on disk has NO per-category truncation marker",
+          "more in repo_knowledge" not in on_disk_rk
+          and "file tree truncated" not in on_disk_rk)
+    check("gitnexus_report.txt on disk has NO truncation marker",
+          "report truncated" not in on_disk_gn
+          and " more)" not in on_disk_gn)
+
+    # And the distilled in-memory flavour must be shorter than the disk file.
+    distilled_rk = _build_repo_knowledge(repo_dir, full=False)
+    distilled_gn = gn_build(repo_dir=repo_dir, code_dir=None, full=False)
+    check("Distilled repo_knowledge < FULL on-disk",
+          len(distilled_rk) < len(on_disk_rk),
+          f"distilled={len(distilled_rk)} on_disk={len(on_disk_rk)}")
+    check("Distilled gitnexus_report < FULL on-disk",
+          len(distilled_gn) < len(on_disk_gn),
+          f"distilled={len(distilled_gn)} on_disk={len(on_disk_gn)}")
+
+
+def _make_repo_zip_bytes_oversized() -> bytes:
+    buf = io.BytesIO()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _make_oversized_repo(root)
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fp in sorted(root.rglob("*")):
+                if fp.is_file():
+                    zf.writestr(str(fp.relative_to(root)), fp.read_text())
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +664,9 @@ def main() -> int:
     test_extractor_covers_all_categories()
     test_empty_repo_yields_marker()
     test_max_chars_truncation()
+    test_gitnexus_full_vs_distilled()
+    test_repo_knowledge_full_vs_distilled()
+    test_session_disk_artefacts_are_full_flavour()
     test_repo_upload_and_gitnexus_extraction_via_session()
     test_app_imports_use_gitnexus()
     test_per_file_compile_signature_accepts_gitnexus()

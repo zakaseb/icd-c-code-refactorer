@@ -276,6 +276,20 @@ def _strip_comments(text: str) -> str:
     return text
 
 
+def _trim(items, n: int, *, full: bool) -> tuple[list, int]:
+    """Return ``(visible, hidden_count)`` for an iterable.
+
+    In ``full`` mode every item is visible and ``hidden_count == 0`` so the
+    caller emits no "… (+N more)" marker.  In the distilled mode the
+    first ``n`` items are returned and ``hidden_count`` reflects the
+    remainder for the suffix.
+    """
+    seq = list(items)
+    if full or len(seq) <= n:
+        return seq, 0
+    return seq[:n], len(seq) - n
+
+
 # ---------------------------------------------------------------------------
 # Per-category extractors
 # ---------------------------------------------------------------------------
@@ -375,7 +389,7 @@ def _extract_rtos_tasks(files: list[tuple[Path, str]],
 
 
 def _extract_state_machines(files: list[tuple[Path, str]],
-                           repo_dir: Path) -> list[str]:
+                           repo_dir: Path, *, full: bool = False) -> list[str]:
     enums: list[tuple[str, list[str], str]] = []        # (typename, members, rel)
     transitions: dict[str, set[str]] = defaultdict(set) # state-var -> assignments
     cases_per_file: dict[str, set[str]] = defaultdict(set)
@@ -401,30 +415,34 @@ def _extract_state_machines(files: list[tuple[Path, str]],
     if enums:
         lines.append("### State enums")
         for typename, members, rel in enums:
-            preview = ", ".join(members[:8])
-            more = f", … (+{len(members) - 8} more)" if len(members) > 8 else ""
-            lines.append(f"  - {typename} in {rel}: {{ {preview}{more} }}")
+            preview, hidden = _trim(members, 8, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            lines.append(f"  - {typename} in {rel}: {{ {preview_str}{more} }}")
     if transitions:
         lines.append("\n### State variable assignments (transitions)")
         for var in sorted(transitions):
-            tgts = sorted(transitions[var])
-            preview = ", ".join(tgts[:10])
-            more = f", … (+{len(tgts) - 10} more)" if len(tgts) > 10 else ""
-            lines.append(f"  - {var} := {preview}{more}")
+            tgts_sorted = sorted(transitions[var])
+            preview, hidden = _trim(tgts_sorted, 10, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            lines.append(f"  - {var} := {preview_str}{more}")
     if cases_per_file:
         lines.append("\n### State switch dispatch (cases per file)")
         for rel in sorted(cases_per_file):
-            cases = sorted(cases_per_file[rel])
-            preview = ", ".join(cases[:10])
-            more = f", … (+{len(cases) - 10} more)" if len(cases) > 10 else ""
-            lines.append(f"  - {rel}: {preview}{more}")
+            cases_sorted = sorted(cases_per_file[rel])
+            preview, hidden = _trim(cases_sorted, 10, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            lines.append(f"  - {rel}: {preview_str}{more}")
     if not lines:
         lines.append("  (no state machines detected)")
     return lines
 
 
 def _extract_drivers_peripherals(files: list[tuple[Path, str]],
-                                repo_dir: Path) -> tuple[list[str], list[str]]:
+                                repo_dir: Path, *,
+                                full: bool = False) -> tuple[list[str], list[str]]:
     """Return (drivers_section_lines, hal_boundary_lines)."""
     stack_hits: dict[str, set[str]] = defaultdict(set)        # stack -> files
     periph_hits: dict[str, set[str]] = defaultdict(set)       # file -> bases
@@ -450,17 +468,19 @@ def _extract_drivers_peripherals(files: list[tuple[Path, str]],
     if stack_hits:
         drv_lines.append("### Communication-stack usage (per stack)")
         for stack in sorted(stack_hits):
-            rels = sorted(stack_hits[stack])
-            preview = ", ".join(rels[:8])
-            more = f" (+{len(rels) - 8} more)" if len(rels) > 8 else ""
-            drv_lines.append(f"  - {stack}: {preview}{more}")
+            rels_sorted = sorted(stack_hits[stack])
+            preview, hidden = _trim(rels_sorted, 8, full=full)
+            preview_str = ", ".join(preview)
+            more = f" (+{hidden} more)" if hidden else ""
+            drv_lines.append(f"  - {stack}: {preview_str}{more}")
     if periph_hits:
         drv_lines.append("\n### Peripheral / register access (per file)")
         for rel in sorted(periph_hits):
-            bases = sorted(periph_hits[rel])
-            preview = ", ".join(bases[:8])
-            more = f", … (+{len(bases) - 8} more)" if len(bases) > 8 else ""
-            drv_lines.append(f"  - {rel}: {preview}{more}")
+            bases_sorted = sorted(periph_hits[rel])
+            preview, hidden = _trim(bases_sorted, 8, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            drv_lines.append(f"  - {rel}: {preview_str}{more}")
     if not drv_lines:
         drv_lines.append("  (no driver/peripheral patterns detected)")
 
@@ -479,7 +499,8 @@ def _extract_drivers_peripherals(files: list[tuple[Path, str]],
 
 
 def _extract_memory_ownership(files: list[tuple[Path, str]],
-                             repo_dir: Path) -> list[str]:
+                             repo_dir: Path, *,
+                             full: bool = False) -> list[str]:
     globals_by_file: dict[str, list[str]] = defaultdict(list)
     alloc_hits: dict[str, set[str]] = defaultdict(set)
     free_hits: dict[str, set[str]] = defaultdict(set)
@@ -521,11 +542,11 @@ def _extract_memory_ownership(files: list[tuple[Path, str]],
         lines.append("### Global / static variable definitions")
         for rel in sorted(globals_by_file):
             vars_ = globals_by_file[rel]
-            preview = vars_[:10]
+            preview, hidden = _trim(vars_, 10, full=full)
             for v in preview:
                 lines.append(f"  - {rel}: {v}")
-            if len(vars_) > 10:
-                lines.append(f"  - {rel}: … (+{len(vars_) - 10} more globals)")
+            if hidden:
+                lines.append(f"  - {rel}: … (+{hidden} more globals)")
     if alloc_hits or free_hits:
         lines.append("\n### Heap allocation usage")
         all_files_ = set(alloc_hits) | set(free_hits)
@@ -545,17 +566,19 @@ def _extract_memory_ownership(files: list[tuple[Path, str]],
     if sections:
         lines.append("\n### Named memory sections (linker placement)")
         for sec in sorted(sections):
-            rels = sorted(sections[sec])
-            preview = ", ".join(rels[:6])
-            more = f" (+{len(rels) - 6} more)" if len(rels) > 6 else ""
-            lines.append(f"  - .{sec}: {preview}{more}")
+            rels_sorted = sorted(sections[sec])
+            preview, hidden = _trim(rels_sorted, 6, full=full)
+            preview_str = ", ".join(preview)
+            more = f" (+{hidden} more)" if hidden else ""
+            lines.append(f"  - .{sec}: {preview_str}{more}")
     if not lines:
         lines.append("  (no global / heap / DMA / section hooks detected)")
     return lines
 
 
 def _extract_boot_and_update(files: list[tuple[Path, str]],
-                            repo_dir: Path) -> tuple[list[str], list[str]]:
+                            repo_dir: Path, *,
+                            full: bool = False) -> tuple[list[str], list[str]]:
     boot_hits: dict[str, set[str]] = defaultdict(set)
     upd_hits: dict[str, set[str]] = defaultdict(set)
     for fp, raw in files:
@@ -572,10 +595,11 @@ def _extract_boot_and_update(files: list[tuple[Path, str]],
     if boot_hits:
         boot_lines.append("### Bootloader / firmware hand-off markers")
         for rel in sorted(boot_hits):
-            toks = sorted(boot_hits[rel])
-            preview = ", ".join(toks[:8])
-            more = f", … (+{len(toks) - 8} more)" if len(toks) > 8 else ""
-            boot_lines.append(f"  - {rel}: {preview}{more}")
+            toks_sorted = sorted(boot_hits[rel])
+            preview, hidden = _trim(toks_sorted, 8, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            boot_lines.append(f"  - {rel}: {preview_str}{more}")
     else:
         boot_lines.append("  (no bootloader / hand-off symbols detected)")
 
@@ -583,17 +607,19 @@ def _extract_boot_and_update(files: list[tuple[Path, str]],
     if upd_hits:
         upd_lines.append("### Firmware-update / OTA / bitstream markers")
         for rel in sorted(upd_hits):
-            toks = sorted(upd_hits[rel])
-            preview = ", ".join(toks[:8])
-            more = f", … (+{len(toks) - 8} more)" if len(toks) > 8 else ""
-            upd_lines.append(f"  - {rel}: {preview}{more}")
+            toks_sorted = sorted(upd_hits[rel])
+            preview, hidden = _trim(toks_sorted, 8, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            upd_lines.append(f"  - {rel}: {preview_str}{more}")
     else:
         upd_lines.append("  (no firmware-update flow detected)")
     return boot_lines, upd_lines
 
 
 def _extract_safety(files: list[tuple[Path, str]],
-                   repo_dir: Path) -> list[str]:
+                   repo_dir: Path, *,
+                   full: bool = False) -> list[str]:
     findings: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     for fp, raw in files:
         text = _strip_comments(raw)
@@ -608,19 +634,22 @@ def _extract_safety(files: list[tuple[Path, str]],
     by_kind: dict[str, list[str]] = defaultdict(list)
     for rel, per_kind in findings.items():
         for kind, toks in per_kind.items():
-            preview = ", ".join(sorted(toks)[:5])
-            by_kind[kind].append(f"  - {rel}: {preview}")
+            tok_preview, _ = _trim(sorted(toks), 5, full=full)
+            by_kind[kind].append(f"  - {rel}: " + ", ".join(tok_preview))
     for kind in sorted(by_kind):
         lines.append(f"### Safety primitive: {kind}")
-        lines.extend(sorted(by_kind[kind])[:20])
-        if len(by_kind[kind]) > 20:
-            lines.append(f"  - … (+{len(by_kind[kind]) - 20} more files)")
+        files_for_kind = sorted(by_kind[kind])
+        visible, hidden = _trim(files_for_kind, 20, full=full)
+        lines.extend(visible)
+        if hidden:
+            lines.append(f"  - … (+{hidden} more files)")
         lines.append("")
     return lines
 
 
 def _extract_include_graph(files: list[tuple[Path, str]],
-                          repo_dir: Path) -> tuple[list[str], dict[str, set[str]]]:
+                          repo_dir: Path, *,
+                          full: bool = False) -> tuple[list[str], dict[str, set[str]]]:
     """Return the cross-module include graph lines plus the
     "file -> {quote includes}" map (used by script-deps section)."""
     includes_by_file: dict[str, set[str]] = {}
@@ -642,33 +671,39 @@ def _extract_include_graph(files: list[tuple[Path, str]],
     if includes_by_file:
         lines.append("### Quote includes per file (project-local dependencies)")
         for rel in sorted(includes_by_file):
-            quotes = sorted(includes_by_file[rel])
-            if not quotes:
+            quotes_sorted = sorted(includes_by_file[rel])
+            if not quotes_sorted:
                 continue
-            preview = ", ".join(quotes[:8])
-            more = f", … (+{len(quotes) - 8} more)" if len(quotes) > 8 else ""
-            lines.append(f"  - {rel}: {preview}{more}")
+            preview, hidden = _trim(quotes_sorted, 8, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            lines.append(f"  - {rel}: {preview_str}{more}")
     if reverse_quote:
         lines.append("\n### Reverse dependency (header -> consumers)")
         for hdr in sorted(reverse_quote):
             consumers = sorted(reverse_quote[hdr])
-            if len(consumers) < 2:
+            if not full and len(consumers) < 2:
                 continue                       # uninteresting (single consumer)
-            preview = ", ".join(consumers[:6])
-            more = f", … (+{len(consumers) - 6} more)" if len(consumers) > 6 else ""
-            lines.append(f"  - {hdr} included by: {preview}{more}")
+            preview, hidden = _trim(consumers, 6, full=full)
+            preview_str = ", ".join(preview)
+            more = f", … (+{hidden} more)" if hidden else ""
+            lines.append(f"  - {hdr} included by: {preview_str}{more}")
     if angle_hits:
         lines.append("\n### Most-used angle includes (SDK / libc)")
-        top = sorted(angle_hits.items(), key=lambda kv: (-kv[1], kv[0]))[:15]
+        ordered = sorted(angle_hits.items(), key=lambda kv: (-kv[1], kv[0]))
+        top, hidden = _trim(ordered, 15, full=full)
         for hdr, n in top:
             lines.append(f"  - <{hdr}>: {n} files")
+        if hidden:
+            lines.append(f"  - … (+{hidden} more angle includes)")
     if not lines:
         lines.append("  (no #include directives discovered)")
     return lines, includes_by_file
 
 
 def _extract_global_var_graph(files: list[tuple[Path, str]],
-                             repo_dir: Path) -> list[str]:
+                             repo_dir: Path, *,
+                             full: bool = False) -> list[str]:
     """Resolve every `extern <type> <name>;` in headers and list the
     `.c` files that read or write each shared symbol."""
     externs: list[tuple[str, str]] = []         # (name, header_rel)
@@ -721,15 +756,15 @@ def _extract_global_var_graph(files: list[tuple[Path, str]],
         wpart = "writes=" + (", ".join(w) if w else "(none)")
         rpart = "reads=" + (", ".join(r) if r else "(none)")
         lines.append(f"  - {name} (declared in {header}): {wpart}; {rpart}")
-        if len(lines) > 60:
+        if not full and len(lines) > 60:
             lines.append("  - … (extern read/write graph truncated)")
             break
     return lines
 
 
 def _extract_script_dependencies(repo_dir: Path,
-                                quote_includes: dict[str, set[str]]
-                                ) -> list[str]:
+                                quote_includes: dict[str, set[str]], *,
+                                full: bool = False) -> list[str]:
     scripts = _iter_script_files(repo_dir)
     if not scripts and not quote_includes:
         return ["  (no build / packaging scripts detected)"]
@@ -737,14 +772,15 @@ def _extract_script_dependencies(repo_dir: Path,
     lines: list[str] = []
     if scripts:
         lines.append("### Build / packaging scripts in repository")
-        for fp in scripts[:40]:
+        visible, hidden = _trim(scripts, 40, full=full)
+        for fp in visible:
             try:
                 size = fp.stat().st_size
             except OSError:
                 size = -1
             lines.append(f"  - {_rel(repo_dir, fp)} ({size} bytes)")
-        if len(scripts) > 40:
-            lines.append(f"  - … (+{len(scripts) - 40} more)")
+        if hidden:
+            lines.append(f"  - … (+{hidden} more)")
 
     # Cross-references: which scripts mention which source files?
     if scripts:
@@ -766,10 +802,11 @@ def _extract_script_dependencies(repo_dir: Path,
         if refs:
             lines.append("\n### Script -> source file references")
             for sp in sorted(refs):
-                bases = sorted(refs[sp])
-                preview = ", ".join(bases[:8])
-                more = f", … (+{len(bases) - 8} more)" if len(bases) > 8 else ""
-                lines.append(f"  - {sp}: {preview}{more}")
+                bases_sorted = sorted(refs[sp])
+                preview, hidden = _trim(bases_sorted, 8, full=full)
+                preview_str = ", ".join(preview)
+                more = f", … (+{hidden} more)" if hidden else ""
+                lines.append(f"  - {sp}: {preview_str}{more}")
     return lines
 
 
@@ -782,15 +819,26 @@ def build_gitnexus_report(
     repo_dir: Path | None,
     code_dir: Path | None = None,
     max_chars: int = 16_000,
+    full: bool = False,
 ) -> str:
     """Produce the GitNexus report for *repo_dir* (and any uploaded code).
 
     Both directories are optional — when neither contains code the report
     is a short notice that GitNexus had nothing to chew on.
 
-    The report length is bounded by *max_chars*; sections beyond the
-    budget are truncated with an explicit marker so the LLM downstream
-    knows extraction was clipped.
+    Two flavours are supported:
+
+      * ``full=False`` (default) — the **distilled** view used by the
+        downstream LLM prompts.  Per-section lists are capped (e.g. 8/10
+        entries with a ``(+N more)`` suffix) and the final string is
+        clipped to ``max_chars`` with an explicit truncation marker.
+        This keeps the prompt budget under control.
+
+      * ``full=True`` — the **untruncated** view written to
+        ``gitnexus_report.txt`` and exposed in the downloadable ZIP for
+        QA purposes.  Every extractor emits the complete set of findings
+        with no per-section caps, and ``max_chars`` is intentionally
+        ignored so reviewers see the entire evidence trail.
     """
     pairs: list[tuple[Path, str]] = []
     if repo_dir is not None and repo_dir.exists():
@@ -808,9 +856,10 @@ def build_gitnexus_report(
                          if _rel(repo_dir or fp.parent, p) != rel]
                 pairs.append((fp, _safe_read(fp)))
 
+    flavour = "FULL (untruncated, QA download)" if full else "DISTILLED (LLM context)"
     header = [
         "=" * 65,
-        "GITNEXUS — CODEBASE UNDERSTANDING REPORT",
+        f"GITNEXUS — CODEBASE UNDERSTANDING REPORT [{flavour}]",
         "=" * 65,
         "",
         "This report is auto-generated immediately after the ICD",
@@ -818,9 +867,12 @@ def build_gitnexus_report(
         "extracted directly from the uploaded repository and source",
         "scripts via deterministic pattern matching.  The downstream",
         "code-generation, verification, per-file compile, sandbox build",
-        "and regeneration prompts all receive this report as additional",
-        "ground-truth context alongside the ICD change_spec and",
-        "repo_knowledge.",
+        "and regeneration prompts receive the DISTILLED flavour of this",
+        "report as additional ground-truth context alongside the ICD",
+        "change_spec and repo_knowledge.  The FULL flavour is kept on",
+        "disk (gitnexus_report.txt) and shipped in the downloadable ZIP",
+        "so QA can audit the complete extraction without prompt-budget",
+        "clipping.",
         "",
     ]
 
@@ -836,15 +888,21 @@ def build_gitnexus_report(
 
     isr_lines = _extract_isr_to_task(pairs, anchor_repo)
     rtos_lines = _extract_rtos_tasks(pairs, anchor_repo)
-    state_lines = _extract_state_machines(pairs, anchor_repo)
-    drv_lines, hal_lines = _extract_drivers_peripherals(pairs, anchor_repo)
-    mem_lines = _extract_memory_ownership(pairs, anchor_repo)
-    boot_lines, upd_lines = _extract_boot_and_update(pairs, anchor_repo)
-    safety_lines = _extract_safety(pairs, anchor_repo)
-    inc_lines, quote_includes = _extract_include_graph(pairs, anchor_repo)
-    extern_lines = _extract_global_var_graph(pairs, anchor_repo)
+    state_lines = _extract_state_machines(pairs, anchor_repo, full=full)
+    drv_lines, hal_lines = _extract_drivers_peripherals(
+        pairs, anchor_repo, full=full,
+    )
+    mem_lines = _extract_memory_ownership(pairs, anchor_repo, full=full)
+    boot_lines, upd_lines = _extract_boot_and_update(
+        pairs, anchor_repo, full=full,
+    )
+    safety_lines = _extract_safety(pairs, anchor_repo, full=full)
+    inc_lines, quote_includes = _extract_include_graph(
+        pairs, anchor_repo, full=full,
+    )
+    extern_lines = _extract_global_var_graph(pairs, anchor_repo, full=full)
     script_lines = _extract_script_dependencies(
-        anchor_repo, quote_includes,
+        anchor_repo, quote_includes, full=full,
     ) if (repo_dir and repo_dir.exists()) else [
         "  (no repository scripts uploaded — GitNexus saw uploaded sources only)"
     ]
@@ -875,7 +933,10 @@ def build_gitnexus_report(
         parts.append("")
 
     result = "\n".join(parts).rstrip() + "\n"
-    if len(result) > max_chars:
+    # ``full`` reports are never length-clipped — that flavour is the
+    # canonical record for the downloadable QA report.  Only the
+    # distilled flavour is bounded by ``max_chars``.
+    if not full and len(result) > max_chars:
         clip = max_chars - 200
         result = (
             result[:clip]
