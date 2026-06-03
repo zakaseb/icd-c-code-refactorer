@@ -952,11 +952,13 @@ def run_per_file_compile(
         "E. The .h must keep its include guards (`#ifndef <BASE>_H` / "
         "`#define <BASE>_H` ... `#endif`). The .c must keep its "
         "`#include \"<base>.h\"` (or equivalent) if it had one.\n"
-        "F. If the file declares MULTIPLE per-variation structs for the "
-        "same peripheral (one per ICD variation, each with its own "
-        "explanatory comment banner), PRESERVE all of them — do NOT "
-        "merge, dedupe, or delete variations to make the compile pass. "
-        "Unused variation structs are intentional and are NOT errors."
+        "F. Peripheral variations are intentional. If a .c file declares "
+        "MULTIPLE per-variation structs for the same peripheral (each with "
+        "its own banner comment), PRESERVE all of them. If the project ships "
+        "SEPARATE per-variation header files (e.g. `<Peripheral>_<Variation>.h`, "
+        "each scoped to one variation), keep them separate — do NOT merge, "
+        "dedupe, or delete variations to make the compile pass. Unused "
+        "variation structs / headers are intentional and are NOT errors."
     )
 
     for cs in c_sources:

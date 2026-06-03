@@ -40,7 +40,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from per_file_compile import run_per_file_compile
+from per_file_compile import run_per_file_compile, _extract_per_file_blocks
 try:
     from api.gitnexus import build_gitnexus_report as _build_gitnexus_report
 except ImportError:  # tolerate flat layout (uvicorn app.app:app)
@@ -194,20 +194,20 @@ PERIPHERAL_VARIATION_CODEGEN_GUIDANCE = (
     "variation (variant / configuration / mode) of the same peripheral, you "
     "MUST represent EACH variation separately instead of merging them or "
     "silently picking one:\n"
-    "- In headers (.h): emit a SEPARATE struct (plus separate enums / "
-    "constants / macros wherever they differ) for EACH variation. Give each a "
-    "distinct, descriptive name derived from the ICD variation name "
-    "(e.g. `<Peripheral>_<Variation>_t`). Immediately above each variation's "
-    "declarations add a clear block-comment banner that names the variation, "
-    "summarises what makes it different, and explicitly tells the integrating "
-    "engineer to KEEP ONLY the struct(s) for the variation they actually use "
-    "and delete the others.\n"
-    "- In sources (.c): provide the corresponding per-variation code the same "
-    "way (separate, clearly-commented functions / definitions per variation). "
-    "Do NOT collapse the variations into a single implementation.\n"
+    "- In headers (.h): emit a SEPARATE, self-contained .h FILE for EACH "
+    "variation rather than one combined header. Give each file a distinct, "
+    "descriptive name derived from the original header and the ICD variation "
+    "name (e.g. `<Peripheral>_<Variation>.h`). Each file must have its own "
+    "include guard, its own #includes, a clear banner comment naming the "
+    "variation and what makes it different, and only that variation's struct / "
+    "enums / constants / macros — so the integrating engineer simply keeps the "
+    "one header file for the variation they need and deletes the others.\n"
+    "- In sources (.c): provide the corresponding per-variation code within "
+    "the file (separate, clearly-commented functions / definitions per "
+    "variation). Do NOT collapse the variations into a single implementation.\n"
     "- Keep logic that is common to all variations shared and clearly marked "
     "as common.\n"
-    "- If only ONE variation is present, generate normally (a single struct), "
+    "- If only ONE variation is present, generate normally (a single header), "
     "exactly as before."
 )
 
@@ -335,6 +335,70 @@ def _looks_complete_c_file(generated: str, original: str, filename: str) -> bool
     ):
         return False
     return True
+
+
+def _looks_complete_header(code: str) -> bool:
+    """Lightweight completeness check for a SINGLE generated header file.
+
+    Used when a .h transform is split into one file per peripheral
+    variation: each variation file is naturally smaller than the original
+    combined header, so the size-vs-original ratio used by
+    :func:`_looks_complete_c_file` would wrongly reject valid per-variation
+    headers. This check only validates self-consistency (balanced braces /
+    comments, include guard, sane ending).
+    """
+    text = code.strip()
+    if len(text) < 60:
+        return False
+    if "[... TRUNCATED" in text or text.endswith("..."):
+        return False
+    if text.count("{") != text.count("}"):
+        return False
+    if text.count("/*") > text.count("*/"):
+        return False
+    has_ifndef = re.search(r"^\s*#\s*ifn?def\b", text, flags=re.MULTILINE)
+    has_endif = re.search(r"^\s*#\s*endif\b", text, flags=re.MULTILINE)
+    if has_ifndef and not has_endif:
+        return False
+    last = text.splitlines()[-1].strip()
+    if not (
+        last.endswith("}")
+        or last.endswith(";")
+        or last.endswith("*/")
+        or last.startswith("#endif")
+        or last.endswith("#endif")
+    ):
+        return False
+    return True
+
+
+def _split_variation_header_files(
+    raw_output: str, base_fname: str,
+) -> dict[str, str]:
+    """Extract per-variation header files from a .h transform output.
+
+    When a target ICD describes multiple variations of the same
+    peripheral, the model is asked to emit a SEPARATE, self-contained .h
+    file per variation, each introduced by a ``### <filename>.h`` marker
+    followed by a ```c fenced block. This returns ``{filename: code}`` for
+    every such header.
+
+    Returns an empty dict for the normal single-header case (fewer than two
+    distinct .h files), so the caller falls back to the existing
+    single-file write path. Only applies to ``.h`` inputs; ``.c`` files are
+    never split.
+    """
+    if not base_fname.lower().endswith(".h"):
+        return {}
+    blocks = _extract_per_file_blocks(raw_output)
+    headers = {
+        name: body
+        for name, body in blocks.items()
+        if name.lower().endswith(".h") and body.strip()
+    }
+    if len(headers) >= 2:
+        return headers
+    return {}
 
 
 def extract_pdf_text(pdf_path: Path) -> str:
@@ -4248,6 +4312,29 @@ async def process(session_id: str):
                     f"{gitnexus_report}"
                 )
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
+            is_header = fname.lower().endswith(".h")
+            if is_header:
+                base_stem = fname[:-2]  # drop trailing ".h"
+                variation_instr = (
+                    "If the change specification describes MULTIPLE variations of "
+                    "the same peripheral, output a SEPARATE, COMPLETE .h file for "
+                    "EACH variation instead of one combined header. Precede each "
+                    "file with a line of the form `### <filename>` (for example "
+                    f"`### {base_stem}_<Variation>.h`) immediately followed by its "
+                    "```c fenced block. Each header MUST be fully self-contained: "
+                    "its own include guard, its own #includes, a banner comment "
+                    "naming the variation, and ONLY that variation's struct / "
+                    "enums / constants / macros. Do NOT emit any other `###` "
+                    "headings. If only one variation applies, output a single "
+                    "complete header normally with NO `### ` marker. "
+                )
+            else:
+                variation_instr = (
+                    "If the change specification lists multiple variations of the "
+                    "same peripheral, emit a separate, clearly-commented struct (and "
+                    "matching code) for EACH variation so the engineer can keep only "
+                    "the one they need — do not merge or drop variations. "
+                )
             sec_file = (
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
                 "Transform this file so it fully conforms to the Target ICD. "
@@ -4255,10 +4342,7 @@ async def process(session_id: str):
                 "Ensure the generated code is FULLY COMPATIBLE with the repository "
                 "codebase — use the exact type names, function signatures, and "
                 "#include paths from the dependency headers above. "
-                "If the change specification lists multiple variations of the same "
-                "peripheral, emit a separate, clearly-commented struct (and matching "
-                "code) for EACH variation so the engineer can keep only the one they "
-                "need — do not merge or drop variations. "
+                f"{variation_instr}"
                 "Output the complete file — do not omit any sections. "
                 "Do not summarize. Do not truncate. Include the full ending of the file."
             )
@@ -4281,6 +4365,7 @@ async def process(session_id: str):
                      fname, len(transform_prompt), _estimate_tokens(transform_prompt))
             clean = ""
             last_chunk = ""
+            last_raw = ""
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 file_parts: list[str] = []
@@ -4320,7 +4405,8 @@ async def process(session_id: str):
                     })
                     break
 
-                last_chunk = _extract_fenced("".join(file_parts), "c").strip()
+                last_raw = "".join(file_parts)
+                last_chunk = _extract_fenced(last_raw, "c").strip()
                 if attempt == 1:
                     clean = last_chunk
                 else:
@@ -4328,6 +4414,47 @@ async def process(session_id: str):
 
                 if _looks_complete_c_file(clean, original, fname):
                     break
+
+            # When the target ICD describes multiple variations of a
+            # peripheral, a .h transform is emitted as one self-contained
+            # header file per variation (### <name>.h + fenced block).
+            # Write each such file separately; otherwise fall through to the
+            # normal single-file path below.
+            variation_headers = _split_variation_header_files(last_raw, fname)
+            if variation_headers:
+                incomplete = [
+                    n for n, c in variation_headers.items()
+                    if not _looks_complete_header(c)
+                ]
+                if not incomplete:
+                    for vname, vcode in sorted(variation_headers.items()):
+                        (gen_dir / vname).write_text(vcode)
+                        yield _sse({
+                            "type": "file_complete",
+                            "file": vname,
+                            "size": len(vcode),
+                        })
+                    log.info(
+                        "Transform %s: emitted %d per-variation header files: %s",
+                        fname, len(variation_headers),
+                        ", ".join(sorted(variation_headers)),
+                    )
+                    yield _sse({
+                        "type": "info",
+                        "stage": "transform",
+                        "file": fname,
+                        "message": (
+                            f"{fname}: detected multiple peripheral variations — "
+                            f"generated {len(variation_headers)} separate header "
+                            f"files ({', '.join(sorted(variation_headers))})."
+                        ),
+                    })
+                    continue
+                log.warning(
+                    "Transform %s: per-variation header split incomplete (%s); "
+                    "falling back to single-file output.",
+                    fname, ", ".join(incomplete),
+                )
 
             if not _looks_complete_c_file(clean, original, fname):
                 yield _sse({
@@ -4457,10 +4584,14 @@ async def process(session_id: str):
                         "'FIXES:' listing corrections made, or 'NO FIXES NEEDED' "
                         "if the code is correct. "
                         "The output MUST include a complete fenced C file. "
-                        "If the file contains multiple per-variation structs for the "
-                        "same peripheral (one per ICD variation), PRESERVE all of "
-                        "them and their explanatory comments — do not merge, dedupe, "
-                        "or delete variations."
+                        "Peripheral variations: if this generated HEADER file is "
+                        "specific to ONE variation of a peripheral (its name and/or "
+                        "banner comment identify a single variation), keep it scoped "
+                        "to that one variation — do NOT pull in or merge the other "
+                        "variations even though the change spec lists them. If a .c "
+                        "file contains multiple per-variation structs, PRESERVE all "
+                        "of them and their comments — do not merge, dedupe, or delete "
+                        "variations."
                     )
 
                     sec_issues = f"## Issues to Fix{issue_guidance}" if issue_guidance else ""
@@ -5220,15 +5351,36 @@ async def regenerate(session_id: str):
                     f"or comm-stack callers.\n\n{gitnexus_report}"
                 )
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
+            is_header = fname.lower().endswith(".h")
+            if is_header:
+                base_stem = fname[:-2]  # drop trailing ".h"
+                regen_variation_instr = (
+                    "If the change specification describes MULTIPLE variations of "
+                    "the same peripheral, output a SEPARATE, COMPLETE .h file for "
+                    "EACH variation instead of one combined header. Precede each "
+                    "file with a line of the form `### <filename>` (for example "
+                    f"`### {base_stem}_<Variation>.h`) immediately followed by its "
+                    "```c fenced block. Each header MUST be self-contained (own "
+                    "include guard, #includes, banner comment naming the variation, "
+                    "and only that variation's declarations). Do NOT emit any other "
+                    "`###` headings. If only one variation applies, output a single "
+                    "complete header with NO `### ` marker. "
+                )
+            else:
+                regen_variation_instr = (
+                    "If the change specification lists multiple variations of the "
+                    "same peripheral, keep a separate, clearly-commented struct "
+                    "(and matching code) for EACH variation — do not merge or drop "
+                    "variations. "
+                )
             sec_file = (
                 f"## Original File: {fname}\n\n```c\n{original}\n```\n\n"
                 "Re-generate this file to conform to the Target ICD while fixing "
                 "ALL issues from the user feedback. Use the change specification "
                 "and repository knowledge as ground truth — do not introduce "
-                "regressions. If the change specification lists multiple variations "
-                "of the same peripheral, keep a separate, clearly-commented struct "
-                "(and matching code) for EACH variation — do not merge or drop "
-                "variations. Output the complete file in "
+                "regressions. "
+                f"{regen_variation_instr}"
+                "Output the complete file in "
                 "```c fences. Do not omit any sections."
             )
 
@@ -5251,6 +5403,7 @@ async def regenerate(session_id: str):
                      fname, len(transform_prompt), _estimate_tokens(transform_prompt))
 
             clean = ""
+            last_raw = ""
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 file_parts: list[str] = []
@@ -5291,7 +5444,8 @@ async def regenerate(session_id: str):
                     })
                     break
 
-                last_chunk = _extract_fenced("".join(file_parts), "c").strip()
+                last_raw = "".join(file_parts)
+                last_chunk = _extract_fenced(last_raw, "c").strip()
                 if attempt == 1:
                     clean = last_chunk
                 else:
@@ -5299,6 +5453,44 @@ async def regenerate(session_id: str):
 
                 if _looks_complete_c_file(clean, original, fname):
                     break
+
+            # Multiple peripheral variations -> one self-contained .h file
+            # per variation (### <name>.h + fenced block).
+            variation_headers = _split_variation_header_files(last_raw, fname)
+            if variation_headers:
+                incomplete = [
+                    n for n, c in variation_headers.items()
+                    if not _looks_complete_header(c)
+                ]
+                if not incomplete:
+                    for vname, vcode in sorted(variation_headers.items()):
+                        prev_vtext = (
+                            (gen_dir / vname).read_text()
+                            if (gen_dir / vname).exists() else ""
+                        )
+                        (gen_dir / vname).write_text(vcode)
+                        if prev_vtext:
+                            regen_diffs[vname] = _generate_diff(
+                                prev_vtext, vcode,
+                                f"{vname} (round {regen_count - 1})",
+                                f"{vname} (round {regen_count})",
+                            )
+                        yield _sse({
+                            "type": "file_complete",
+                            "file": vname,
+                            "size": len(vcode),
+                        })
+                    log.info(
+                        "Regenerate %s: emitted %d per-variation header files: %s",
+                        fname, len(variation_headers),
+                        ", ".join(sorted(variation_headers)),
+                    )
+                    continue
+                log.warning(
+                    "Regenerate %s: per-variation header split incomplete (%s); "
+                    "falling back to single-file output.",
+                    fname, ", ".join(incomplete),
+                )
 
             if not _looks_complete_c_file(clean, original, fname):
                 yield _sse({
@@ -5419,10 +5611,14 @@ async def regenerate(session_id: str):
                         "'FIXES:' listing corrections made, or 'NO FIXES NEEDED' "
                         "if the code is correct. "
                         "The output MUST include a complete fenced C file. "
-                        "If the file contains multiple per-variation structs for the "
-                        "same peripheral (one per ICD variation), PRESERVE all of "
-                        "them and their explanatory comments — do not merge, dedupe, "
-                        "or delete variations."
+                        "Peripheral variations: if this generated HEADER file is "
+                        "specific to ONE variation of a peripheral (its name and/or "
+                        "banner comment identify a single variation), keep it scoped "
+                        "to that one variation — do NOT pull in or merge the other "
+                        "variations even though the change spec lists them. If a .c "
+                        "file contains multiple per-variation structs, PRESERVE all "
+                        "of them and their comments — do not merge, dedupe, or delete "
+                        "variations."
                     )
 
                     sec_issues = f"## Issues to Fix{issue_guidance}" if issue_guidance else ""
