@@ -951,7 +951,12 @@ def run_per_file_compile(
         "struct X.\n"
         "E. The .h must keep its include guards (`#ifndef <BASE>_H` / "
         "`#define <BASE>_H` ... `#endif`). The .c must keep its "
-        "`#include \"<base>.h\"` (or equivalent) if it had one."
+        "`#include \"<base>.h\"` (or equivalent) if it had one.\n"
+        "F. If the file declares MULTIPLE per-variation structs for the "
+        "same peripheral (one per ICD variation, each with its own "
+        "explanatory comment banner), PRESERVE all of them — do NOT "
+        "merge, dedupe, or delete variations to make the compile pass. "
+        "Unused variation structs are intentional and are NOT errors."
     )
 
     for cs in c_sources:

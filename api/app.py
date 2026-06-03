@@ -155,6 +155,64 @@ REMOTE_BUILD_SCRIPT  = os.environ.get("REMOTE_BUILD_SCRIPT", "python build.py")
 REMOTE_BUILD_MODE    = os.environ.get("REMOTE_BUILD_MODE", "debug")   # "debug" | "release"
 
 # ---------------------------------------------------------------------------
+# Peripheral-variation awareness
+# ---------------------------------------------------------------------------
+# A single Target ICD sometimes describes MULTIPLE variations (variants /
+# configurations / modes / build options) of the SAME peripheral — e.g. the
+# same logical device with different message layouts, field sets, scale
+# factors, sample rates or register maps.  The pipeline must recognise this
+# and (a) report each variation separately and (b) emit one clearly-commented
+# struct (and matching .c code) per variation so an integrating engineer can
+# keep only the variation they need.  These two reusable instruction blocks
+# are threaded into the analysis/report prompts and the code-generation prompts
+# respectively so the behaviour is consistent across every stage.
+
+PERIPHERAL_VARIATION_ANALYSIS_GUIDANCE = (
+    "\n\nPERIPHERAL VARIATIONS WITHIN A SINGLE ICD:\n"
+    "A single Target ICD may describe MULTIPLE VARIATIONS (variants / "
+    "configurations / modes / build or hardware options) of the SAME "
+    "peripheral — for example different message layouts, field sets, scale "
+    "factors, sample rates, or register maps for one logical device.\n"
+    "- Determine whether the Target ICD defines more than one variation of a "
+    "peripheral. State EXPLICITLY how many variations exist and name each one "
+    "using the ICD's own terminology.\n"
+    "- If multiple variations exist, organise the change specification PER "
+    "VARIATION: give each variation its own clearly-labelled subsection and, "
+    "for each, report the same categories of detail you normally would "
+    "(structs/fields/types/sizes/alignment, enums/constants/message IDs, "
+    "function signatures, behaviour/protocol/timing). Use bullet points or a "
+    "comparison table so the per-variation differences are easy to read.\n"
+    "- Call out the SHARED parts (common to every variation) separately from "
+    "the variation-specific parts.\n"
+    "- If only ONE variation exists, report normally and do NOT invent "
+    "variations."
+)
+
+PERIPHERAL_VARIATION_CODEGEN_GUIDANCE = (
+    "\n\nPERIPHERAL VARIATIONS (MULTIPLE VARIANTS IN ONE ICD):\n"
+    "When the change specification / Target ICD describes MORE THAN ONE "
+    "variation (variant / configuration / mode) of the same peripheral, you "
+    "MUST represent EACH variation separately instead of merging them or "
+    "silently picking one:\n"
+    "- In headers (.h): emit a SEPARATE struct (plus separate enums / "
+    "constants / macros wherever they differ) for EACH variation. Give each a "
+    "distinct, descriptive name derived from the ICD variation name "
+    "(e.g. `<Peripheral>_<Variation>_t`). Immediately above each variation's "
+    "declarations add a clear block-comment banner that names the variation, "
+    "summarises what makes it different, and explicitly tells the integrating "
+    "engineer to KEEP ONLY the struct(s) for the variation they actually use "
+    "and delete the others.\n"
+    "- In sources (.c): provide the corresponding per-variation code the same "
+    "way (separate, clearly-commented functions / definitions per variation). "
+    "Do NOT collapse the variations into a single implementation.\n"
+    "- Keep logic that is common to all variations shared and clearly marked "
+    "as common.\n"
+    "- If only ONE variation is present, generate normally (a single struct), "
+    "exactly as before."
+)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -3635,6 +3693,7 @@ async def process(session_id: str):
                 "List every single change with specific old and new values. "
                 "Ground the 'Impact on C code' section in the actual old scripts "
                 "provided below — cite real files and symbols, never invented ones."
+                f"{PERIPHERAL_VARIATION_ANALYSIS_GUIDANCE}"
                 f"{repo_analysis_hint}"
             )
 
@@ -3674,6 +3733,7 @@ async def process(session_id: str):
                         "3. Impact on C code (structs, enums, functions, constants, etc.) — "
                         "cite the specific file and symbol from the old scripts, mapping the "
                         "OLD form to the NEW form."
+                        f"{PERIPHERAL_VARIATION_ANALYSIS_GUIDANCE}"
                         f"{grounding_note}"
                     )
                     target_summary = _truncate_text(target_icd, 12_000, "target_icd_for_transform")
@@ -3829,6 +3889,7 @@ async def process(session_id: str):
                         "3. Impact on C code (structs, enums, functions, constants, etc.) — "
                         "cite the specific file and symbol from the old scripts, mapping the "
                         "OLD form to the NEW form."
+                        f"{PERIPHERAL_VARIATION_ANALYSIS_GUIDANCE}"
                         f"{grounding_note}"
                     )
 
@@ -3906,7 +3967,69 @@ async def process(session_id: str):
                         ),
                     })
 
-                change_spec = complete_analysis.strip()
+                raw_change_spec = complete_analysis.strip()
+                change_spec = raw_change_spec
+                if raw_change_spec:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "analysis",
+                        "message": (
+                            "Distilling change specification for conciseness "
+                            "while preserving full coverage..."
+                        ),
+                    })
+                    distill_system = (
+                        "You are an expert embedded C refactoring analyst. "
+                        "Rewrite ICD delta specifications to be concise while "
+                        "preserving complete technical coverage."
+                    )
+                    distill_prompt = (
+                        "Distill the following complete ICD change specification.\n\n"
+                        "Requirements:\n"
+                        "1. Keep it concise and remove redundancy.\n"
+                        "2. Preserve ALL actionable changes and old->new mappings.\n"
+                        "3. Keep C-impact details for structs, enums, functions, "
+                        "constants, macros, and symbols.\n"
+                        "4. Do NOT introduce new changes.\n"
+                        "5. If the specification describes MULTIPLE variations "
+                        "(variants / configurations / modes) of the same "
+                        "peripheral, PRESERVE the per-variation structure: keep a "
+                        "separate, clearly-labelled subsection (bullet points or a "
+                        "table) for each variation and keep the shared parts "
+                        "separate. Do NOT merge variations together.\n"
+                        "6. Output only the distilled specification text.\n\n"
+                        "## Original change specification\n"
+                        f"{raw_change_spec}"
+                    )
+                    try:
+                        distilled = _call_llm_complete(
+                            distill_system,
+                            distill_prompt,
+                            max_tokens=3072,
+                            max_passes=4,
+                        ).strip()
+                        if distilled:
+                            change_spec = distilled
+                            log.info(
+                                "Distilled change_spec from %d to %d chars",
+                                len(raw_change_spec), len(change_spec),
+                            )
+                        else:
+                            log.warning(
+                                "Distillation returned empty output; using raw change_spec"
+                            )
+                    except Exception as e:            # noqa: BLE001
+                        log.warning(
+                            "change_spec distillation failed, using raw output: %s", e,
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "analysis",
+                            "message": (
+                                "Distillation failed; using original analysis output "
+                                "as change specification."
+                            ),
+                        })
                 log.info(
                     "ICD analysis complete (%d chars, %d passes, mode=%s)",
                     len(change_spec), len(analysis_parts),
@@ -4071,6 +4194,7 @@ async def process(session_id: str):
                 "and communication patterns from the repository codebase\n"
                 "11. Ensure #include directives reference correct repository headers\n"
                 "12. Maintain compatibility with all dependent modules in the repository"
+                f"{PERIPHERAL_VARIATION_CODEGEN_GUIDANCE}"
             )
 
             file_repo_ctx = ""
@@ -4131,6 +4255,10 @@ async def process(session_id: str):
                 "Ensure the generated code is FULLY COMPATIBLE with the repository "
                 "codebase — use the exact type names, function signatures, and "
                 "#include paths from the dependency headers above. "
+                "If the change specification lists multiple variations of the same "
+                "peripheral, emit a separate, clearly-commented struct (and matching "
+                "code) for EACH variation so the engineer can keep only the one they "
+                "need — do not merge or drop variations. "
                 "Output the complete file — do not omit any sections. "
                 "Do not summarize. Do not truncate. Include the full ending of the file."
             )
@@ -4328,7 +4456,11 @@ async def process(session_id: str):
                         "Before the code, write a one-line summary starting with "
                         "'FIXES:' listing corrections made, or 'NO FIXES NEEDED' "
                         "if the code is correct. "
-                        "The output MUST include a complete fenced C file."
+                        "The output MUST include a complete fenced C file. "
+                        "If the file contains multiple per-variation structs for the "
+                        "same peripheral (one per ICD variation), PRESERVE all of "
+                        "them and their explanatory comments — do not merge, dedupe, "
+                        "or delete variations."
                     )
 
                     sec_issues = f"## Issues to Fix{issue_guidance}" if issue_guidance else ""
@@ -5035,6 +5167,7 @@ async def regenerate(session_id: str):
                 "11. Maintain compatibility with all dependent modules in the repository\n"
                 "12. Cross-check every fix against the change spec and repo headers "
                 "to prevent error loops"
+                f"{PERIPHERAL_VARIATION_CODEGEN_GUIDANCE}"
             )
 
             file_repo_ctx = ""
@@ -5092,7 +5225,10 @@ async def regenerate(session_id: str):
                 "Re-generate this file to conform to the Target ICD while fixing "
                 "ALL issues from the user feedback. Use the change specification "
                 "and repository knowledge as ground truth — do not introduce "
-                "regressions. Output the complete file in "
+                "regressions. If the change specification lists multiple variations "
+                "of the same peripheral, keep a separate, clearly-commented struct "
+                "(and matching code) for EACH variation — do not merge or drop "
+                "variations. Output the complete file in "
                 "```c fences. Do not omit any sections."
             )
 
@@ -5282,7 +5418,11 @@ async def regenerate(session_id: str):
                         "Before the code, write a one-line summary starting with "
                         "'FIXES:' listing corrections made, or 'NO FIXES NEEDED' "
                         "if the code is correct. "
-                        "The output MUST include a complete fenced C file."
+                        "The output MUST include a complete fenced C file. "
+                        "If the file contains multiple per-variation structs for the "
+                        "same peripheral (one per ICD variation), PRESERVE all of "
+                        "them and their explanatory comments — do not merge, dedupe, "
+                        "or delete variations."
                     )
 
                     sec_issues = f"## Issues to Fix{issue_guidance}" if issue_guidance else ""
