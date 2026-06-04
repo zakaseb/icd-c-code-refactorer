@@ -4105,7 +4105,16 @@ async def process(session_id: str):
                 return
 
             (session_dir / "change_spec.txt").write_text(change_spec)
+            # Distilled spec is what downstream LLM prompts consume;
+            # the pre-distillation comprehensive analysis is kept separately
+            # for QA / audit (same pattern as full vs distilled repo knowledge).
+            (session_dir / "change_spec_raw.txt").write_text(raw_change_spec)
             (session_dir / "target_summary.txt").write_text(target_summary)
+            log.info(
+                "Saved change_spec (distilled): %d chars, change_spec_raw "
+                "(comprehensive): %d chars",
+                len(change_spec), len(raw_change_spec),
+            )
 
             # ``icd_analysis.txt`` is a downloadable QA artefact, so it
             # embeds the FULL repo_knowledge (no caps / no clip), not the
@@ -4917,6 +4926,7 @@ async def download_all(session_id: str):
     report_candidates = [
         session_dir / "icd_analysis.txt",
         session_dir / "change_spec.txt",
+        session_dir / "change_spec_raw.txt",
         session_dir / "target_summary.txt",
         session_dir / "repo_knowledge.txt",
         session_dir / "gitnexus_report.txt",
@@ -4979,6 +4989,7 @@ async def download_all(session_id: str):
             session_dir / PIPELINE_EVENTS_FILE,
             session_dir / "status.json",
             session_dir / "change_spec.txt",
+            session_dir / "change_spec_raw.txt",
             session_dir / "target_summary.txt",
             session_dir / "repo_knowledge.txt",
             session_dir / "playbook.jsonl",
