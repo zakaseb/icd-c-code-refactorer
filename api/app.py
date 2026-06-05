@@ -549,6 +549,186 @@ def _split_variation_header_files(
     return {}
 
 
+def _variant_slug(name: str) -> str:
+    """Turn a human variant name into a filename-safe CamelCase fragment.
+
+    e.g. ``"High-Rate"`` -> ``"HighRate"``, ``"Low power mode"`` ->
+    ``"LowPowerMode"``. Returns ``""`` if nothing usable remains.
+    """
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", name or "") if p]
+    if not parts:
+        return ""
+    slug = "".join(p[:1].upper() + p[1:] for p in parts)
+    if slug and slug[0].isdigit():
+        slug = "V" + slug
+    return slug
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Best-effort parse of the first JSON object in *text*.
+
+    Tolerates ```json fences and surrounding prose by scanning for the
+    first balanced ``{ ... }`` span. Returns ``None`` on failure.
+    """
+    if not text:
+        return None
+    m = re.search(r"```(?:json)?\s*\n(.*?)\n```", text, flags=re.DOTALL)
+    candidate = m.group(1) if m else text
+    start = candidate.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(candidate)):
+        ch = candidate[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(candidate[start:i + 1])
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    break
+    try:
+        obj = json.loads(candidate)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _detect_peripheral_variants(
+    original: str, fname: str, change_spec: str, target_summary: str,
+) -> list[str]:
+    """Detect distinct variants of the peripheral implemented by *fname*.
+
+    Returns the list of variant names (using the ICD's own terminology) when
+    the Target ICD defines TWO OR MORE variants of the same peripheral, else
+    an empty list (single-variant / normal case). Names are de-duplicated by
+    slug. Any failure degrades gracefully to ``[]``.
+    """
+    if not fname.lower().endswith(".h"):
+        return []
+    detect_system = (
+        "You analyse ICD change specifications to decide whether a given C "
+        "header's peripheral is defined in MULTIPLE distinct variants "
+        "(variants / configurations / modes / hardware or build options) in "
+        "the Target ICD. You respond with STRICT JSON only, no prose."
+    )
+    detect_prompt = (
+        f"Header file: {fname}\n\n"
+        f"## Original header (pre-change)\n```c\n{original[:4000]}\n```\n\n"
+        f"## Change specification (Source ICD -> Target ICD)\n{change_spec}\n\n"
+        f"## Target ICD summary\n{target_summary[:6000]}\n\n"
+        "Question: does the Target ICD define MORE THAN ONE distinct variant "
+        "of the peripheral implemented by THIS header? Count only true "
+        "variants of the SAME peripheral (e.g. different message layouts, "
+        "field sets, scale factors, sample rates, or register maps for one "
+        "logical device) — NOT unrelated peripherals, and NOT mere version "
+        "bumps of a single layout.\n"
+        "Respond with STRICT JSON exactly in this shape:\n"
+        '{"has_variants": true, "variants": ["<Name1>", "<Name2>"]}\n'
+        "Use the ICD's own names for each variant. If there is only one "
+        'variant, respond {"has_variants": false, "variants": []}.'
+    )
+    try:
+        out = _call_llm_complete(
+            detect_system, detect_prompt, max_tokens=512, max_passes=1,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Variant detection for %s failed: %s", fname, e)
+        return []
+    data = _extract_json_object(out)
+    if not data or not data.get("has_variants"):
+        return []
+    raw_names = data.get("variants") or []
+    if not isinstance(raw_names, list):
+        return []
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for n in raw_names:
+        name = str(n).strip()
+        slug = _variant_slug(name)
+        if name and slug and slug.lower() not in seen:
+            seen.add(slug.lower())
+            uniq.append(name)
+    return uniq if len(uniq) >= 2 else []
+
+
+def _generate_variant_header(
+    *,
+    base_sections: list[tuple[str, str, int]],
+    transform_system: str,
+    base_header_name: str,
+    original: str,
+    variant_name: str,
+    all_variants: list[str],
+    header_filename: str,
+) -> str:
+    """Generate ONE complete, self-contained .h for a single peripheral variant.
+
+    Reuses the shared prompt *base_sections* (change spec, repo context, etc.)
+    and adds a variant-scoped file instruction. Returns the cleaned header
+    code (possibly empty / incomplete; the caller validates with
+    :func:`_looks_complete_header`).
+    """
+    guard = re.sub(r"[^A-Za-z0-9]", "_", header_filename).upper()
+    others = [v for v in all_variants if v != variant_name]
+    sec_file = (
+        f"## File to Transform: {base_header_name} -> {header_filename} "
+        f"(VARIANT: {variant_name})\n\n```c\n{original}\n```\n\n"
+        f"The Target ICD defines multiple variants of this peripheral: "
+        f"{', '.join(all_variants)}.\n"
+        f"Generate the header for ONLY the '{variant_name}' variant. Output a "
+        f"SINGLE complete, self-contained C header file (to be saved as "
+        f"{header_filename}) that conforms to the Target ICD for this variant:\n"
+        f"- Use include guard {guard}.\n"
+        f"- Start with a banner comment naming the '{variant_name}' variant and "
+        f"what makes it distinct.\n"
+        f"- Define ONLY this variant's structs / enums / constants / macros, "
+        f"plus any definitions shared by ALL variants. Do NOT define the other "
+        f"variants ({', '.join(others) if others else 'none'}).\n"
+        f"- Use the exact repository type names, function signatures, and "
+        f"#include paths.\n"
+        "Output ONLY the header code in ```c fences. Do not summarise or "
+        "truncate; include the full ending (#endif)."
+    )
+    sections = list(base_sections) + [("file_to_transform", sec_file, 0)]
+    system_tokens = _estimate_tokens(transform_system)
+    prompt = _assemble_prompt(
+        sections, max_input_tokens=MAX_INPUT_TOKENS - system_tokens,
+    )
+    clean = ""
+    for attempt in range(1, 3):
+        attempt_prompt = prompt
+        if attempt > 1 and clean:
+            attempt_prompt = (
+                f"{prompt}\n\n"
+                "The previous output was incomplete/truncated. Continue from "
+                "the exact point where it stopped, output ONLY the missing "
+                "remainder, and ensure all braces/comments are closed and the "
+                "file ends with #endif.\n\n"
+                f"Previous partial output:\n```c\n{clean}\n```"
+            )
+        try:
+            out = _call_llm_complete(
+                transform_system, attempt_prompt, max_tokens=4096, max_passes=2,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "Variant header generation for %s (%s) failed: %s",
+                header_filename, variant_name, e,
+            )
+            break
+        chunk = _extract_fenced(out, "c").strip()
+        clean = chunk if attempt == 1 else (
+            clean.rstrip() + "\n" + chunk.lstrip()
+        ).strip()
+        if _looks_complete_header(clean):
+            break
+    return clean
+
+
 def extract_pdf_text(pdf_path: Path) -> str:
     """Extract all text from a PDF using PyMuPDF."""
     doc = fitz.open(str(pdf_path))
@@ -4230,25 +4410,40 @@ async def process(session_id: str):
                         ),
                     })
                     distill_system = (
-                        "You are an expert embedded C refactoring analyst. "
-                        "Rewrite ICD delta specifications to be concise while "
-                        "preserving complete technical coverage."
+                        "You are an expert embedded C refactoring analyst. You "
+                        "tighten ICD delta specifications by removing ONLY "
+                        "redundancy, repetition and filler prose. You NEVER drop "
+                        "technical facts. The distilled output must remain fully "
+                        "comprehensive: an engineer must be able to refactor the C "
+                        "code from the distilled spec alone, without consulting the "
+                        "original."
                     )
                     distill_prompt = (
-                        "Distill the following complete ICD change specification.\n\n"
-                        "Requirements:\n"
-                        "1. Keep it concise and remove redundancy.\n"
-                        "2. Preserve ALL actionable changes and old->new mappings.\n"
-                        "3. Keep C-impact details for structs, enums, functions, "
-                        "constants, macros, and symbols.\n"
-                        "4. Do NOT introduce new changes.\n"
-                        "5. If the specification describes MULTIPLE variations "
+                        "Condense the following ICD change specification WITHOUT "
+                        "losing any technical information. This is a lossless "
+                        "compression of wording, NOT a summary.\n\n"
+                        "MUST PRESERVE (never omit, never abbreviate away):\n"
+                        "- Every changed/added/removed field, struct, enum, "
+                        "constant, macro, message ID, function/API and symbol, "
+                        "with its OLD -> NEW mapping.\n"
+                        "- All concrete values: types, bit widths, sizes, offsets, "
+                        "alignment/padding, byte order, ranges, units, scale "
+                        "factors, default/initial values, sample rates, timing.\n"
+                        "- File/symbol citations (which .c/.h and which symbol "
+                        "each change touches) and any item marked NEW.\n"
+                        "- Behaviour / protocol / state / timing constraints.\n"
+                        "REMOVE ONLY: duplicated statements, restated context, "
+                        "verbose narration, and filler — never substantive detail.\n"
+                        "If the specification describes MULTIPLE variations "
                         "(variants / configurations / modes) of the same "
                         "peripheral, PRESERVE the per-variation structure: keep a "
                         "separate, clearly-labelled subsection (bullet points or a "
-                        "table) for each variation and keep the shared parts "
-                        "separate. Do NOT merge variations together.\n"
-                        "6. Output only the distilled specification text.\n\n"
+                        "table) for EACH variation with that variation's full field "
+                        "set, and keep the SHARED parts in their own section. Do "
+                        "NOT merge variations together and do NOT drop any "
+                        "variation.\n"
+                        "Do NOT introduce new changes. Output only the distilled "
+                        "specification text.\n\n"
                         "## Original change specification\n"
                         f"{raw_change_spec}"
                     )
@@ -4256,15 +4451,35 @@ async def process(session_id: str):
                         distilled = _call_llm_complete(
                             distill_system,
                             distill_prompt,
-                            max_tokens=3072,
-                            max_passes=4,
+                            max_tokens=4096,
+                            max_passes=6,
                         ).strip()
-                        if distilled:
+                        # Guard against over-aggressive distillation that
+                        # silently drops important detail: if the distilled
+                        # spec is suspiciously small relative to the
+                        # comprehensive one, keep the comprehensive version.
+                        min_keep = max(1200, int(len(raw_change_spec) * 0.45))
+                        if distilled and len(distilled) >= min_keep:
                             change_spec = distilled
                             log.info(
                                 "Distilled change_spec from %d to %d chars",
                                 len(raw_change_spec), len(change_spec),
                             )
+                        elif distilled:
+                            log.warning(
+                                "Distilled change_spec too short (%d < %d chars); "
+                                "keeping comprehensive raw version to avoid detail "
+                                "loss.", len(distilled), min_keep,
+                            )
+                            yield _sse({
+                                "type": "info",
+                                "stage": "analysis",
+                                "message": (
+                                    "Distilled spec looked too sparse — keeping the "
+                                    "comprehensive version to avoid dropping "
+                                    "details."
+                                ),
+                            })
                         else:
                             log.warning(
                                 "Distillation returned empty output; using raw change_spec"
@@ -4510,6 +4725,101 @@ async def process(session_id: str):
             sec_code = ""
             # sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             is_header = fname.lower().endswith(".h")
+
+            # ---- Deterministic per-variant header generation ----
+            # When the Target ICD defines multiple variants of THIS header's
+            # peripheral, generate one self-contained .h FILE per variant
+            # (named after the variant) using a focused call per variant.
+            # This is far more reliable than asking the model to emit several
+            # files with markers inside one capped response.
+            if is_header:
+                variant_names = _detect_peripheral_variants(
+                    original, fname, change_spec, target_summary,
+                )
+                if len(variant_names) >= 2:
+                    base_stem = fname[:-2]  # drop trailing ".h"
+                    yield _sse({
+                        "type": "info",
+                        "stage": "transform",
+                        "file": fname,
+                        "message": (
+                            f"{fname}: Target ICD defines {len(variant_names)} "
+                            f"variants ({', '.join(variant_names)}) — generating "
+                            "one header file per variant…"
+                        ),
+                    })
+                    variant_files: dict[str, str] = {}
+                    for vname in variant_names:
+                        slug = _variant_slug(vname)
+                        if not slug:
+                            continue
+                        hfn = f"{base_stem}_{slug}.h"
+                        yield _sse({
+                            "type": "info",
+                            "stage": "transform",
+                            "file": hfn,
+                            "message": f"Generating {hfn} for variant '{vname}'…",
+                        })
+                        vcode = _generate_variant_header(
+                            base_sections=base_sections,
+                            transform_system=transform_system,
+                            base_header_name=fname,
+                            original=original,
+                            variant_name=vname,
+                            all_variants=variant_names,
+                            header_filename=hfn,
+                        )
+                        if vcode and _looks_complete_header(vcode):
+                            variant_files[hfn] = vcode
+                        else:
+                            yield _sse({
+                                "type": "info",
+                                "stage": "transform",
+                                "file": hfn,
+                                "message": (
+                                    f"Variant '{vname}' header looked incomplete; "
+                                    "it will be skipped."
+                                ),
+                            })
+                    if len(variant_files) >= 2:
+                        for hfn, vcode in sorted(variant_files.items()):
+                            (gen_dir / hfn).write_text(vcode)
+                            yield _sse({
+                                "type": "file_complete",
+                                "file": hfn,
+                                "size": len(vcode),
+                            })
+                        log.info(
+                            "Transform %s: emitted %d per-variant header files: %s",
+                            fname, len(variant_files),
+                            ", ".join(sorted(variant_files)),
+                        )
+                        yield _sse({
+                            "type": "info",
+                            "stage": "transform",
+                            "file": fname,
+                            "message": (
+                                f"{fname}: generated {len(variant_files)} separate "
+                                f"per-variant header files "
+                                f"({', '.join(sorted(variant_files))})."
+                            ),
+                        })
+                        continue
+                    log.warning(
+                        "Transform %s: deterministic per-variant generation "
+                        "produced <2 complete headers; falling back to single "
+                        "header output.", fname,
+                    )
+                    yield _sse({
+                        "type": "info",
+                        "stage": "transform",
+                        "file": fname,
+                        "message": (
+                            f"{fname}: could not generate separate variant headers "
+                            "reliably — falling back to a single header."
+                        ),
+                    })
+
             if is_header:
                 base_stem = fname[:-2]  # drop trailing ".h"
                 variation_instr = (
