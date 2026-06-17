@@ -449,6 +449,61 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
+# Regex for extracting "technical fact tokens" from a change-spec text.
+# Used by the distillation validator to confirm that the distilled output
+# preserves the substantive facts present in the raw spec (hex constants,
+# numeric literals, multi-part identifiers, common embedded units). Tokens
+# that appear in BOTH raw and distilled are evidence of fact preservation.
+_FACT_TOKEN_RE = re.compile(
+    r"""
+      0[xX][0-9A-Fa-f]+                       # hex constants (0xEB90)
+    | \b\d+(?:\.\d+)?\b                       # numeric literals (1000, 0.001)
+    | \b[A-Za-z]\w*_\w+\b                     # any identifier containing '_'
+                                              # (uint32_t, acc_x, msg_id,
+                                              #  ImuHeader_t, High_Rate,
+                                              #  IMU_BAUD_RATE)
+    | \b[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+\b      # CamelCase ≥2 words (no '_')
+    | \b[A-Z]{2,}\b                           # ACRONYMS
+    | \b(?:Hz|kHz|MHz|GHz|us|ms|ns|dps|rps|bps|kbps|Mbps|MB|KB|GB)\b
+    """,
+    re.VERBOSE,
+)
+
+
+def _extract_fact_tokens(text: str) -> set[str]:
+    """Extract a set of distinctive "fact tokens" from *text*.
+
+    Returns the set of substantive tokens (hex / numeric constants, multi-part
+    identifiers, common embedded units) that a faithful distillation must
+    preserve. Single-letter and 1-char tokens are excluded as noise.
+    """
+    if not text:
+        return set()
+    return {
+        m.group(0)
+        for m in _FACT_TOKEN_RE.finditer(text)
+        if len(m.group(0)) >= 2
+    }
+
+
+def _distillation_fact_check(
+    raw: str, distilled: str, min_ratio: float = 0.80,
+) -> tuple[bool, list[str], float]:
+    """Verify that *distilled* preserves most fact tokens from *raw*.
+
+    Returns ``(ok, missing_tokens_sorted, ratio_kept)``. ``ok`` is ``True``
+    when the kept-ratio meets ``min_ratio``. Missing tokens are sorted for
+    deterministic retry prompts.
+    """
+    raw_facts = _extract_fact_tokens(raw)
+    if not raw_facts:
+        return True, [], 1.0
+    distilled_facts = _extract_fact_tokens(distilled)
+    missing = raw_facts - distilled_facts
+    kept = (len(raw_facts) - len(missing)) / len(raw_facts)
+    return kept >= min_ratio, sorted(missing), kept
+
+
 def _detect_peripheral_variants(
     original: str, fname: str, change_spec: str, target_summary: str,
 ) -> list[str]:
@@ -4212,6 +4267,9 @@ async def process(session_id: str):
                     })
 
                 raw_change_spec = complete_analysis.strip()
+                # Default to raw; only overwrite below when distillation
+                # genuinely produces a shorter/cleaner version that survives
+                # the fact-preservation check.
                 change_spec = raw_change_spec
                 if raw_change_spec:
                     yield _sse({
@@ -4219,94 +4277,177 @@ async def process(session_id: str):
                         "stage": "analysis",
                         "message": (
                             "Distilling change specification for conciseness "
-                            "while preserving full coverage..."
+                            "while preserving every technical fact..."
                         ),
                     })
                     distill_system = (
                         "You are an expert embedded C refactoring analyst. You "
-                        "tighten ICD delta specifications by removing ONLY "
-                        "redundancy, repetition and filler prose. You NEVER drop "
-                        "technical facts. The distilled output must remain fully "
-                        "comprehensive: an engineer must be able to refactor the C "
-                        "code from the distilled spec alone, without consulting the "
-                        "original."
+                        "produce a SHORTER, more compact rewrite of ICD delta "
+                        "specifications. Your output is a distillation — it must "
+                        "be different from the input, removing redundancy and "
+                        "verbose prose, while preserving EVERY technical fact "
+                        "verbatim (hex constants, numeric literals, type names, "
+                        "field names, identifiers, units, scale factors). An "
+                        "engineer must be able to refactor C code from the "
+                        "distilled spec alone."
                     )
-                    distill_prompt = (
-                        "Condense the following ICD change specification WITHOUT "
-                        "losing any technical information. This is a lossless "
-                        "compression of wording, NOT a summary.\n\n"
-                        "MUST PRESERVE (never omit, never abbreviate away):\n"
-                        "- Every changed/added/removed field, struct, enum, "
-                        "constant, macro, message ID, function/API and symbol, "
-                        "with its OLD -> NEW mapping.\n"
-                        "- All concrete values: types, bit widths, sizes, offsets, "
-                        "alignment/padding, byte order, ranges, units, scale "
-                        "factors, default/initial values, sample rates, timing.\n"
-                        "- File/symbol citations (which .c/.h and which symbol "
-                        "each change touches) and any item marked NEW.\n"
-                        "- Behaviour / protocol / state / timing constraints.\n"
-                        "REMOVE ONLY: duplicated statements, restated context, "
-                        "verbose narration, and filler — never substantive detail.\n"
-                        "If the specification describes MULTIPLE variations "
-                        "(variants / configurations / modes) of the same "
-                        "peripheral, PRESERVE the per-variation structure: keep a "
-                        "separate, clearly-labelled subsection (bullet points or a "
-                        "table) for EACH variation with that variation's full field "
-                        "set, and keep the SHARED parts in their own section. Do "
-                        "NOT merge variations together and do NOT drop any "
-                        "variation.\n"
-                        "Do NOT introduce new changes. Output only the distilled "
-                        "specification text.\n\n"
+                    base_distill_prompt = (
+                        "Produce a DISTILLED version of the following ICD change "
+                        "specification.\n\n"
+                        "MANDATORY RULES:\n"
+                        "1. Your output MUST be shorter than the input (aim for "
+                        "40-60% of the original length). It MUST be different "
+                        "from the input — never echo it back verbatim.\n"
+                        "2. Preserve EVERY technical fact verbatim: every hex "
+                        "constant (e.g. 0xEB90), numeric literal, type "
+                        "(uint8_t/uint16_t/uint32_t), field name, struct/enum/"
+                        "macro/function identifier, message ID, scale factor, "
+                        "sample rate, unit and OLD -> NEW mapping. Do NOT "
+                        "rename or paraphrase identifiers.\n"
+                        "3. Preserve file/symbol citations (which .c/.h and "
+                        "which symbol each change touches) and any item marked "
+                        "NEW.\n"
+                        "4. Preserve behaviour / protocol / state / timing "
+                        "constraints.\n"
+                        "5. If the spec describes MULTIPLE variations (variants "
+                        "/ configurations / modes) of the same peripheral, "
+                        "PRESERVE the per-variation structure: a clearly-"
+                        "labelled subsection per variation with that variation's "
+                        "FULL field set, plus a separate SHARED section. Do NOT "
+                        "merge variations and do NOT drop any.\n"
+                        "6. REMOVE: duplicated statements, restated context, "
+                        "verbose narration and filler prose — never substantive "
+                        "detail. Use compact bullet points / tables.\n"
+                        "7. Do NOT introduce new changes. Output ONLY the "
+                        "distilled specification text (no preamble, no JSON, no "
+                        "code fences around the whole thing).\n\n"
                         "## Original change specification\n"
                         f"{raw_change_spec}"
                     )
-                    try:
-                        distilled = _call_llm_complete(
-                            distill_system,
-                            distill_prompt,
-                            max_tokens=4096,
-                            max_passes=6,
-                        ).strip()
-                        # Guard against over-aggressive distillation that
-                        # silently drops important detail: if the distilled
-                        # spec is suspiciously small relative to the
-                        # comprehensive one, keep the comprehensive version.
-                        min_keep = max(1200, int(len(raw_change_spec) * 0.45))
-                        if distilled and len(distilled) >= min_keep:
-                            change_spec = distilled
-                            log.info(
-                                "Distilled change_spec from %d to %d chars",
-                                len(raw_change_spec), len(change_spec),
-                            )
-                        elif distilled:
+                    raw_facts_count = len(_extract_fact_tokens(raw_change_spec))
+
+                    def _call_distill(prompt_text: str) -> str:
+                        try:
+                            return _call_llm_complete(
+                                distill_system, prompt_text,
+                                max_tokens=4096, max_passes=6,
+                            ).strip()
+                        except Exception as e:        # noqa: BLE001
                             log.warning(
-                                "Distilled change_spec too short (%d < %d chars); "
-                                "keeping comprehensive raw version to avoid detail "
-                                "loss.", len(distilled), min_keep,
+                                "change_spec distillation call failed: %s", e,
+                            )
+                            return ""
+
+                    distilled = _call_distill(base_distill_prompt)
+                    ok, missing, kept_ratio = _distillation_fact_check(
+                        raw_change_spec, distilled,
+                    )
+                    needs_retry_reason = ""
+                    if not distilled:
+                        needs_retry_reason = "previous attempt produced no output"
+                    elif distilled == raw_change_spec:
+                        needs_retry_reason = (
+                            "previous attempt returned the input verbatim; you "
+                            "MUST condense it"
+                        )
+                    elif not ok:
+                        sample = ", ".join(missing[:60])
+                        needs_retry_reason = (
+                            "previous attempt dropped required technical "
+                            f"tokens — re-include them verbatim: {sample}"
+                        )
+                    if needs_retry_reason:
+                        yield _sse({
+                            "type": "info",
+                            "stage": "analysis",
+                            "message": (
+                                "Distillation needs a second pass — facts "
+                                f"kept: {kept_ratio:.0%}, retrying with focused "
+                                "guidance."
+                            ),
+                        })
+                        retry_prompt = (
+                            f"{base_distill_prompt}\n\n"
+                            f"## Retry guidance\n{needs_retry_reason}.\n"
+                            "Produce a NEW, shorter distillation that satisfies "
+                            "every rule above."
+                        )
+                        distilled2 = _call_distill(retry_prompt)
+                        ok2, missing2, kept2 = _distillation_fact_check(
+                            raw_change_spec, distilled2,
+                        )
+                        # Accept the retry whenever it produces a usable,
+                        # genuinely distilled output. We MUST swap when the
+                        # first attempt was empty or was the raw verbatim
+                        # (raw-verbatim trivially has 1.0 fact coverage but
+                        # is NOT a distillation). Otherwise accept the retry
+                        # when its fact coverage is at least as good.
+                        if distilled2 and distilled2 != raw_change_spec:
+                            first_unusable = (
+                                not distilled or distilled == raw_change_spec
+                            )
+                            if first_unusable or kept2 >= kept_ratio:
+                                distilled, ok, missing, kept_ratio = (
+                                    distilled2, ok2, missing2, kept2,
+                                )
+
+                    if distilled and distilled != raw_change_spec:
+                        change_spec = distilled
+                        if ok:
+                            log.info(
+                                "Distilled change_spec: %d -> %d chars "
+                                "(facts kept %.0f%%, %d/%d).",
+                                len(raw_change_spec), len(change_spec),
+                                kept_ratio * 100,
+                                raw_facts_count - len(missing),
+                                raw_facts_count,
                             )
                             yield _sse({
                                 "type": "info",
                                 "stage": "analysis",
                                 "message": (
-                                    "Distilled spec looked too sparse — keeping the "
-                                    "comprehensive version to avoid dropping "
-                                    "details."
+                                    f"Distilled change_spec: "
+                                    f"{len(raw_change_spec):,} -> "
+                                    f"{len(change_spec):,} chars "
+                                    f"({kept_ratio:.0%} of technical facts "
+                                    "preserved). Raw comprehensive version "
+                                    "saved to change_spec_raw.txt."
                                 ),
                             })
                         else:
                             log.warning(
-                                "Distillation returned empty output; using raw change_spec"
+                                "Distilled change_spec accepted with reduced "
+                                "fact coverage: %d -> %d chars "
+                                "(facts kept %.0f%%, missing %d tokens). "
+                                "Comprehensive version available in "
+                                "change_spec_raw.txt.",
+                                len(raw_change_spec), len(change_spec),
+                                kept_ratio * 100, len(missing),
                             )
-                    except Exception as e:            # noqa: BLE001
+                            yield _sse({
+                                "type": "info",
+                                "stage": "analysis",
+                                "message": (
+                                    f"Distilled spec accepted with "
+                                    f"{kept_ratio:.0%} fact coverage; the "
+                                    "comprehensive raw version is in "
+                                    "change_spec_raw.txt."
+                                ),
+                            })
+                    else:
                         log.warning(
-                            "change_spec distillation failed, using raw output: %s", e,
+                            "Distillation could not produce a usable shorter "
+                            "version (empty=%s, equals_raw=%s); change_spec "
+                            "will mirror change_spec_raw for this run.",
+                            not distilled, distilled == raw_change_spec,
                         )
                         yield _sse({
                             "type": "info",
                             "stage": "analysis",
                             "message": (
-                                "Distillation failed; using original analysis output "
-                                "as change specification."
+                                "Distillation did not produce a usable shorter "
+                                "version this time — change_spec will mirror "
+                                "the comprehensive raw spec."
                             ),
                         })
                 log.info(
