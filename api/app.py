@@ -251,17 +251,7 @@ HEADER_DOCUMENTATION_SYSTEM_PROMPT = (
     " * ============================================================ */\n"
     "```\n\n"
 
-    "### B. Section dividers\n"
-    "Insert a section divider comment before each logical group:\n"
-    "```c\n"
-    "/* --- Macros --------------------------------------------------------------- */\n"
-    "/* --- Enumerations --------------------------------------------------------- */\n"
-    "/* --- Data Structures ------------------------------------------------------ */\n"
-    "/* --- Function Prototypes -------------------------------------------------- */\n"
-    "```\n"
-    "Only include a section divider if that section is non-empty in the file.\n\n"
-
-    "### C. Struct and enum block comments\n"
+    "### B. Struct and enum block comments\n"
     "Before each `typedef struct` or `typedef enum`, insert a block comment:\n"
     "```c\n"
     "/**\n"
@@ -271,7 +261,7 @@ HEADER_DOCUMENTATION_SYSTEM_PROMPT = (
     " */\n"
     "```\n\n"
 
-    "### D. Inline field comments\n"
+    "### C. Inline field comments\n"
     "Every struct field and every enum member MUST have an inline `/* ... */` comment "
     "on the same line. Each comment must include ALL of the following that are "
     "defined in the ICD for that field — omit a sub-item only if the ICD truly does "
@@ -289,12 +279,12 @@ HEADER_DOCUMENTATION_SYSTEM_PROMPT = (
     "range: [-400, 400] | conv: raw * 0.01220703125 = deg/s | res: 0.012 deg/s */\n"
     "```\n\n"
 
-    "### E. Macro comments\n"
+    "### D. Macro comments\n"
     "Every `#define` MUST have an inline `/* ... */` comment that states:\n"
     "  - What the constant represents\n"
     "  - Its unit or meaning (e.g. `/* Maximum payload length in bytes */`)\n\n"
 
-    "### F. Closing size comment on structs\n"
+    "### E. Closing size comment on structs\n"
     "After the closing brace of every `typedef struct`, append a size comment:\n"
     "```c\n"
     "} sMyStruct;  /* Total: <N> bytes */\n"
@@ -319,6 +309,60 @@ HEADER_DOCUMENTATION_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _strip_c_comments(code: str) -> str:
+    result = []
+    i = 0
+    n = len(code)
+    in_string = False
+    in_char   = False
+    while i < n:
+        c = code[i]
+        if in_string:
+            result.append(c)
+            if c == '\\' and i + 1 < n:
+                i += 1
+                result.append(code[i])
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if in_char:
+            result.append(c)
+            if c == '\\' and i + 1 < n:
+                i += 1
+                result.append(code[i])
+            elif c == "'":
+                in_char = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            result.append(c)
+            i += 1
+            continue
+        if c == "'":
+            in_char = True
+            result.append(c)
+            i += 1
+            continue
+        if c == '/' and i + 1 < n and code[i + 1] == '*':
+            i += 2
+            while i < n - 1:
+                if code[i] == '*' and code[i + 1] == '/':
+                    i += 2
+                    break
+                i += 1
+            else:
+                i = n
+            continue
+        if c == '/' and i + 1 < n and code[i + 1] == '/':
+            i += 2
+            while i < n and code[i] != '\n':
+                i += 1
+            continue
+        result.append(c)
+        i += 1
+    return re.sub(r'\n{3,}', '\n\n', ''.join(result))
 
 def _tail_truncate_for_sse(text: str, max_chars: int, label: str) -> str:
     """Return the *end* of *text*, suitable for error-heavy compiler output.
@@ -1081,7 +1125,7 @@ def _build_source_scripts_context(
         """Append one file. Returns False when the budget is exhausted."""
         nonlocal budget
         try:
-            content = fp.read_text(errors="replace")
+            content = _strip_c_comments(fp.read_text(errors="replace"))
         except Exception:
             return True
         rel = str(fp.relative_to(code_dir))
@@ -4441,29 +4485,30 @@ async def process(session_id: str):
                     f"naming conventions from these files.\n\n{file_repo_ctx}"
                 )
             sec_knowledge = ""
-            if repo_knowledge:
-                sec_knowledge = (
-                    f"## Repository Codebase Knowledge\n"
-                    f"Detailed inventory of types, functions, variables, and macros "
-                    f"from the repository. Use these as ground truth for naming, "
-                    f"types, and conventions.\n\n{repo_knowledge}"
-                )
+            # if repo_knowledge:
+            #     sec_knowledge = (
+            #         f"## Repository Codebase Knowledge\n"
+            #         f"Detailed inventory of types, functions, variables, and macros "
+            #         f"from the repository. Use these as ground truth for naming, "
+            #         f"types, and conventions.\n\n{repo_knowledge}"
+            #     )
             sec_gitnexus = ""
-            if gitnexus_report:
-                sec_gitnexus = (
-                    f"## GitNexus Codebase Understanding\n"
-                    f"Embedded-systems-specific relationships extracted from the "
-                    f"uploaded repository (ISR/task wiring, drivers/peripherals, "
-                    f"RTOS or superloop, state machines, communication stacks, "
-                    f"memory ownership, HAL boundaries, bootloader/firmware-update "
-                    f"hooks, safety chains, cross-module #include graph, global "
-                    f"variable read/write graph, build-script deps). Honor the "
-                    f"relationships listed here when modifying ISRs, drivers, "
-                    f"shared globals, comm-stack callers, state-machine "
-                    f"dispatch tables and safety-critical paths.\n\n"
-                    f"{gitnexus_report}"
-                )
-            sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
+            # if gitnexus_report:
+            #     sec_gitnexus = (
+            #         f"## GitNexus Codebase Understanding\n"
+            #         f"Embedded-systems-specific relationships extracted from the "
+            #         f"uploaded repository (ISR/task wiring, drivers/peripherals, "
+            #         f"RTOS or superloop, state machines, communication stacks, "
+            #         f"memory ownership, HAL boundaries, bootloader/firmware-update "
+            #         f"hooks, safety chains, cross-module #include graph, global "
+            #         f"variable read/write graph, build-script deps). Honor the "
+            #         f"relationships listed here when modifying ISRs, drivers, "
+            #         f"shared globals, comm-stack callers, state-machine "
+            #         f"dispatch tables and safety-critical paths.\n\n"
+            #         f"{gitnexus_report}"
+            #     )
+            sec_code = ""
+            # sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             is_header = fname.lower().endswith(".h")
             if is_header:
                 base_stem = fname[:-2]  # drop trailing ".h"
@@ -4831,10 +4876,11 @@ async def process(session_id: str):
                         if verify_repo else ""
                     )
                     sec_spec_v = f"## Change Specification (must be applied)\n{change_spec}"
-                    sec_gitnexus_v = (
-                        f"## GitNexus Codebase Understanding\n{gitnexus_report}"
-                        if gitnexus_report else ""
-                    )
+                    # sec_gitnexus_v = (
+                    #     f"## GitNexus Codebase Understanding\n{gitnexus_report}"
+                    #     if gitnexus_report else ""
+                    # )
+                    sec_gitnexus_v = ""
                     sec_code_v = (
                         f"## Code to Verify ({gfname})\n```c\n{generated_code}\n```\n\n"
                         "Output the verified/corrected file."
@@ -5562,13 +5608,13 @@ async def regenerate(session_id: str):
                     f"conventions from these files.\n\n{file_repo_ctx}"
                 )
             sec_knowledge = ""
-            if repo_knowledge:
-                sec_knowledge = (
-                    f"## Repository Codebase Knowledge\n"
-                    f"Detailed inventory of types, functions, variables, and macros "
-                    f"from the repository. Use these as ground truth for naming, "
-                    f"types, and conventions.\n\n{repo_knowledge}"
-                )
+            # if repo_knowledge:
+            #     sec_knowledge = (
+            #         f"## Repository Codebase Knowledge\n"
+            #         f"Detailed inventory of types, functions, variables, and macros "
+            #         f"from the repository. Use these as ground truth for naming, "
+            #         f"types, and conventions.\n\n{repo_knowledge}"
+            #     )
             sec_gitnexus = ""
             if gitnexus_report:
                 sec_gitnexus = (
