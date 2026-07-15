@@ -100,6 +100,15 @@ SANDBOX_BUILD_TIMEOUT = 120
 SANDBOX_SSE_MAX_BUILD_LOG_CHARS = int(
     os.environ.get("SANDBOX_SSE_MAX_BUILD_LOG_CHARS", "200000")
 )
+# Agentic multi-agent pipeline (agent-of-agents orchestration).
+# When enabled, /api/process routes through the agentic pipeline in
+# api/agentic_pipeline/ (six multi-agent stage teams + MissionController
+# with non-sequential feedback routing). The dedicated endpoint
+# /api/process-agentic/{id} is always available regardless of this flag.
+AGENTIC_PIPELINE = os.environ.get(
+    "AGENTIC_PIPELINE", "0"
+).strip().lower() not in ("0", "false", "no", "off")
+
 # Orchestrator agent settings — drives the iterative debugging loop.
 SANDBOX_USE_ORCHESTRATOR = os.environ.get(
     "SANDBOX_USE_ORCHESTRATOR", "1"
@@ -3766,9 +3775,110 @@ async def resume_session(session_id: str):
     }
 
 
+def _agentic_streaming_response(session_id: str) -> StreamingResponse:
+    """Run the agentic multi-agent pipeline for *session_id* (SSE stream).
+
+    Same input validation, session layout, SSE event contract and final
+    artifacts as the classic ``/api/process`` pipeline — the difference is
+    the execution model: six multi-agent teams orchestrated by an
+    agent-of-agents MissionController with non-sequential feedback routing
+    (see ``api/agentic_pipeline/``).
+    """
+    from agentic_pipeline import run_agentic_pipeline
+    from agentic_pipeline.llm import make_agent_llm
+
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    status = json.loads((session_dir / "status.json").read_text())
+    if not status.get("files"):
+        raise HTTPException(status_code=400, detail="No code files uploaded")
+    if not status.get("source_icd"):
+        raise HTTPException(status_code=400, detail="Source ICD not uploaded")
+    if not status.get("target_icd"):
+        raise HTTPException(status_code=400, detail="Target ICD not uploaded")
+
+    code_dir = session_dir / "original_code"
+    gen_dir = session_dir / "generated_code"
+    gen_dir.mkdir(exist_ok=True)
+    source_icd = (session_dir / "source_icd.txt").read_text()
+    target_icd = (session_dir / "target_icd.txt").read_text()
+    repo_dir = session_dir / "repo_contents"
+    has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
+
+    status["pause_requested"] = False
+    status["state"] = "processing"
+    status["pipeline_state"] = {
+        "completed_stages": [], "completed_files": [], "events": 0,
+    }
+    events_path = session_dir / PIPELINE_EVENTS_FILE
+    if events_path.exists():
+        events_path.unlink()
+    _write_status(session_dir, status)
+
+    log.info(
+        "Agentic process %s: source_icd=%d chars, target_icd=%d chars, "
+        "has_repo=%s", session_id[:8], len(source_icd), len(target_icd),
+        has_repo,
+    )
+
+    def event_stream():
+        yield _sse({
+            "type": "info",
+            "stage": "analysis",
+            "message": "Checking llama-server availability...",
+        })
+        try:
+            _wait_for_llm_ready(timeout_s=300)
+        except Exception as e:
+            yield _sse({
+                "type": "error",
+                "message": (
+                    f"{e} This usually means llama-server failed during "
+                    "startup. Check container terminal/tmux logs for "
+                    "CUDA/GPU errors."
+                ),
+            })
+            return
+        try:
+            for payload in run_agentic_pipeline(
+                session_dir=session_dir,
+                gen_dir=gen_dir,
+                code_dir=code_dir,
+                repo_dir=repo_dir,
+                has_repo=has_repo,
+                source_icd=source_icd,
+                target_icd=target_icd,
+                llm=make_agent_llm(),
+            ):
+                yield _sse(payload)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Agentic pipeline failed: %s", e)
+            yield _sse({"type": "error", "message": str(e)})
+
+    return StreamingResponse(
+        _pausable_stream(session_dir, event_stream()),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/process-agentic/{session_id}")
+async def process_agentic(session_id: str):
+    """Agentic multi-agent pipeline (agent-of-agents). SSE stream."""
+    return _agentic_streaming_response(session_id)
+
+
 @app.get("/api/process/{session_id}")
 async def process(session_id: str):
     """Analyze ICDs and transform every code file. Returns an SSE stream."""
+    if AGENTIC_PIPELINE:
+        return _agentic_streaming_response(session_id)
     session_dir = SESSIONS_DIR / session_id
     if not session_dir.exists():
         raise HTTPException(status_code=404, detail="Session not found")

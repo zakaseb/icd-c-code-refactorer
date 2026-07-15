@@ -3,3 +3,9 @@ uvicorn[standard]>=0.27.0
 httpx>=0.26.0
 PyMuPDF>=1.24.0
 python-multipart>=0.0.6
+# Agentic multi-agent pipeline (api/agentic_pipeline/): drives agent calls
+# through the Claude Agent SDK pointed at the LOCAL model via an
+# Anthropic-compatible endpoint (Ollama >= 0.14 or the bundled LiteLLM
+# proxy). The pipeline degrades gracefully to the direct llama-server
+# backend when this package is not installed.
+claude-agent-sdk>=0.2.0

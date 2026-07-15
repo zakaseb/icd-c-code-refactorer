@@ -105,6 +105,11 @@ icd-c-code-refactorer/
 │   ├── per_file_compile.py            # Per-file .c → .o compile gate
 │   ├── orchestrator.py                # Sandbox-build agentic debug loop
 │   ├── agentic_debug.py               # Agentic-AI single-hypothesis debug pipeline
+│   ├── agentic_pipeline/              # Multi-agent teams + agent-of-agents mission
+│   │   ├── mission.py                 # MissionController (non-sequential routing)
+│   │   ├── blackboard.py              # Shared state + routable feedback
+│   │   ├── llm.py                     # Claude Agent SDK / local llama-server backends
+│   │   └── teams/                     # One multi-agent team per pipeline stage
 │   └── static/
 │       ├── index.html                 # Single-page application
 │       ├── app.js                     # Uploads, SSE streaming, conversation UI
@@ -188,6 +193,52 @@ Each run produces a `verification_report.txt` included in the download ZIP:
 2. **Results per File** — structural check pass/fail with specific issues, verification outcome, and unified diffs of any corrections applied automatically.
 3. **Changes from User Feedback** *(regeneration rounds only)* — diffs showing what changed between rounds, with the user feedback quoted.
 4. **Variable Inventory** — complete listing of all variables extracted from each generated file, organised by scope (global, local, parameter, macro) with types and initialiser values.
+
+# Agentic Multi-Agent Pipeline
+
+The classic sequential pipeline has an agentic re-imagining in
+`api/agentic_pipeline/`: every stage is a **multi-agent team**, and the
+whole mission is orchestrated by an **agent-of-agents**
+(`MissionController`). All teams share a blackboard and publish feedback
+that can target ANY stage — so reiteration is non-sequential: a failed
+sandbox build can send the mission straight back to code generation or even
+ICD analysis, not just the previous step. Stage names, SSE events and
+artifacts are identical to the classic pipeline, so the web UI works
+unchanged.
+
+| Stage (SSE) | Team | Agents |
+|---|---|---|
+| `analysis` | Ingestion & Analysis | TargetSummarizer, DocumentAnalyst, SpecSynthesizer, Distiller, FactAuditor |
+| `gitnexus` | Codebase Understanding | RepoCartographer, SystemsArchaeologist, ImpactAssessor |
+| `transform` | Code Generation (.h first, then .c) | VariantScout, InterfaceArchitect, ImplementationEngineer, CompletionCritic |
+| `verification` | Verification | StructuralAuditor, ComplianceReviewer, RepairEngineer |
+| `compile` | Compilation | ToolchainScout, BuildOperator, GateKeeper |
+| `sandbox_build` | Integration & Build | SandboxEngineer, DebugCrew, IntegrationJudge |
+
+**How to run it**
+
+- `GET /api/process-agentic/{session_id}` — always available.
+- `AGENTIC_PIPELINE=1` — routes the regular **Transform Code** button
+  (`/api/process`) through the agentic pipeline.
+
+**LLM backend** (same local model as the classic pipeline)
+
+- `AGENTIC_LLM_BACKEND=auto|claude|local` (default `auto`). With `claude`,
+  agent calls go through the **Claude Agent SDK** pointed at a LOCAL
+  Anthropic-compatible endpoint — Ollama (>= 0.14, native `/v1/messages`)
+  or the LiteLLM proxy shipped in the Docker deployment. `local` calls
+  llama-server directly (identical to the classic pipeline). `auto` picks
+  the SDK when installed, with per-call degradation to `local`.
+- `AGENTIC_ANTHROPIC_BASE_URL` (default: LiteLLM `http://127.0.0.1:4000`;
+  use `http://127.0.0.1:11434` for Ollama) and `AGENTIC_CLAUDE_MODEL`
+  (default: the configured `HF_MODEL` name).
+
+**Mission bounds**: `AGENTIC_MAX_STAGE_RUNS` (default 12) and
+`AGENTIC_MAX_REVISITS_PER_STAGE` (default 2) guarantee termination;
+`AGENTIC_ROUTER_LLM=0` disables the LLM router in favour of the
+deterministic feedback-routing policy. The RTOS/embedded toolchain
+contract (Xilinx SDK 2018 / GCC 7.3.1 / gnu99 / newlib, cross-compiler
+detection) is inherited from the classic pipeline helpers.
 
 # Processing Pipeline
 
