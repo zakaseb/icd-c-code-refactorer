@@ -18,6 +18,8 @@ Covers (no live LLM needed — a scripted FakeLLM plays every agent):
 from __future__ import annotations
 
 import json
+import importlib
+import os
 import shutil
 import sys
 import tempfile
@@ -36,6 +38,7 @@ from agentic_pipeline import (  # noqa: E402
     run_agentic_pipeline,
 )
 from agentic_pipeline.llm import (  # noqa: E402
+    ClaudeSDKBackend,
     LocalLLMBackend,
     ResilientLLM,
     make_agent_llm,
@@ -238,8 +241,31 @@ check("/api/process-agentic/{session_id} route registered",
       "/api/process-agentic/{session_id}" in routes)
 check("/api/process/{session_id} still registered",
       "/api/process/{session_id}" in routes)
-check("AGENTIC_PIPELINE flag defaults to off",
-      real_app.AGENTIC_PIPELINE is False)
+
+# Default-on: unset AGENTIC_PIPELINE -> agentic mode enabled.
+_saved_ap = os.environ.pop("AGENTIC_PIPELINE", None)
+import app as _app_reload  # noqa: E402
+importlib.reload(_app_reload)
+check("AGENTIC_PIPELINE defaults to on when env unset",
+      _app_reload.AGENTIC_PIPELINE is True)
+if _saved_ap is not None:
+    os.environ["AGENTIC_PIPELINE"] = _saved_ap
+else:
+    os.environ["AGENTIC_PIPELINE"] = "1"
+importlib.reload(real_app)
+os.environ["AGENTIC_PIPELINE"] = "0"
+importlib.reload(_app_reload)
+check("AGENTIC_PIPELINE=0 restores classic pipeline",
+      _app_reload.AGENTIC_PIPELINE is False)
+os.environ["AGENTIC_PIPELINE"] = "1"
+importlib.reload(real_app)
+
+check("serve.sh passes AGENTIC_PIPELINE into docker",
+      "AGENTIC_PIPELINE=" in (REPO / "scripts" / "serve.sh").read_text())
+check("Dockerfile bakes AGENTIC_PIPELINE=1",
+      "ENV AGENTIC_PIPELINE=1" in (REPO / "deployments" / "docker" / "Dockerfile").read_text())
+check("Dockerfile installs claude-agent-sdk",
+      "claude-agent-sdk" in (REPO / "deployments" / "docker" / "Dockerfile").read_text())
 
 # ===========================================================================
 print("\n=== Test 2: Blackboard mechanics ===")
@@ -299,6 +325,29 @@ check("resilient falls back on primary error",
 res.complete("s", "u")
 check("resilient degrades permanently after budget",
       "degraded" in res.name)
+_os.environ.pop("AGENTIC_LLM_BACKEND", None)
+
+# When claude-agent-sdk is installed, auto/claude should target the local
+# Anthropic proxy model name (ANTHROPIC_MODEL) with llama-server fallback.
+try:
+    import claude_agent_sdk  # noqa: F401
+    _sdk_present = True
+except Exception:  # noqa: BLE001
+    _sdk_present = False
+if _sdk_present:
+    _os.environ["AGENTIC_LLM_BACKEND"] = "auto"
+    _os.environ["ANTHROPIC_MODEL"] = "openai/test-local-model.gguf"
+    _sdk_llm = make_agent_llm()
+    check("auto backend uses ResilientLLM when SDK installed",
+          isinstance(_sdk_llm, ResilientLLM))
+    check("SDK primary is ClaudeSDKBackend",
+          isinstance(_sdk_llm.primary, ClaudeSDKBackend))
+    check("SDK primary model reads ANTHROPIC_MODEL env",
+          _sdk_llm.primary.model == "openai/test-local-model.gguf")
+    _os.environ.pop("ANTHROPIC_MODEL", None)
+else:
+    check("claude-agent-sdk not installed in test venv (skip SDK checks)",
+          True)
 _os.environ.pop("AGENTIC_LLM_BACKEND", None)
 
 # ===========================================================================

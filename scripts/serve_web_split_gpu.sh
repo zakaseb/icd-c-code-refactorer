@@ -91,6 +91,8 @@ docker run -ti --rm --name "$WEB_CONTAINER" --network=host \
   -e CUDA_VISIBLE_DEVICES= \
   -e NVIDIA_VISIBLE_DEVICES=void \
   -e NVIDIA_DRIVER_CAPABILITIES= \
+  -e AGENTIC_PIPELINE="${AGENTIC_PIPELINE:-1}" \
+  -e AGENTIC_LLM_BACKEND="${AGENTIC_LLM_BACKEND:-auto}" \
   -v "$PROJECT_ROOT/workspace":/home/developer/workspace \
   --entrypoint /bin/bash \
   "$IMAGE" -lc '

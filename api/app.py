@@ -101,12 +101,12 @@ SANDBOX_SSE_MAX_BUILD_LOG_CHARS = int(
     os.environ.get("SANDBOX_SSE_MAX_BUILD_LOG_CHARS", "200000")
 )
 # Agentic multi-agent pipeline (agent-of-agents orchestration).
-# When enabled, /api/process routes through the agentic pipeline in
-# api/agentic_pipeline/ (six multi-agent stage teams + MissionController
-# with non-sequential feedback routing). The dedicated endpoint
-# /api/process-agentic/{id} is always available regardless of this flag.
+# Default ON: /api/process routes through api/agentic_pipeline/ (six
+# multi-agent stage teams + MissionController with non-sequential feedback
+# routing). Set AGENTIC_PIPELINE=0 to restore the classic sequential pipeline.
+# The dedicated endpoint /api/process-agentic/{id} is always available.
 AGENTIC_PIPELINE = os.environ.get(
-    "AGENTIC_PIPELINE", "0"
+    "AGENTIC_PIPELINE", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
 
 # Orchestrator agent settings — drives the iterative debugging loop.

@@ -189,7 +189,11 @@ def make_agent_llm(complete_fn=None):
                 or os.environ.get("ANTHROPIC_BASE_URL")
                 or default_base
             )
-            model = os.environ.get("AGENTIC_CLAUDE_MODEL", default_model)
+            model = (
+                os.environ.get("AGENTIC_CLAUDE_MODEL")
+                or os.environ.get("ANTHROPIC_MODEL")
+                or default_model
+            )
             auth = os.environ.get("ANTHROPIC_AUTH_TOKEN", "ollama")
             claude = ClaudeSDKBackend(
                 model=model, base_url=base_url, auth_token=auth,

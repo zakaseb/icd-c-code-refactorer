@@ -16,7 +16,7 @@ RUN apt-get update \
 
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -U huggingface_hub hf_transfer 'litellm[proxy]' \
-       fastapi 'uvicorn[standard]' httpx PyMuPDF python-multipart
+       fastapi 'uvicorn[standard]' httpx PyMuPDF python-multipart claude-agent-sdk
 
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y nodejs \
@@ -89,6 +89,13 @@ ENV ANTHROPIC_AUTH_TOKEN="$OPENAI_API_KEY"
 ENV ANTHROPIC_MODEL="openai/$HF_MODEL"
 ENV ANTHROPIC_SMALL_FAST_MODEL="openai/$HF_MODEL"
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+# Default pipeline: agentic multi-agent mission via Claude Agent SDK
+# pointed at the local LiteLLM Anthropic proxy (same GGUF model), with
+# per-call degradation to direct llama-server. Set AGENTIC_PIPELINE=0
+# for the classic sequential pipeline.
+ENV AGENTIC_PIPELINE=1
+ENV AGENTIC_LLM_BACKEND=auto
 
 COPY --chown=developer:developer deployments/docker/entrypoint.sh /home/developer/entrypoint.sh
 COPY --chown=developer:developer src/utils/hf_download.py /home/developer/hf_download.py

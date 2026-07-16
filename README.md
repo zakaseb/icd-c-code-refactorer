@@ -80,6 +80,8 @@ mkdir -p models
 
 Open **[http://localhost:8081](http://localhost:8081)** in your browser once the container finishes starting up.
 
+**Transform Code** uses the **agentic multi-agent pipeline** by default (Claude Agent SDK → local LiteLLM proxy → the same Qwen GGUF, with llama-server fallback). To use the classic sequential pipeline instead, rebuild/run with `AGENTIC_PIPELINE=0` (see [Agentic Multi-Agent Pipeline](#agentic-multi-agent-pipeline)).
+
 > On first run, `entrypoint.sh` downloads the Qwen3-Coder-Next GGUF model (~49.3 GB at `UD-Q4_K_XL`) into `models/`. Subsequent starts are fast as the model is cached.
 
 > `run_web.sh` runs a GPU preflight check, reserves CPU cores for the host, and validates port 8081 is free before starting. If the GPU is unavailable it offers a CPU-only fallback (significantly slower).
@@ -217,9 +219,12 @@ unchanged.
 
 **How to run it**
 
-- `GET /api/process-agentic/{session_id}` — always available.
-- `AGENTIC_PIPELINE=1` — routes the regular **Transform Code** button
-  (`/api/process`) through the agentic pipeline.
+- **Default** — `./scripts/serve_web.sh` then **Transform Code** uses the
+  agentic pipeline (Claude Agent SDK → local LiteLLM proxy → same GGUF
+  model, with llama-server fallback).
+- `GET /api/process-agentic/{session_id}` — always available (same path).
+- `AGENTIC_PIPELINE=0` — restores the classic sequential pipeline on
+  `/api/process`.
 
 **LLM backend** (same local model as the classic pipeline)
 
