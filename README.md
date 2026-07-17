@@ -32,7 +32,6 @@ Transform C source code between Interface Control Document (ICD) versions using 
 
 - **ICD Delta Analysis** — Automatically extracts and compares two ICD PDFs to produce an exhaustive, structured change specification covering structs, enums, constants, function signatures, protocol changes, and more.
 - **Repository-Aware Code Generation** — When a repository ZIP is provided, the tool extracts detailed codebase knowledge (types, function signatures, macros, naming conventions) and uses it as ground truth during transformation.
-- **GitNexus Codebase Understanding** — Immediately after the ICD change specification is produced, GitNexus deterministically extracts embedded-systems-specific relationships from the uploaded repository (ISR ↔ task wiring, drivers ↔ peripherals, RTOS/superloop task interactions, state-machine transitions, communication-stack dependencies, memory ownership, HAL/BSP boundaries, bootloader → firmware hand-off, firmware-update flow, safety-critical execution chains, cross-module #include graph, global-variable read/write graph, and build-script dependencies). The resulting `gitnexus_report.txt` is added to the context fed into every .c/.h generation, verification, per-file compile fix, sandbox build and regeneration prompt — alongside the existing ICD change spec, repository codebase knowledge and dependency headers.
 - **Multi-Pass Verification** — Every generated file goes through structural checks (brace matching, header guards, include resolution, function presence) and an LLM verification pass for ICD compliance and repository compatibility.
 - **Conversational Feedback Loop** — After reviewing the output (e.g. pasting build errors), send feedback and click **Re-generate** to produce corrected code that considers your feedback holistically alongside all ICD and repository context.
 - **Variable Inventory** — Verification reports include a complete inventory of all variables, macros, and function parameters in the generated code.
@@ -101,7 +100,6 @@ icd-c-code-refactorer/
 │
 ├── api/                               # FastAPI backend
 │   ├── app.py                         # All endpoints and LLM orchestration
-│   ├── gitnexus.py                    # GitNexus codebase-understanding extractor
 │   ├── per_file_compile.py            # Per-file .c → .o compile gate
 │   ├── orchestrator.py                # Sandbox-build agentic debug loop
 │   ├── agentic_debug.py               # Agentic-AI single-hypothesis debug pipeline
@@ -160,8 +158,7 @@ All upload zones support drag-and-drop and file picker dialogs.
 Click **Transform Code** to start the pipeline. Progress streams in real time:
 
 1. **ICD Analysis** — Both PDFs are extracted, chunked if large, and compared to produce a change specification. When a repository ZIP is provided, the codebase knowledge (file structure, struct definitions, enum values, function signatures, macros) is extracted and included in the analysis report.
-2. **GitNexus Codebase Report** — Runs immediately after the ICD change spec. Deterministically scans the uploaded repository and source scripts to extract ISR↔task wiring, driver/peripheral access, RTOS or superloop task interactions, state-machine transitions, communication-stack dependencies, memory ownership, HAL/BSP boundary, bootloader/firmware-update hooks, safety-critical chains, cross-module dependencies, the global-variable read/write graph and script dependencies. The output is saved as `gitnexus_report.txt` and added to the context for every later prompt.
-3. **Code Transformation** — Each uploaded file is transformed against the target ICD, using the change specification, repository dependency headers, codebase knowledge **and the GitNexus report** as context. Incomplete outputs are automatically continued.
+3. **Code Transformation** — Each uploaded file is transformed against the target ICD, using the change specification, repository dependency headers and codebase knowledge as context. Incomplete outputs are automatically continued.
 4. **Verification** — Each generated file undergoes structural checks and an LLM verification pass. Corrections are applied automatically when possible.
 
 ## 3. Review & Download
@@ -208,27 +205,10 @@ Each run produces a `verification_report.txt` included in the download ZIP:
                         └──────────────────┬───────────────────────────┘
                                            │
                         ┌──────────────────▼───────────────────────────┐
-                        │   GitNexus Codebase Report (Step 1b)         │
-                        │  Deterministic extraction of:                │
-                        │  • ISR ↔ task wiring                         │
-                        │  • Drivers ↔ peripherals & comm stacks       │
-                        │  • RTOS / superloop task interactions        │
-                        │  • State machine transitions                 │
-                        │  • Memory ownership, HAL/BSP boundary        │
-                        │  • Bootloader → firmware handoff             │
-                        │  • Firmware update flow                      │
-                        │  • Safety-critical execution chains          │
-                        │  • Cross-module #include graph               │
-                        │  • Global variable read/write graph          │
-                        │  • Build / script dependencies               │
-                        │  → gitnexus_report.txt                       │
-                        └──────────────────┬───────────────────────────┘
-                                           │
-                        ┌──────────────────▼───────────────────────────┐
                         │     Code Transformation (Step 2)             │
                         │  Per file:                                   │
                         │  • Assemble prioritised prompt (file, spec,  │
-                        │    repo deps, repo knowledge, GitNexus,      │
+                        │    repo deps, repo knowledge,               │
                         │    target ICD, cross-file context)           │
                         │  • Stream generation + auto-continue         │
                         │  • Completeness validation                   │
