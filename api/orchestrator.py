@@ -723,11 +723,14 @@ def run_orchestrator(
     build_runner: Callable[[], tuple[bool, str]],
     llm_stream: Callable[..., Iterator[str]],
     max_steps: int | None = DEFAULT_MAX_STEPS,
-    max_builds: int = DEFAULT_MAX_BUILDS,
+    max_builds: int | None = DEFAULT_MAX_BUILDS,
     max_input_tokens: int = 24_000,
     max_output_tokens: int = 1024,
 ) -> Iterator[dict]:
     """Drive the debugging loop. Yields events for SSE forwarding.
+
+    ``max_builds`` may be ``None`` to allow unlimited build tool calls
+    (used when the UI selects an indefinite sandbox retry budget).
 
     Event shape:
         {"type": "step",      "step": int}
@@ -897,7 +900,11 @@ def run_orchestrator(
         }
 
         # --- Dispatch -------------------------------------------------------
-        if action.tool == "build" and ctx.build_calls >= max_builds:
+        if (
+            action.tool == "build"
+            and max_builds is not None
+            and ctx.build_calls >= max_builds
+        ):
             obs = Observation(
                 text=(
                     f"build budget exhausted ({ctx.build_calls}/{max_builds}). "

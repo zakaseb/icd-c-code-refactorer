@@ -22,6 +22,10 @@
   const repoZipList    = document.getElementById('repo-zip-file-list');
   const processBtn     = document.getElementById('process-btn');
   const resetBtn       = document.getElementById('reset-btn');
+  const sandboxRetriesInput = document.getElementById('sandbox-retries-input');
+  const sandboxRetriesIndefinite = document.getElementById('sandbox-retries-indefinite');
+  const sandboxRetriesHint = document.getElementById('sandbox-retries-hint');
+  let sandboxRetriesIndefiniteMode = false;
   const procSection    = document.getElementById('processing-section');
   const pipelineSteps  = document.getElementById('pipeline-steps');
   const resultsSection = document.getElementById('results-section');
@@ -120,6 +124,53 @@
   function updateBtn() {
     processBtn.disabled = !(codeFiles.length > 0 && sourceIcdFile && targetIcdFile);
   }
+
+  function setSandboxRetriesIndefinite(on) {
+    sandboxRetriesIndefiniteMode = !!on;
+    if (sandboxRetriesIndefinite) {
+      sandboxRetriesIndefinite.classList.toggle('active', sandboxRetriesIndefiniteMode);
+      sandboxRetriesIndefinite.setAttribute(
+        'aria-pressed',
+        sandboxRetriesIndefiniteMode ? 'true' : 'false'
+      );
+    }
+    if (sandboxRetriesInput) {
+      sandboxRetriesInput.disabled = sandboxRetriesIndefiniteMode;
+    }
+    if (sandboxRetriesHint) {
+      sandboxRetriesHint.textContent = sandboxRetriesIndefiniteMode
+        ? 'Indefinite: the sandbox build keeps iterating until the project builds successfully.'
+        : 'Stop after this many sandbox build reiterations, or keep going until the build succeeds.';
+    }
+  }
+
+  function getSandboxRetriesQueryValue() {
+    if (sandboxRetriesIndefiniteMode) return 'indefinite';
+    if (!sandboxRetriesInput) return '25';
+    var n = parseInt(sandboxRetriesInput.value, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      n = 25;
+      sandboxRetriesInput.value = String(n);
+    }
+    return String(n);
+  }
+
+  function processStreamUrl(path) {
+    var q = 'sandbox_retries=' + encodeURIComponent(getSandboxRetriesQueryValue());
+    return path + (path.indexOf('?') >= 0 ? '&' : '?') + q;
+  }
+
+  if (sandboxRetriesIndefinite) {
+    sandboxRetriesIndefinite.addEventListener('click', function () {
+      setSandboxRetriesIndefinite(!sandboxRetriesIndefiniteMode);
+    });
+  }
+  if (sandboxRetriesInput) {
+    sandboxRetriesInput.addEventListener('input', function () {
+      if (sandboxRetriesIndefiniteMode) setSandboxRetriesIndefinite(false);
+    });
+  }
+  setSandboxRetriesIndefinite(false);
 
   function renderZipFile(file, listEl, dropEl, cardId) {
     listEl.innerHTML = '';
@@ -246,7 +297,7 @@
     let gitnexusStep = null;
     let hasSandboxBuild = false;
 
-    let es = new EventSource('/api/process/' + sessionId);
+    let es = new EventSource(processStreamUrl('/api/process/' + sessionId));
     activeEventSource = es;
 
     es.onmessage = function (event) {
@@ -491,7 +542,7 @@
         await fetch('/api/resume/' + sessionId, { method: 'POST' });
         const onMessage = es.onmessage;
         const onError = es.onerror;
-        es = new EventSource('/api/process/' + sessionId);
+        es = new EventSource(processStreamUrl('/api/process/' + sessionId));
         activeEventSource = es;
         es.onmessage = onMessage;
         es.onerror = onError;
@@ -695,7 +746,7 @@
     var sandboxStep = null;
     var hasSandboxBuild = false;
 
-    var es = new EventSource('/api/regenerate/' + sessionId);
+    var es = new EventSource(processStreamUrl('/api/regenerate/' + sessionId));
 
     es.onmessage = function (event) {
       var msg = JSON.parse(event.data);

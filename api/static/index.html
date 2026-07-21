@@ -139,15 +139,45 @@
     <!-- ACTION BUTTONS                                                -->
     <!-- ============================================================ -->
     <section class="action-section">
-      <button type="button" id="process-btn" class="btn-primary" disabled>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="5 3 19 12 5 21 5 3"/>
-        </svg>
-        Transform Code
-      </button>
-      <button type="button" id="reset-btn" class="btn-secondary" style="display:none">Reset</button>
-      <button type="button" id="pause-btn" class="btn-secondary" style="display:none">Pause</button>
-      <button type="button" id="resume-btn" class="btn-primary" style="display:none">Resume</button>
+      <div class="sandbox-retries-control" id="sandbox-retries-control">
+        <label class="sandbox-retries-label" for="sandbox-retries-input">
+          Sandbox build retries
+        </label>
+        <div class="sandbox-retries-row">
+          <input
+            type="number"
+            id="sandbox-retries-input"
+            class="sandbox-retries-input"
+            min="1"
+            step="1"
+            value="25"
+            title="Maximum sandbox build/fix reiterations before giving up"
+          />
+          <button
+            type="button"
+            id="sandbox-retries-indefinite"
+            class="btn-secondary sandbox-retries-indefinite"
+            aria-pressed="false"
+            title="Keep iterating until the project builds successfully"
+          >
+            Indefinite
+          </button>
+        </div>
+        <p class="sandbox-retries-hint" id="sandbox-retries-hint">
+          Stop after this many sandbox build reiterations, or keep going until the build succeeds.
+        </p>
+      </div>
+      <div class="action-buttons">
+        <button type="button" id="process-btn" class="btn-primary" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          Transform Code
+        </button>
+        <button type="button" id="reset-btn" class="btn-secondary" style="display:none">Reset</button>
+        <button type="button" id="pause-btn" class="btn-secondary" style="display:none">Pause</button>
+        <button type="button" id="resume-btn" class="btn-primary" style="display:none">Resume</button>
+      </div>
     </section>
 
     <!-- ============================================================ -->
