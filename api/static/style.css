@@ -309,8 +309,71 @@ main {
   text-align: center;
   padding: 1rem 0 2rem;
   display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  align-items: center;
+}
+
+.action-buttons {
+  display: flex;
   gap: 1rem;
   justify-content: center;
+  flex-wrap: wrap;
+}
+
+.sandbox-retries-control {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .45rem;
+  max-width: 28rem;
+  width: 100%;
+}
+
+.sandbox-retries-label {
+  font-size: .85rem;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-muted, #8a8a8a);
+}
+
+.sandbox-retries-row {
+  display: flex;
+  gap: .6rem;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+
+.sandbox-retries-input {
+  width: 6.5rem;
+  padding: .55rem .75rem;
+  border: 1px solid var(--border, #3a3a3a);
+  border-radius: var(--radius-md, 8px);
+  background: var(--surface, #1a1a1a);
+  color: var(--text, #f0f0f0);
+  font-size: .95rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.sandbox-retries-input:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.sandbox-retries-indefinite.active {
+  background: var(--brand, #c45c26);
+  border-color: var(--brand, #c45c26);
+  color: var(--white, #fff);
+}
+
+.sandbox-retries-hint {
+  margin: 0;
+  font-size: .78rem;
+  color: var(--text-muted, #8a8a8a);
+  line-height: 1.35;
 }
 
 /* Buttons — uppercase, tracked, rounded (Edge component spec) */

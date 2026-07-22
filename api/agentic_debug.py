@@ -1578,7 +1578,7 @@ def run_agentic_debug(
     snapshots: dict[Path, str],
     build_runner: Callable[[], tuple[bool, str]],
     llm_stream: Callable[..., Iterator[str]],
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_attempts: int | None = DEFAULT_MAX_ATTEMPTS,
     no_progress_limit: int = DEFAULT_NO_PROGRESS_LIMIT,
     oscillation_limit: int = DEFAULT_OSCILLATION_LIMIT,
     edit_budget_files: int = DEFAULT_EDIT_BUDGET_FILES,
@@ -1587,6 +1587,9 @@ def run_agentic_debug(
     patch_max_tokens: int = DEFAULT_PATCH_MAX_TOKENS,
 ) -> Iterator[dict]:
     """Drive the agentic-debug state machine.
+
+    ``max_attempts`` may be ``None`` to allow unlimited hypothesis attempts
+    (used when the UI selects an indefinite sandbox retry budget).
 
     Yields events of the same shape as ``api.orchestrator.run_orchestrator``
     so the calling SSE adapter can stay (almost) unchanged:
@@ -1691,7 +1694,11 @@ def run_agentic_debug(
 
     last_build_output = build_output
 
-    for attempt in range(1, max_attempts + 1):
+    attempt = 0
+    while True:
+        attempt += 1
+        if max_attempts is not None and attempt > max_attempts:
+            break
         attempt_start = time.monotonic()
         attempt_dir = attempts_dir / f"attempt_{attempt:02d}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -2319,7 +2326,7 @@ def run_agentic_debug(
             f"Attempt budget exhausted ({max_attempts}) before satisfying "
             "Xilinx acceptance criteria."
         ),
-        "steps": max_attempts,
+        "steps": max_attempts if max_attempts is not None else attempt,
         "builds": build_calls,
     }
 
