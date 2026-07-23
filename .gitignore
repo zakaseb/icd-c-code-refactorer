@@ -3,6 +3,7 @@ workspace/
 __pycache__/
 *.pyc
 .env
+*.ipynb
 *.egg-info/
 .idea/
 .vscode/

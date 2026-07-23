@@ -20,7 +20,7 @@ from app import (
     app,
     _build_repo_context,
     _build_file_repo_context,
-    _build_repo_summary,
+    _build_source_scripts_context,
     _safe_extract_zip,
     _extract_includes,
     _find_repo_file,
@@ -32,6 +32,7 @@ from app import (
     MAX_REPO_CONTEXT_CHARS,
     MAX_INPUT_TOKENS,
     CHARS_PER_TOKEN,
+    SOURCE_SCRIPTS_MAX_CHARS,
 )
 
 client = TestClient(app)
@@ -188,23 +189,126 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("no includes = empty context", ctx_no_deps == "", f"got '{ctx_no_deps[:50]}'")
 
 # ---------------------------------------------------------------
-print("\n=== Test 6: _build_repo_summary ===")
+print("\n=== Test 6: _build_source_scripts_context ===")
 with tempfile.TemporaryDirectory() as tmpdir:
     zp = Path(tmpdir) / "test.zip"
     zp.write_bytes(zip_bytes)
     dest = Path(tmpdir) / "repo"
     _safe_extract_zip(zp, dest)
 
-    summary = _build_repo_summary(dest)
-    check("summary non-empty", len(summary) > 0)
-    check("summary under 4K", len(summary) <= 4100)
-    check("file structure in summary", "File Structure" in summary)
-    check("type names in summary", "CommMessage_t" in summary or "SensorReading_t" in summary)
-    check("function names in summary", "COMM_Init" in summary or "SENSOR_Init" in summary)
+    scripts = _build_source_scripts_context(dest)
+    check("scripts context non-empty", len(scripts) > 0)
+    check(
+        "scripts context within budget",
+        len(scripts) <= SOURCE_SCRIPTS_MAX_CHARS + 200,
+        f"got {len(scripts)} chars (budget {SOURCE_SCRIPTS_MAX_CHARS})",
+    )
+    check(
+        "labelled as old/pre-change code",
+        "PRE-CHANGE" in scripts and "old" in scripts.lower(),
+        "expected explicit 'pre-change' / 'old' labelling for impact-on-C grounding",
+    )
+    check(
+        "file tree present",
+        "Uploaded Source Scripts File Structure" in scripts,
+    )
+    check(
+        "headers section present",
+        "Headers (.h)" in scripts,
+    )
+    check(
+        "implementation section present",
+        "Implementation Files (.c)" in scripts,
+    )
+    check(
+        "real header content (comm.h body) included",
+        "CommMessage_t" in scripts and "COMM_Init" in scripts,
+    )
+    check(
+        "real source content (comm.c body) included",
+        "s_initialized" in scripts,
+        "expected concrete .c body, not just summary",
+    )
+    check(
+        "real source content (sensor.c body) included",
+        "SENSOR_Read" in scripts and "SensorReading_t" in scripts,
+    )
+    check(
+        "headers come before sources",
+        scripts.find("Headers (.h)") < scripts.find("Implementation Files (.c)"),
+    )
+
+    # Confirm budget enforcement under a tight cap.
+    tight = _build_source_scripts_context(dest, max_chars=2000)
+    check("tight budget respected", len(tight) <= 2100,
+          f"got {len(tight)} chars for 2K cap")
+    check("tight budget still labels old scripts", "PRE-CHANGE" in tight)
+
+    # Empty repo -> empty string.
+    empty_repo = Path(tmpdir) / "empty"
+    empty_repo.mkdir()
+    check("empty repo -> empty context",
+          _build_source_scripts_context(empty_repo) == "")
+
+    # Repo with only non-C files -> empty string.
+    nonc_repo = Path(tmpdir) / "nonc"
+    nonc_repo.mkdir()
+    (nonc_repo / "README.md").write_text("hi")
+    check("non-C repo -> empty context",
+          _build_source_scripts_context(nonc_repo) == "")
+
+    # NEW USAGE: flat code_dir-style directory (mirrors what
+    # process_session now actually passes: session_dir/"original_code").
+    code_dir = Path(tmpdir) / "code_dir"
+    code_dir.mkdir()
+    (code_dir / "comm.h").write_text(
+        "#ifndef COMM_H\n#define COMM_H\n"
+        "typedef struct { int msg_id; } CommMessage_t;\n"
+        "int COMM_Init(void);\n"
+        "#endif\n"
+    )
+    (code_dir / "comm.c").write_text(
+        '#include "comm.h"\nint COMM_Init(void) { return 0; }\n'
+    )
+    code_ctx = _build_source_scripts_context(code_dir)
+    check("flat code_dir context non-empty", len(code_ctx) > 0)
+    check(
+        "flat code_dir labelled as PRE-CHANGE",
+        "PRE-CHANGE" in code_ctx,
+    )
+    check(
+        "flat code_dir tree heading uses new label",
+        "Uploaded Source Scripts File Structure" in code_ctx,
+    )
+    check(
+        "flat code_dir lists both files in tree",
+        "comm.h" in code_ctx and "comm.c" in code_ctx,
+    )
+    check(
+        "flat code_dir embeds header body",
+        "CommMessage_t" in code_ctx and "COMM_Init" in code_ctx,
+    )
+    check(
+        "flat code_dir embeds source body",
+        'COMM_Init(void) { return 0; }' in code_ctx,
+    )
+    check(
+        "flat code_dir uses Header before Source",
+        code_ctx.find("Headers (.h)") < code_ctx.find("Implementation Files (.c)"),
+    )
+    check(
+        "flat code_dir relative paths have NO directory prefix",
+        "### Header: comm.h" in code_ctx
+        and "### Source: comm.c" in code_ctx,
+        "code_dir is flat, so relative paths should be bare filenames",
+    )
 
 # ---------------------------------------------------------------
 print("\n=== Test 7: _estimate_tokens ===")
-check("1000 chars ~ 250 tokens", _estimate_tokens("x" * 1000) == 250)
+check(
+    "1000 chars / CHARS_PER_TOKEN tokens",
+    _estimate_tokens("x" * 1000) == 1000 // CHARS_PER_TOKEN,
+)
 check("empty = 0", _estimate_tokens("") == 0)
 
 # ---------------------------------------------------------------
@@ -314,7 +418,21 @@ print("\n=== Test 14: Constants are reasonable ===")
 check("MAX_REPO_CONTEXT_CHARS is 15000", MAX_REPO_CONTEXT_CHARS == 15_000)
 check("MAX_INPUT_TOKENS > 20000", MAX_INPUT_TOKENS > 20000,
       f"got {MAX_INPUT_TOKENS}")
-check("CHARS_PER_TOKEN is 4", CHARS_PER_TOKEN == 4)
+check(
+    "CHARS_PER_TOKEN is conservative for code (3-4)",
+    CHARS_PER_TOKEN in (3, 4),
+    f"got {CHARS_PER_TOKEN}",
+)
+check(
+    "SOURCE_SCRIPTS_MAX_CHARS comfortably above 10K",
+    SOURCE_SCRIPTS_MAX_CHARS >= 10_000,
+    f"got {SOURCE_SCRIPTS_MAX_CHARS}",
+)
+check(
+    "SOURCE_SCRIPTS_MAX_CHARS fits inside model context budget",
+    SOURCE_SCRIPTS_MAX_CHARS // CHARS_PER_TOKEN < MAX_INPUT_TOKENS,
+    f"{SOURCE_SCRIPTS_MAX_CHARS} chars vs {MAX_INPUT_TOKENS} tokens",
+)
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")

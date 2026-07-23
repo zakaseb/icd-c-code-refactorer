@@ -8,7 +8,7 @@ else
   LLAMA_THREADS=1
 fi
 
-docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus all \
+docker run -ti --rm --name icd-c-code-refactorer --network=host --gpus "device=0" \
   -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
   -e LLAMA_ARG_CTX_SIZE=32768 \
   -e LLAMA_ARG_N_PREDICT=32768 \

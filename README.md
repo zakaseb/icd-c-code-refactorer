@@ -37,14 +37,14 @@ Transform C source code between Interface Control Document (ICD) versions using 
 - **Variable Inventory** — Verification reports include a complete inventory of all variables, macros, and function parameters in the generated code.
 - **Detailed Verification Reports** — Every run produces a report documenting structural checks, verification outcomes, unified diffs of all changes, and the variable inventory.
 - **Real-Time Streaming** — All pipeline stages stream progress via Server-Sent Events so you see analysis, transformation, and verification happen token by token.
-- **Fully Local** — Runs Qwen3-Coder-30B via llama.cpp on your own GPU. No cloud APIs, no data exfiltration.
+- **Fully Local** — Runs Qwen3-Coder-Next (80B-A3B coder-specialised) via llama.cpp on your own GPU. No cloud APIs, no data exfiltration.
 
 
 # Hardware
 
 Device: `Workstation`, `AI-Laptop-Dell`, `AI-Laptop-MSI`
 
-Requires an NVIDIA GPU with 24 GB+ VRAM for full GPU offload of the Qwen3-Coder-30B-A3B model. The number of GPU layers offloaded is controlled by `LLAMA_ARG_N_GPU_LAYERS` (default: `auto`). CPU-only fallback is available but significantly slower.
+Requires an NVIDIA GPU with 48 GB+ VRAM (e.g. A6000, L40, A100 40/80 GB, H100) for full GPU offload of the Qwen3-Coder-Next model at the bundled `UD-Q4_K_XL` quant (~49.3 GB). The number of GPU layers offloaded is controlled by `LLAMA_ARG_N_GPU_LAYERS` (default: `auto`), so smaller GPUs (e.g. 24 GB) still work by spilling layers to CPU RAM with reduced throughput. Because Qwen3-Coder-Next is a Mixture-of-Experts model with ~3 B active parameters per token (the "A3B" suffix), per-token latency is comparable to a dense ~3 B model when fully offloaded — much faster than its 80 B total-parameter count would suggest. CPU-only fallback is available but significantly slower.
 
 Please refer to [Reproducible Experiments](https://hal-confluence.edgegroup.ae/spaces/AIENG/pages/424772002/Reproducible+Experiments+in+PyTorch) for settings on reproducible results.
 
@@ -52,8 +52,8 @@ Please refer to [Reproducible Experiments](https://hal-confluence.edgegroup.ae/s
 # Prerequisites
 
 * Docker with NVIDIA GPU support (`nvidia-container-toolkit` installed and configured)
-* NVIDIA GPU with 24 GB+ VRAM recommended
-* ~20 GB free disk space for the quantised GGUF model (auto-downloaded on first run)
+* NVIDIA GPU with 48 GB+ VRAM recommended (24 GB works with partial offload)
+* ~50 GB free disk space for the quantised GGUF model (~49.3 GB at `UD-Q4_K_XL`, auto-downloaded on first run)
 * Tools:
   * Docker + NVIDIA Container Toolkit
   * `nvidia-smi` accessible on the host
@@ -79,7 +79,7 @@ mkdir -p models
 
 Open **[http://localhost:8081](http://localhost:8081)** in your browser once the container finishes starting up.
 
-> On first run, `entrypoint.sh` downloads the Qwen3-Coder-30B-A3B-Instruct GGUF model (~20 GB) into `models/`. Subsequent starts are fast as the model is cached.
+> On first run, `entrypoint.sh` downloads the Qwen3-Coder-Next GGUF model (~49.3 GB at `UD-Q4_K_XL`) into `models/`. Subsequent starts are fast as the model is cached.
 
 > `run_web.sh` runs a GPU preflight check, reserves CPU cores for the host, and validates port 8081 is free before starting. If the GPU is unavailable it offers a CPU-only fallback (significantly slower).
 
@@ -100,6 +100,9 @@ icd-c-code-refactorer/
 │
 ├── api/                               # FastAPI backend
 │   ├── app.py                         # All endpoints and LLM orchestration
+│   ├── per_file_compile.py            # Per-file .c → .o compile gate
+│   ├── orchestrator.py                # Sandbox-build agentic debug loop
+│   ├── agentic_debug.py               # Agentic-AI single-hypothesis debug pipeline
 │   └── static/
 │       ├── index.html                 # Single-page application
 │       ├── app.js                     # Uploads, SSE streaming, conversation UI
@@ -155,8 +158,8 @@ All upload zones support drag-and-drop and file picker dialogs.
 Click **Transform Code** to start the pipeline. Progress streams in real time:
 
 1. **ICD Analysis** — Both PDFs are extracted, chunked if large, and compared to produce a change specification. When a repository ZIP is provided, the codebase knowledge (file structure, struct definitions, enum values, function signatures, macros) is extracted and included in the analysis report.
-2. **Code Transformation** — Each uploaded file is transformed against the target ICD, using the change specification, repository dependency headers, and codebase knowledge as context. Incomplete outputs are automatically continued.
-3. **Verification** — Each generated file undergoes structural checks and an LLM verification pass. Corrections are applied automatically when possible.
+3. **Code Transformation** — Each uploaded file is transformed against the target ICD, using the change specification, repository dependency headers and codebase knowledge as context. Incomplete outputs are automatically continued.
+4. **Verification** — Each generated file undergoes structural checks and an LLM verification pass. Corrections are applied automatically when possible.
 
 ## 3. Review & Download
 
@@ -205,8 +208,8 @@ Each run produces a `verification_report.txt` included in the download ZIP:
                         │     Code Transformation (Step 2)             │
                         │  Per file:                                   │
                         │  • Assemble prioritised prompt (file, spec,  │
-                        │    repo deps, repo knowledge, target ICD,    │
-                        │    cross-file context)                       │
+                        │    repo deps, repo knowledge,               │
+                        │    target ICD, cross-file context)           │
                         │  • Stream generation + auto-continue         │
                         │  • Completeness validation                   │
                         └──────────────────┬───────────────────────────┘
@@ -269,7 +272,7 @@ Each run produces a `verification_report.txt` included in the download ZIP:
                              │ OpenAI-compatible streaming API
 ┌────────────────────────────▼────────────────────────────────────────┐
 │                    llama.cpp (llama-server)                          │
-│             Qwen3-Coder-30B-A3B quantised (Q4_K_XL)                 │
+│        Qwen3-Coder-Next (80B-A3B coder) quantised (UD-Q4_K_XL)      │
 │                    GPU-accelerated (CUDA)                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -280,7 +283,7 @@ Each run produces a `verification_report.txt` included in the download ZIP:
 | **Backend** | Python 3, FastAPI, uvicorn | Session management, PDF processing, LLM orchestration, verification |
 | **PDF Extraction** | PyMuPDF (fitz) | Reliable text extraction from ICD PDFs |
 | **LLM Inference** | llama.cpp `llama-server` | Local GPU inference, OpenAI-compatible streaming API |
-| **Model** | Qwen3-Coder-30B-A3B-Instruct (GGUF Q4_K_XL) | Code-specialised LLM (~20 GB quantised) |
+| **Model** | Qwen3-Coder-Next (GGUF UD-Q4_K_XL) | Coder-specialised MoE LLM trained for agentic coding workflows; ~80 B total / ~3 B active params per token (~49.3 GB quantised) |
 | **LLM Proxy** | LiteLLM | Anthropic-compatible API proxy (for Claude Code tooling) |
 | **Container** | Docker + NVIDIA Container Toolkit | Reproducible deployment with GPU passthrough |
 
@@ -288,9 +291,9 @@ Each run produces a `verification_report.txt` included in the download ZIP:
 
 | | Details |
 |---|---|
-| **Model** | Qwen3-Coder-30B-A3B-Instruct (GGUF Q4_K_XL) |
-| **Version** | `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` |
-| **Source** | [Hugging Face — unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF) |
+| **Model** | Qwen3-Coder-Next (GGUF UD-Q4_K_XL) |
+| **Version** | `unsloth/Qwen3-Coder-Next-GGUF` |
+| **Source** | [Hugging Face — unsloth/Qwen3-Coder-Next-GGUF](https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF) |
 | **License** | Apache 2.0 |
 | **Usage restrictions** | No PII or sensitive data should be included in uploaded ICD PDFs or source files if operating under data residency constraints. All inference is local — no data leaves the machine. |
 
