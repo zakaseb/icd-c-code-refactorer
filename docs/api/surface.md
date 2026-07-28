@@ -1,12 +1,12 @@
 ---
 title: API Surface
-description: FastAPI routes, SSE behaviour, and sandbox_retries
+description: FastAPI routes and SSE behaviour on the agentic multi-agent branch
 tags: [api, rest, sse]
 ---
 
 # API Surface
 
-Primary implementation: `api/app.py`.
+Primary implementation: `api/app.py`. On this branch, `/api/process` defaults to the agentic mission (`AGENTIC_PIPELINE=1`).
 
 ## Session & uploads
 
@@ -24,28 +24,13 @@ Primary implementation: `api/app.py`.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/api/process/{session_id}` | **SSE** full pipeline (agentic mission when `AGENTIC_PIPELINE=1`) |
-| `GET` | `/api/process-agentic/{session_id}` | **SSE** always agentic mission |
+| `GET` | `/api/process/{session_id}` | **SSE** — agentic mission when `AGENTIC_PIPELINE=1` (default); classic sequential when `0` |
+| `GET` | `/api/process-agentic/{session_id}` | **SSE** — always agentic mission |
 | `GET` | `/api/regenerate/{session_id}` | **SSE** conversational regen |
 | `POST` | `/api/pause/{session_id}` | Pause processing |
 | `POST` | `/api/resume/{session_id}` | Resume processing |
 
-### Query: `sandbox_retries`
-
-Accepted on both `/api/process/{session_id}` and `/api/regenerate/{session_id}`.
-
-| Value | Behaviour |
-|-------|-----------|
-| Positive integer `N` | Finite budget: one outer round, `N` builds/attempts |
-| `indefinite`, `inf`, `infinite`, `unlimited`, `0`, `-1` | Unlimited until success/cancel |
-| Omitted | Env defaults (`SANDBOX_ORCH_*` / `SANDBOX_AGENTIC_*`) |
-
-Parsed by `_parse_sandbox_retries` / `_resolve_sandbox_max_retries` / `_sandbox_retry_plan`. Persisted on the session as:
-
-- `sandbox_retries_mode` ∈ `{env, indefinite, finite}`
-- `sandbox_max_retries`
-
-Finite budgets hard-stop the orchestrator when exhausted (no endless patch loop after the last failed build).
+There is **no** `sandbox_retries` query parameter on this branch. Sandbox attempt budgets come from env (`SANDBOX_ORCH_*` / `SANDBOX_AGENTIC_*`). Mission revisits are bounded by `AGENTIC_MAX_STAGE_RUNS` and `AGENTIC_MAX_REVISITS_PER_STAGE`.
 
 ## Results & conversation
 
@@ -66,13 +51,13 @@ Finite budgets hard-stop the orchestrator when exhausted (no endless patch loop 
 
 ## SSE event shapes (typical)
 
-Events emitted during process/regenerate include (non-exhaustive):
-
-- `stage` / `stage_complete` — stage transitions
-- `token` / batched tokens — streamed LLM output for UI
+- `stage` / `stage_complete` — including live **`gitnexus`** from CodebaseTeam
+- `token` / batched tokens — streamed LLM output
 - `file_complete` — per-file transform progress
-- `sandbox_build_result` / build log chunks — sandbox outcome
-- Orchestrator events: `step`, `thought`, `action`, `observation`, `build`, `done`, `warning`
-- Agentic events: phase transitions, attempt artefacts under `agentic_attempts/`
+- `sandbox_build_result` / build log chunks
+- Mission / team info lines; orchestrator or agentic-debug events during `sandbox_build`
+- Final `{type: "complete", files, sandbox_build?}`
 
-UI token batching is controlled by `SSE_UI_TOKEN_BATCH_*` to avoid browser OOM on long runs. Sandbox log streaming is capped (`SANDBOX_SSE_MAX_BUILD_LOG_CHARS`).
+UI token batching: `SSE_UI_TOKEN_BATCH_*`. Sandbox log cap: `SANDBOX_SSE_MAX_BUILD_LOG_CHARS`.
+
+Mission audit on disk: `session_dir/agentic_pipeline/blackboard.json`.

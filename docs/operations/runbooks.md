@@ -1,6 +1,6 @@
 ---
 title: Operational Runbooks
-description: Common ops tasks and failure recovery
+description: Common ops tasks for the agentic multi-agent branch
 tags: [operations, runbooks]
 ---
 
@@ -16,64 +16,61 @@ tags: [operations, runbooks]
 ## Start / stop the stack
 
 ```bash
-./scripts/serve_web.sh          # start (blocks / foreground docker)
-# stop: Ctrl-C or docker stop the running container
+./scripts/serve_web.sh
 docker ps --filter ancestor=icd-c-code-refactorer:llama.cpp
 ```
 
-UI: http://localhost:8081 — llama-server `:24000`, LiteLLM `:4000` inside the container network.
+UI: http://localhost:8081 — llama-server `:24000`, LiteLLM `:4000`.
 
 ## Port already in use
 
-`serve_web.sh` exits if **8081** is taken. Find and stop the occupant, or change `WEB_PORT` in the script.
+`serve_web.sh` exits if **8081** is taken. Stop the occupant or change `WEB_PORT`.
 
 ## GPU preflight failures
 
-1. Run `nvidia-smi`. If **GPU Recovery Action: Reboot**, reboot the host before retrying.
-2. Re-run `serve_web.sh` (script retries CUDA device listing up to 3 times).
-3. If still failing, inspect preflight output and consider CPU-only fallback only as a last resort (very slow).
+1. `nvidia-smi` — if **GPU Recovery Action: Reboot**, reboot the host.
+2. Re-run `serve_web.sh` (retries CUDA listing).
+3. CPU-only fallback only as last resort.
 
 ## First-boot model download stuck
 
-- Ensure `models/` is writable and has ~50 GB free.
-- Check container logs for Hugging Face download errors (`src/utils/hf_download.py`).
-- Subsequent starts should reuse the cached GGUF.
+- `models/` writable with ~50 GB free; check `hf_download.py` logs; later starts reuse cache.
 
 ## Browser tab dies on long runs
 
-- Prefer current `app.js` + `append_log_helper.js` (batched logs).
-- Confirm server-side SSE token batching and sandbox log caps are enabled.
-- Avoid opening multiple EventSource tabs for the same heavy session.
+- Use current `app.js` + `append_log_helper.js`; keep a single EventSource tab per heavy session.
 
-## Sandbox never finishes / ignores retry count
+## Sandbox never finishes
 
-- Confirm the UI is sending `?sandbox_retries=N` (network tab).
-- Session `status.json` should show `sandbox_retries_mode` / `sandbox_max_retries`.
-- Finite mode must hard-stop after budget exhaustion (see `tests/development/test_orchestrator_build_budget.py`).
-- If `SANDBOX_USE_AGENTIC=1`, agentic caps apply instead of orchestrator knobs.
+- Check `SANDBOX_USE_ORCHESTRATOR` / `SANDBOX_USE_AGENTIC` and related `SANDBOX_*` caps.
+- IntegrationTeam may emit blackboard feedback targeting `transform` or `compile`.
+- Review `sandbox_build_log.txt` and (if agentic debug) `agentic_attempts/`.
+
+## Mission stuck revisiting stages
+
+- Caps: `AGENTIC_MAX_STAGE_RUNS`, `AGENTIC_MAX_REVISITS_PER_STAGE`.
+- Set `AGENTIC_ROUTER_LLM=0` for deterministic-only routing while debugging.
+- Read `blackboard.json` history/feedback.
 
 ## llama-server HTTP 400 / context overflow
 
-- Lower prompt size / raise ctx (`LLAMA_ARG_CTX_SIZE`) carefully for VRAM.
-- App path clamps prompts and retries on overflow (`LLM_PROMPT_SAFETY_TOKENS`, hardening tests).
+- Tune `LLAMA_ARG_CTX_SIZE` / `LLM_PROMPT_SAFETY_TOKENS`; see hardening tests.
 
 ## Rebuild after code changes
-
-If the image `COPY`s `api/` rather than bind-mounting it:
 
 ```bash
 ./deployments/docker/build.sh
 ./scripts/serve_web.sh
 ```
 
-Hot-copying a single module into a running container is possible for emergency debugging but is not the durable workflow.
+Required after pulling `claude-agent-sdk` / Dockerfile changes on this branch.
 
-## Refresh documentation
+## Keep documentation current
 
-Locally (with a capable OpenWiki provider configured):
+When you add or change a feature on this branch, update the matching pages under `docs/` (exposed as `openwiki/`) in the **same change**. Follow [INSTRUCTIONS.md](../INSTRUCTIONS.md). Recurring refresh:
 
 ```bash
 openwiki code --update --print
 ```
 
-Or rely on `.github/workflows/openwiki-update.yml` (needs OpenRouter secret). Preserve [agentic-debug-pipeline.md](../agentic-debug-pipeline.md) and follow [INSTRUCTIONS.md](../INSTRUCTIONS.md).
+or `.github/workflows/openwiki-update.yml` (needs OpenRouter secret). Preserve [agentic-debug-pipeline.md](../agentic-debug-pipeline.md) and [agentic/multiagent-pipeline.md](../agentic/multiagent-pipeline.md).

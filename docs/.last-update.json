@@ -1,8 +1,8 @@
 {
-  "updatedAt": "2026-07-28T10:05:00.000Z",
-  "command": "init",
-  "gitHead": "2efd809",
+  "updatedAt": "2026-07-28T10:10:00.000Z",
+  "command": "update",
+  "gitHead": "1bb4278",
   "branch": "feature/agentic-multiagent-pipeline",
-  "model": "openwiki-brief+codebase-grounded",
-  "notes": "Comprehensive docs under docs/ (openwiki symlink), including agentic multi-agent mission documentation."
+  "model": "branch-accurate-refresh",
+  "notes": "Scrubbed sandbox_retries/header_doc leftovers from other branches; docs now match agentic multi-agent tree. Feature→docs policy in INSTRUCTIONS + Cursor rule."
 }
