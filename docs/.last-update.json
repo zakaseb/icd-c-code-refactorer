@@ -1,0 +1,7 @@
+{
+  "updatedAt": "2026-07-28T08:30:00.000Z",
+  "command": "init",
+  "gitHead": "eea742dccac47ca62193f5faffc469b2fa3c9403",
+  "model": "openwiki-brief+codebase-grounded",
+  "notes": "Comprehensive docs generated into docs/ (openwiki symlink). Local openwiki CLI init with qwen2.5:14b produced stubs only; pages expanded per docs/INSTRUCTIONS.md."
+}

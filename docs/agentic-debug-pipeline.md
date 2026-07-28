@@ -1,3 +1,9 @@
+---
+type: "Reference"
+title: "Agentic Debug Pipeline"
+openwiki_generated: true
+---
+
 # Agentic Debug Pipeline
 
 A plain-English walkthrough of the build-debug-repair loop introduced on
