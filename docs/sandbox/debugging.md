@@ -39,9 +39,15 @@ Env: `SANDBOX_AGENTIC_MAX_ATTEMPTS`, `SANDBOX_AGENTIC_NO_PROGRESS`, `SANDBOX_AGE
 
 Deep dive: [agentic-debug-pipeline.md](../agentic-debug-pipeline.md).
 
-## Budgets on this branch
+## UI retry budget maths
 
-Attempt limits are **environment-driven** (no UI `sandbox_retries` query). Mission-level revisits use `AGENTIC_MAX_STAGE_RUNS` / `AGENTIC_MAX_REVISITS_PER_STAGE`.
+| Mode | Outer rounds | Builds / attempts |
+|------|--------------|-------------------|
+| Finite `N` | 1 | `N` |
+| Indefinite | Unlimited (with backend safety caps) | Unlimited |
+| Env (query omitted) | From `SANDBOX_*_OUTER_ROUNDS` | From `SANDBOX_ORCH_MAX_BUILDS` / agentic max attempts |
+
+Mission-level revisits still use `AGENTIC_MAX_STAGE_RUNS` / `AGENTIC_MAX_REVISITS_PER_STAGE`.
 
 ## Remote build
 

@@ -39,7 +39,7 @@ Agentic mode may **revisit** earlier stages when blackboard feedback has blocker
 
 ## Sandbox build
 
-See [sandbox/debugging.md](../sandbox/debugging.md). Budgets are env-based on this branch.
+See [sandbox/debugging.md](../sandbox/debugging.md) for backend selection and `sandbox_retries` budgets.
 
 ## Regeneration
 

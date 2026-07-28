@@ -87,6 +87,9 @@ class IntegrationTeam(Team):
                 has_repo=ctx.has_repo,
                 repo_knowledge=str(bb.data.get("repo_knowledge", "")),
                 gitnexus_report=str(bb.data.get("gitnexus_report", "")),
+                sandbox_max_retries=a._resolve_sandbox_max_retries(
+                    None, a._read_status(ctx.session_dir),
+                ),
             )
         )
 

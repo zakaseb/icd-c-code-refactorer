@@ -6,46 +6,32 @@ tags: [webui, frontend]
 
 # Web UI Integration
 
-Location: `api/static/`.
+Location: `api/static/`. Visual language matches the Halcon-themed UI (colors, typography, layout) inherited from main.
 
 | File | Role |
 |------|------|
-| `index.html` | Upload forms, stage indicators, conversation box |
+| `index.html` | Upload forms, stage indicators, sandbox-retries controls, conversation box |
 | `app.js` | Session lifecycle, uploads, EventSource streaming, regenerate, downloads |
-| `append_log_helper.js` | rAF-batched log DOM updates (reduces jank / OOM risk) |
-| `style.css` | Layout and theming |
+| `append_log_helper.js` | rAF-batched log DOM updates |
+| `style.css` | Halcon theme styles |
 
 ## User flow
 
 1. Page load → `POST /api/session/create`.
-2. User selects `.c`/`.h`, Source ICD, Target ICD, optional repo ZIP → matching `/api/upload/...` routes.
-3. **Transform Code** opens EventSource on `/api/process/{session_id}` (no retry query string on this branch).
-4. UI handles SSE stages: `analysis`, **`gitnexus`**, `transform` (per-file steps), `verification`, `compile`, `sandbox_build`, and `regeneration` on re-run.
-5. User can pause/resume, preview files, download artefacts, send conversation feedback, then regenerate.
+2. Upload `.c`/`.h`, Source ICD, Target ICD, optional repo ZIP.
+3. **Transform Code** opens EventSource via `processStreamUrl()`, appending `?sandbox_retries=` from:
+   - number input (default **25**), or
+   - **Indefinite** toggle → `indefinite`.
+4. UI handles SSE stages: `analysis`, `gitnexus`, `transform` (per-file), `verification`, `compile`, `sandbox_build`, and `regeneration` on re-run.
+5. Pause/resume, preview, download, conversation feedback, then regenerate (same retries query).
 
-## Stages the UI knows about
+## Sandbox retries control
 
-`app.js` creates/updates steps for:
+- `#sandbox-retries-input` — integer attempts
+- `#sandbox-retries-indefinite` — unlimited mode
 
-| Stage | Notes |
-|-------|-------|
-| `analysis` | ICD delta / change_spec |
-| `gitnexus` | Live CodebaseTeam stage on the agentic path |
-| `transform` | One UI step per generated file |
-| `verification` | Structural + compliance |
-| `compile` | Per-file compile gate |
-| `sandbox_build` | Integration / sandbox |
-| `regeneration` | Conversational re-generate path |
-
-There are **no** sandbox-retries number/indefinite controls in this branch’s UI.
+Maps to the `sandbox_retries` query on process / process-agentic / regenerate.
 
 ## Streaming robustness
 
-- Token batching and log helper batching keep overnight runs from freezing/crashing the tab.
-- Sandbox build log characters streamed to the browser are capped server-side.
-
-## Conversation & regenerate
-
-- Feedback is posted to `/api/conversation/{session_id}`.
-- **Re-generate** opens EventSource on `/api/regenerate/{session_id}`.
-- Regen reuses ICD/repo context and conversation history; it does not redo full ICD delta analysis from scratch.
+Token batching + log helper batching; server-side sandbox log caps.

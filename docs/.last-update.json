@@ -1,8 +1,6 @@
 {
-  "updatedAt": "2026-07-28T10:10:00.000Z",
+  "updatedAt": "2026-07-28T10:20:00.000Z",
   "command": "update",
-  "gitHead": "1bb4278",
   "branch": "feature/agentic-multiagent-pipeline",
-  "model": "branch-accurate-refresh",
-  "notes": "Scrubbed sandbox_retries/header_doc leftovers from other branches; docs now match agentic multi-agent tree. Feature→docs policy in INSTRUCTIONS + Cursor rule."
+  "notes": "Inherited Halcon UI + sandbox_retries (finite/indefinite) from main/sandbox-retry branch; wired through agentic mission IntegrationTeam."
 }

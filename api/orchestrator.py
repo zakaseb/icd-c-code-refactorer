@@ -649,7 +649,6 @@ def build_brief(
     repo_knowledge: str,
     initial_build_output: str,
     notes: list[str],
-    gitnexus_report: str = "",
 ) -> str:
     """Compose the user message that frames the task each turn."""
     rel_build = (
@@ -691,18 +690,6 @@ def build_brief(
             "## Repository codebase knowledge",
             _truncate(repo_knowledge, 3000),
         ])
-    if gitnexus_report:
-        parts.extend([
-            "",
-            "## GitNexus codebase understanding",
-            "Embedded-systems-specific relationships (ISR/task wiring, "
-            "drivers/peripherals, RTOS or superloop, state machines, "
-            "communication stacks, memory ownership, HAL boundary, "
-            "bootloader/firmware-update hooks, safety chains, "
-            "cross-module #include graph, global variable read/write "
-            "graph, build-script deps). Honor these when patching.",
-            _truncate(gitnexus_report, 4000),
-        ])
     parts.extend([
         "",
         "## Reminder",
@@ -736,12 +723,14 @@ def run_orchestrator(
     build_runner: Callable[[], tuple[bool, str]],
     llm_stream: Callable[..., Iterator[str]],
     max_steps: int | None = DEFAULT_MAX_STEPS,
-    max_builds: int = DEFAULT_MAX_BUILDS,
+    max_builds: int | None = DEFAULT_MAX_BUILDS,
     max_input_tokens: int = 24_000,
     max_output_tokens: int = 1024,
-    gitnexus_report: str = "",
 ) -> Iterator[dict]:
     """Drive the debugging loop. Yields events for SSE forwarding.
+
+    ``max_builds`` may be ``None`` to allow unlimited build tool calls
+    (used when the UI selects an indefinite sandbox retry budget).
 
     Event shape:
         {"type": "step",      "step": int}
@@ -772,6 +761,18 @@ def run_orchestrator(
             "type": "done",
             "success": True,
             "reason": "Build already succeeds without any patches.",
+            "steps": 0,
+            "builds": ctx.build_calls,
+        }
+        return
+    if max_builds is not None and ctx.build_calls >= max_builds:
+        yield {
+            "type": "done",
+            "success": False,
+            "reason": (
+                f"build budget exhausted after the initial build "
+                f"({ctx.build_calls}/{max_builds}). Sandbox stage terminating."
+            ),
             "steps": 0,
             "builds": ctx.build_calls,
         }
@@ -808,7 +809,6 @@ def run_orchestrator(
             repo_knowledge=repo_knowledge,
             initial_build_output=last_build_output,
             notes=ctx.notes,
-            gitnexus_report=gitnexus_report,
         )
         transcript = render_transcript(history)
         char_budget = max_input_tokens * 4
@@ -912,32 +912,50 @@ def run_orchestrator(
         }
 
         # --- Dispatch -------------------------------------------------------
-        if action.tool == "build" and ctx.build_calls >= max_builds:
+        if (
+            action.tool == "build"
+            and max_builds is not None
+            and ctx.build_calls >= max_builds
+        ):
+            # Hard stop: the user-facing sandbox retry budget is spent.
+            # Do NOT keep patching forever — that is what made finite
+            # sandbox_retries look ignored in the UI.
+            reason = (
+                f"build budget exhausted ({ctx.build_calls}/{max_builds} "
+                "build calls). Sandbox stage terminating."
+            )
+            yield {
+                "type": "observation",
+                "step": step,
+                "text": reason,
+                "error": True,
+            }
+            yield {
+                "type": "done",
+                "success": False,
+                "reason": reason,
+                "steps": step,
+                "builds": ctx.build_calls,
+            }
+            return
+
+        handler = TOOL_REGISTRY.get(action.tool)
+        if handler is None:
             obs = Observation(
                 text=(
-                    f"build budget exhausted ({ctx.build_calls}/{max_builds}). "
-                    "Make more patches before the next build."
+                    f"unknown tool '{action.tool}'. "
+                    f"Available: {', '.join(sorted(TOOL_REGISTRY))}"
                 ),
                 error=True,
             )
         else:
-            handler = TOOL_REGISTRY.get(action.tool)
-            if handler is None:
+            try:
+                obs = handler(ctx, action.args)
+            except Exception as e:
                 obs = Observation(
-                    text=(
-                        f"unknown tool '{action.tool}'. "
-                        f"Available: {', '.join(sorted(TOOL_REGISTRY))}"
-                    ),
+                    text=f"tool '{action.tool}' raised {type(e).__name__}: {e}",
                     error=True,
                 )
-            else:
-                try:
-                    obs = handler(ctx, action.args)
-                except Exception as e:
-                    obs = Observation(
-                        text=f"tool '{action.tool}' raised {type(e).__name__}: {e}",
-                        error=True,
-                    )
 
         history.append(StepRecord(step=step, action=action, observation=obs))
         yield {
@@ -967,6 +985,22 @@ def run_orchestrator(
                     "builds": ctx.build_calls,
                 }
                 return
+            # After the Nth failed build, stop immediately so a UI budget
+            # of N reiterations actually ends the sandbox stage.
+            if max_builds is not None and ctx.build_calls >= max_builds:
+                reason = (
+                    f"build budget exhausted after {ctx.build_calls}/"
+                    f"{max_builds} failed build call(s). Sandbox stage "
+                    "terminating."
+                )
+                yield {
+                    "type": "done",
+                    "success": False,
+                    "reason": reason,
+                    "steps": step,
+                    "builds": ctx.build_calls,
+                }
+                return
 
         if action.tool == "done":
             # Trust 'done' only if the most recent build was a success.
@@ -979,7 +1013,20 @@ def run_orchestrator(
                     "builds": ctx.build_calls,
                 }
                 return
-            # Otherwise force one more build to confirm.
+            # Otherwise force one more build to confirm — but never exceed
+            # a finite user-supplied build budget.
+            if max_builds is not None and ctx.build_calls >= max_builds:
+                yield {
+                    "type": "done",
+                    "success": False,
+                    "reason": (
+                        f"agent signalled done but build still failing and "
+                        f"budget is exhausted ({ctx.build_calls}/{max_builds})."
+                    ),
+                    "steps": step,
+                    "builds": ctx.build_calls,
+                }
+                return
             obs2 = tool_build(ctx, {})
             history[-1] = StepRecord(
                 step=step,
@@ -1000,6 +1047,18 @@ def run_orchestrator(
                     "type": "done",
                     "success": True,
                     "reason": "Verified by forced build after `done`.",
+                    "steps": step,
+                    "builds": ctx.build_calls,
+                }
+                return
+            if max_builds is not None and ctx.build_calls >= max_builds:
+                yield {
+                    "type": "done",
+                    "success": False,
+                    "reason": (
+                        f"forced verify build failed and budget exhausted "
+                        f"({ctx.build_calls}/{max_builds})."
+                    ),
                     "steps": step,
                     "builds": ctx.build_calls,
                 }

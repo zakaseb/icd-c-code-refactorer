@@ -40,9 +40,11 @@ UI: http://localhost:8081 — llama-server `:24000`, LiteLLM `:4000`.
 
 - Use current `app.js` + `append_log_helper.js`; keep a single EventSource tab per heavy session.
 
-## Sandbox never finishes
+## Sandbox never finishes / ignores retry count
 
-- Check `SANDBOX_USE_ORCHESTRATOR` / `SANDBOX_USE_AGENTIC` and related `SANDBOX_*` caps.
+- Confirm the UI is sending `?sandbox_retries=N` (network tab).
+- Session `status.json` should show `sandbox_retries_mode` / `sandbox_max_retries`.
+- Finite mode must hard-stop after budget exhaustion (`test_orchestrator_build_budget.py`).
 - IntegrationTeam may emit blackboard feedback targeting `transform` or `compile`.
 - Review `sandbox_build_log.txt` and (if agentic debug) `agentic_attempts/`.
 

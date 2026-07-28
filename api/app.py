@@ -26,7 +26,7 @@ import fitz  # PyMuPDF
 from pathlib import Path
 from typing import Iterable, Iterator, List
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 
 try:
     from api.orchestrator import run_orchestrator as _run_orchestrator
@@ -141,6 +141,128 @@ SANDBOX_AGENTIC_EDIT_BUDGET = int(
 SANDBOX_AGENTIC_OUTER_ROUNDS = int(
     os.environ.get("SANDBOX_AGENTIC_OUTER_ROUNDS", "2")
 )
+
+_SANDBOX_RETRIES_UNSET = object()
+# Default finite budget offered by the UI when the user has not chosen
+# "indefinite" (matches the orchestrator's historic per-round build cap).
+SANDBOX_RETRIES_UI_DEFAULT = SANDBOX_ORCH_MAX_BUILDS
+
+
+def _parse_sandbox_retries(raw: str | int | None) -> int | None:
+    """Parse a user-supplied sandbox retry budget.
+
+    Returns:
+      * ``None``  — run indefinitely until the build succeeds
+      * ``int``   — maximum number of build/fix reiterations (>= 1)
+
+    Accepts ``"indefinite"`` / ``"inf"`` / ``"infinite"`` / ``"0"`` / ``"-1"``
+    for the unlimited mode, or a positive integer string.
+    """
+    if raw is None:
+        raise ValueError("sandbox_retries value is required")
+    if isinstance(raw, int):
+        if raw < 0:
+            return None
+        if raw == 0:
+            return None
+        return raw
+    text = str(raw).strip().lower()
+    if text in ("indefinite", "inf", "infinite", "unlimited", "0", "-1"):
+        return None
+    try:
+        n = int(text)
+    except ValueError as e:
+        raise ValueError(
+            f"sandbox_retries must be a positive integer or 'indefinite' "
+            f"(got {raw!r})"
+        ) from e
+    if n < 0:
+        return None
+    if n == 0:
+        return None
+    return n
+
+
+def _resolve_sandbox_max_retries(
+    raw: str | None, status: dict | None = None,
+) -> object:
+    """Resolve the effective sandbox retry budget for a process/regenerate run.
+
+    Priority: explicit query/raw value → persisted status → unset (env defaults).
+    Return value is ``None`` (indefinite), a positive ``int``, or
+    ``_SANDBOX_RETRIES_UNSET`` (preserve classic env-driven limits).
+    """
+    if raw is not None and str(raw).strip() != "":
+        return _parse_sandbox_retries(raw)
+    if status:
+        mode = status.get("sandbox_retries_mode")
+        if mode == "indefinite":
+            return None
+        stored = status.get("sandbox_max_retries")
+        if isinstance(stored, int) and stored >= 1:
+            return stored
+        if mode == "finite" and stored is None:
+            return SANDBOX_RETRIES_UI_DEFAULT
+    return _SANDBOX_RETRIES_UNSET
+
+
+def _sandbox_retry_plan(sandbox_max_retries: object) -> dict:
+    """Translate a retry budget into per-backend limits.
+
+    When the budget is unset, mirror the classic env-driven behaviour
+    (multiple outer rounds × per-round caps). When the user supplies a
+    finite N, collapse to a single round with N builds/attempts. When
+    indefinite, outer rounds and per-round caps are both unlimited.
+    """
+    if sandbox_max_retries is _SANDBOX_RETRIES_UNSET:
+        return {
+            "mode": "env",
+            "label": (
+                f"env defaults (orch rounds={SANDBOX_ORCH_OUTER_ROUNDS} "
+                f"× builds={SANDBOX_ORCH_MAX_BUILDS}; agentic rounds="
+                f"{SANDBOX_AGENTIC_OUTER_ROUNDS} × attempts="
+                f"{SANDBOX_AGENTIC_MAX_ATTEMPTS})"
+            ),
+            "orch_outer": SANDBOX_ORCH_OUTER_ROUNDS,
+            "orch_builds": SANDBOX_ORCH_MAX_BUILDS,
+            "agentic_outer": SANDBOX_AGENTIC_OUTER_ROUNDS,
+            "agentic_attempts": SANDBOX_AGENTIC_MAX_ATTEMPTS,
+            "legacy_max": None,
+        }
+    if sandbox_max_retries is None:
+        return {
+            "mode": "indefinite",
+            "label": "indefinite (until build succeeds)",
+            "orch_outer": None,
+            "orch_builds": None,
+            "agentic_outer": None,
+            "agentic_attempts": None,
+            "legacy_max": None,
+        }
+    n = int(sandbox_max_retries)
+    return {
+        "mode": "finite",
+        "label": f"{n} reiteration(s)",
+        "orch_outer": 1,
+        "orch_builds": n,
+        "agentic_outer": 1,
+        "agentic_attempts": n,
+        "legacy_max": n,
+    }
+
+
+def _persist_sandbox_retries(status: dict, sandbox_max_retries: object) -> None:
+    """Write resolved retry budget fields onto *status* (caller writes disk)."""
+    if sandbox_max_retries is _SANDBOX_RETRIES_UNSET:
+        status["sandbox_retries_mode"] = "env"
+        status["sandbox_max_retries"] = None
+    elif sandbox_max_retries is None:
+        status["sandbox_retries_mode"] = "indefinite"
+        status["sandbox_max_retries"] = None
+    else:
+        status["sandbox_retries_mode"] = "finite"
+        status["sandbox_max_retries"] = int(sandbox_max_retries)
+
 # Coalesce tiny llama-server deltas into fewer SSE messages (less JSON.parse +
 # DOM pressure in the browser — important on unified-memory hosts).
 SSE_UI_TOKEN_BATCH_MIN_CHARS = int(os.environ.get("SSE_UI_TOKEN_BATCH_MIN_CHARS", "4096"))
@@ -1920,11 +2042,17 @@ def _sandbox_build_iterate(
     has_repo: bool,
     repo_knowledge: str = "",
     gitnexus_report: str = "",
+    sandbox_max_retries: object = _SANDBOX_RETRIES_UNSET,
 ):
     """Generator that yields SSE dicts for the sandbox build loop.
 
     Copies the repo, injects generated files, builds, and iteratively fixes
     compiler errors via the LLM until the build succeeds.
+
+    ``sandbox_max_retries`` controls the user-facing reiteration budget:
+      * ``_SANDBOX_RETRIES_UNSET`` — classic env-driven outer-round × caps
+      * ``None`` — keep iterating indefinitely until the build succeeds
+      * positive ``int`` — at most that many build/fix reiterations
 
     Key convergence strategies:
     - Generated files are fixed using the original working code as a reference,
@@ -1935,6 +2063,12 @@ def _sandbox_build_iterate(
       state and the LLM is given accumulated error history to force a
       different approach.
     """
+    retry_plan = _sandbox_retry_plan(sandbox_max_retries)
+    yield _sse({
+        "type": "info",
+        "stage": "sandbox_build",
+        "message": f"Sandbox build retry budget: {retry_plan['label']}.",
+    })
     sandbox_dir = session_dir / "sandbox"
     if sandbox_dir.exists():
         shutil.rmtree(sandbox_dir)
@@ -2166,15 +2300,29 @@ def _sandbox_build_iterate(
         agentic_total_steps = 0
         agentic_total_builds = 0
         success_via_agentic = False
+        agentic_outer = retry_plan["agentic_outer"]
+        agentic_attempts = retry_plan["agentic_attempts"]
 
-        for outer_round in range(1, SANDBOX_AGENTIC_OUTER_ROUNDS + 1):
+        outer_round = 0
+        while True:
+            outer_round += 1
+            if agentic_outer is not None and outer_round > agentic_outer:
+                break
+            round_label = (
+                f"{outer_round}/∞" if agentic_outer is None
+                else f"{outer_round}/{agentic_outer}"
+            )
+            attempts_label = (
+                "unlimited" if agentic_attempts is None
+                else str(agentic_attempts)
+            )
             yield _sse({
                 "type": "info",
                 "stage": "sandbox_build",
                 "message": (
                     f"Starting agentic debug pipeline "
-                    f"(round {outer_round}/{SANDBOX_AGENTIC_OUTER_ROUNDS}) — "
-                    f"max {SANDBOX_AGENTIC_MAX_ATTEMPTS} attempts, "
+                    f"(round {round_label}) — "
+                    f"max {attempts_label} attempts, "
                     f"no-progress limit {SANDBOX_AGENTIC_NO_PROGRESS}…"
                 ),
             })
@@ -2202,7 +2350,7 @@ def _sandbox_build_iterate(
                     snapshots=original_repo_files,
                     build_runner=runner,
                     llm_stream=_call_llm_stream,
-                    max_attempts=SANDBOX_AGENTIC_MAX_ATTEMPTS,
+                    max_attempts=agentic_attempts,
                     no_progress_limit=SANDBOX_AGENTIC_NO_PROGRESS,
                     oscillation_limit=SANDBOX_AGENTIC_OSCILLATION,
                     edit_budget_files=SANDBOX_AGENTIC_EDIT_BUDGET,
@@ -2213,8 +2361,11 @@ def _sandbox_build_iterate(
                             "type": "info",
                             "stage": "sandbox_build",
                             "message": (
-                                f"agentic attempt {evt['step']}/"
-                                f"{SANDBOX_AGENTIC_MAX_ATTEMPTS}"
+                                f"agentic attempt {evt['step']}"
+                                + (
+                                    "/∞" if agentic_attempts is None
+                                    else f"/{agentic_attempts}"
+                                )
                             ),
                         })
                     elif et == "phase":
@@ -2336,7 +2487,11 @@ def _sandbox_build_iterate(
                     "type": "done",
                     "success": False,
                     "reason": "round ended without explicit done event",
-                    "steps": SANDBOX_AGENTIC_MAX_ATTEMPTS,
+                    "steps": (
+                        agentic_attempts
+                        if agentic_attempts is not None
+                        else attempts_state["n"]
+                    ),
                     "builds": attempts_state["n"],
                 }
 
@@ -2360,7 +2515,7 @@ def _sandbox_build_iterate(
                 break
 
             # Round failed: reset to initial snapshot before next round.
-            if outer_round < SANDBOX_AGENTIC_OUTER_ROUNDS:
+            if agentic_outer is None or outer_round < agentic_outer:
                 yield _sse({
                     "type": "info",
                     "stage": "sandbox_build",
@@ -2392,7 +2547,7 @@ def _sandbox_build_iterate(
                 "=" * 65,
                 "SUMMARY (AGENTIC)",
                 "=" * 65,
-                f"Agentic rounds: {SANDBOX_AGENTIC_OUTER_ROUNDS}",
+                f"Agentic rounds: {outer_round}",
                 f"Total agent steps: {agentic_total_steps}",
                 f"Total build calls: {agentic_total_builds}",
                 f"Result: BUILD STILL FAILING (best effort packaged)",
@@ -2424,7 +2579,7 @@ def _sandbox_build_iterate(
                 "iterations": agentic_total_builds,
                 "message": (
                     "Sandbox build did not converge after "
-                    f"{SANDBOX_AGENTIC_OUTER_ROUNDS} agentic round(s); "
+                    f"{outer_round} agentic round(s); "
                     "best-effort repository packaged."
                 ),
             })
@@ -2497,8 +2652,21 @@ def _sandbox_build_iterate(
         success_via_orchestrator = False
         orch_total_steps = 0
         orch_total_builds = 0
+        orch_outer = retry_plan["orch_outer"]
+        orch_builds = retry_plan["orch_builds"]
 
-        for outer_round in range(1, SANDBOX_ORCH_OUTER_ROUNDS + 1):
+        outer_round = 0
+        while True:
+            outer_round += 1
+            if orch_outer is not None and outer_round > orch_outer:
+                break
+            round_label = (
+                f"{outer_round}/∞" if orch_outer is None
+                else f"{outer_round}/{orch_outer}"
+            )
+            builds_label = (
+                "unlimited" if orch_builds is None else str(orch_builds)
+            )
             step_phrase = (
                 f"max {SANDBOX_ORCH_MAX_STEPS} steps, "
                 if SANDBOX_ORCH_MAX_STEPS is not None
@@ -2509,8 +2677,8 @@ def _sandbox_build_iterate(
                 "stage": "sandbox_build",
                 "message": (
                     "Starting debugging orchestrator "
-                    f"(round {outer_round}/{SANDBOX_ORCH_OUTER_ROUNDS}) — "
-                    f"{step_phrase}{SANDBOX_ORCH_MAX_BUILDS} builds…"
+                    f"(round {round_label}) — "
+                    f"{step_phrase}{builds_label} builds…"
                 ),
             })
             build_log_lines.append("=" * 65)
@@ -2537,7 +2705,7 @@ def _sandbox_build_iterate(
                     build_runner=runner,
                     llm_stream=_call_llm_stream,
                     max_steps=SANDBOX_ORCH_MAX_STEPS,
-                    max_builds=SANDBOX_ORCH_MAX_BUILDS,
+                    max_builds=orch_builds,
                     max_input_tokens=MAX_INPUT_TOKENS,
                     max_output_tokens=MAX_OUTPUT_TOKENS,
                 ):
@@ -2687,7 +2855,7 @@ def _sandbox_build_iterate(
                 break
 
             # --- Round failed: reset and let next round try fresh -----------
-            if outer_round < SANDBOX_ORCH_OUTER_ROUNDS:
+            if orch_outer is None or outer_round < orch_outer:
                 yield _sse({
                     "type": "info",
                     "stage": "sandbox_build",
@@ -2721,7 +2889,7 @@ def _sandbox_build_iterate(
                 "=" * 65,
                 "SUMMARY",
                 "=" * 65,
-                f"Orchestrator rounds: {SANDBOX_ORCH_OUTER_ROUNDS}",
+                f"Orchestrator rounds: {outer_round}",
                 f"Total agent steps: {orch_total_steps}",
                 f"Total build calls: {orch_total_builds}",
                 f"Runtime (hours): {orch_runtime_h:.2f}",
@@ -2752,7 +2920,7 @@ def _sandbox_build_iterate(
                 "runtime_hours": round(orch_runtime_h, 3),
                 "message": (
                     "Sandbox build did not converge after "
-                    f"{SANDBOX_ORCH_OUTER_ROUNDS} orchestrator round(s); "
+                    f"{outer_round} orchestrator round(s); "
                     f"best-effort repository packaged. Runtime: {orch_runtime_h:.2f}h."
                 ),
             })
@@ -3775,7 +3943,10 @@ async def resume_session(session_id: str):
     }
 
 
-def _agentic_streaming_response(session_id: str) -> StreamingResponse:
+def _agentic_streaming_response(
+    session_id: str,
+    sandbox_retries: str | None = None,
+) -> StreamingResponse:
     """Run the agentic multi-agent pipeline for *session_id* (SSE stream).
 
     Same input validation, session layout, SSE event contract and final
@@ -3798,6 +3969,14 @@ def _agentic_streaming_response(session_id: str) -> StreamingResponse:
         raise HTTPException(status_code=400, detail="Source ICD not uploaded")
     if not status.get("target_icd"):
         raise HTTPException(status_code=400, detail="Target ICD not uploaded")
+
+    try:
+        sandbox_max_retries = _resolve_sandbox_max_retries(
+            sandbox_retries, status,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    _persist_sandbox_retries(status, sandbox_max_retries)
 
     code_dir = session_dir / "original_code"
     gen_dir = session_dir / "generated_code"
@@ -3869,16 +4048,34 @@ def _agentic_streaming_response(session_id: str) -> StreamingResponse:
 
 
 @app.get("/api/process-agentic/{session_id}")
-async def process_agentic(session_id: str):
+async def process_agentic(
+    session_id: str,
+    sandbox_retries: str | None = Query(
+        None,
+        description=(
+            "Sandbox build reiteration budget: a positive integer, or "
+            "'indefinite' to keep iterating until the build succeeds."
+        ),
+    ),
+):
     """Agentic multi-agent pipeline (agent-of-agents). SSE stream."""
-    return _agentic_streaming_response(session_id)
+    return _agentic_streaming_response(session_id, sandbox_retries)
 
 
 @app.get("/api/process/{session_id}")
-async def process(session_id: str):
+async def process(
+    session_id: str,
+    sandbox_retries: str | None = Query(
+        None,
+        description=(
+            "Sandbox build reiteration budget: a positive integer, or "
+            "'indefinite' to keep iterating until the build succeeds."
+        ),
+    ),
+):
     """Analyze ICDs and transform every code file. Returns an SSE stream."""
     if AGENTIC_PIPELINE:
-        return _agentic_streaming_response(session_id)
+        return _agentic_streaming_response(session_id, sandbox_retries)
     session_dir = SESSIONS_DIR / session_id
     if not session_dir.exists():
         raise HTTPException(status_code=404, detail="Session not found")
@@ -3890,6 +4087,15 @@ async def process(session_id: str):
         raise HTTPException(status_code=400, detail="Source ICD not uploaded")
     if not status.get("target_icd"):
         raise HTTPException(status_code=400, detail="Target ICD not uploaded")
+
+    try:
+        sandbox_max_retries = _resolve_sandbox_max_retries(
+            sandbox_retries, status,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    _persist_sandbox_retries(status, sandbox_max_retries)
+    _write_status(session_dir, status)
 
     code_dir = session_dir / "original_code"
     gen_dir = session_dir / "generated_code"
@@ -5442,6 +5648,9 @@ async def process(session_id: str):
                         has_repo=has_repo,
                         repo_knowledge=repo_knowledge,
                         gitnexus_report=gitnexus_report,
+                        sandbox_max_retries=_resolve_sandbox_max_retries(
+                            None, _read_status(session_dir),
+                        ),
                     )
                 )
                 for evt in build_iter:
@@ -5685,7 +5894,16 @@ async def get_conversation(session_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/regenerate/{session_id}")
-async def regenerate(session_id: str):
+async def regenerate(
+    session_id: str,
+    sandbox_retries: str | None = Query(
+        None,
+        description=(
+            "Sandbox build reiteration budget: a positive integer, or "
+            "'indefinite' to keep iterating until the build succeeds."
+        ),
+    ),
+):
     """Re-generate code incorporating conversation feedback. Returns SSE stream."""
     session_dir = SESSIONS_DIR / session_id
     if not session_dir.exists():
@@ -5694,6 +5912,16 @@ async def regenerate(session_id: str):
     status = json.loads((session_dir / "status.json").read_text())
     if status.get("state") != "completed":
         raise HTTPException(status_code=400, detail="Initial processing must complete first")
+
+    try:
+        sandbox_max_retries = _resolve_sandbox_max_retries(
+            sandbox_retries, status,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if sandbox_max_retries is not _SANDBOX_RETRIES_UNSET:
+        _persist_sandbox_retries(status, sandbox_max_retries)
+        _write_status(session_dir, status)
 
     conv_path = session_dir / "conversation.json"
     conversation = json.loads(conv_path.read_text()) if conv_path.exists() else []
@@ -6423,6 +6651,9 @@ async def regenerate(session_id: str):
                     has_repo=has_repo,
                     repo_knowledge=repo_knowledge,
                     gitnexus_report=gitnexus_report,
+                    sandbox_max_retries=_resolve_sandbox_max_retries(
+                        None, _read_status(session_dir),
+                    ),
                 )
             )
             for evt in build_iter:

@@ -1,6 +1,6 @@
 ---
 title: API Surface
-description: FastAPI routes and SSE behaviour on the agentic multi-agent branch
+description: FastAPI routes, SSE behaviour, and sandbox_retries
 tags: [api, rest, sse]
 ---
 
@@ -30,7 +30,17 @@ Primary implementation: `api/app.py`. On this branch, `/api/process` defaults to
 | `POST` | `/api/pause/{session_id}` | Pause processing |
 | `POST` | `/api/resume/{session_id}` | Resume processing |
 
-There is **no** `sandbox_retries` query parameter on this branch. Sandbox attempt budgets come from env (`SANDBOX_ORCH_*` / `SANDBOX_AGENTIC_*`). Mission revisits are bounded by `AGENTIC_MAX_STAGE_RUNS` and `AGENTIC_MAX_REVISITS_PER_STAGE`.
+### Query: `sandbox_retries`
+
+Accepted on `/api/process`, `/api/process-agentic`, and `/api/regenerate`.
+
+| Value | Behaviour |
+|-------|-----------|
+| Positive integer `N` | Finite budget: one outer round, `N` builds/attempts |
+| `indefinite`, `inf`, `infinite`, `unlimited`, `0`, `-1` | Unlimited until success/cancel |
+| Omitted | Env defaults (`SANDBOX_ORCH_*` / `SANDBOX_AGENTIC_*`) |
+
+Persisted on the session as `sandbox_retries_mode` ∈ `{env, indefinite, finite}` and `sandbox_max_retries`. Mission revisits remain bounded by `AGENTIC_MAX_STAGE_RUNS` / `AGENTIC_MAX_REVISITS_PER_STAGE`.
 
 ## Results & conversation
 

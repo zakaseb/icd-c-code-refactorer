@@ -45,4 +45,4 @@ Open **http://localhost:8081**. First start downloads the GGUF model into `model
 3. **Review** generated code, optionally chat feedback, then **Re-generate**.
 4. **Download** result ZIP and/or built repo ZIP.
 
-Set `AGENTIC_PIPELINE=0` to force the classic sequential path. Sandbox attempt budgets are env-driven (`SANDBOX_ORCH_*` / `SANDBOX_AGENTIC_*`); there is no UI `sandbox_retries` control on this branch.
+Set `AGENTIC_PIPELINE=0` to force the classic sequential path. Sandbox build retries are configurable in the UI (`sandbox_retries=N` or `indefinite`).
