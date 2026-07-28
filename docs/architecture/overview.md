@@ -60,11 +60,14 @@ workspace/sessions/<session_id>/
   source_icd.txt          # extracted Source ICD text
   target_icd.txt          # extracted Target ICD text
   repo_contents/          # optional unzipped repo
-  generated_code/         # transformed sources
+  generated_code/         # transformed sources + team_report_{stage}.md
   change_spec.txt         # distilled delta
   change_spec_raw.txt     # fuller analysis artefact
   verification_report.txt
   compile_report.txt
+  agentic_pipeline/
+    blackboard.json       # mission stages / feedback
+    team_reports/         # {stage}_team_report.md archive copies
   sandbox/                # build workspace
   built_repo.zip
   sandbox_build_log.txt

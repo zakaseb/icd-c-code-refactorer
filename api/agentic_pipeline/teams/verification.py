@@ -208,12 +208,32 @@ class VerificationTeam(Team):
 
         bb.resolve_feedback(self.stage)
         status = "success" if not unresolved else "partial"
-        bb.record_stage(
-            self.stage, status,
+        summary = (
             f"{len(gen_files)} file(s) verified; "
             f"{len(unresolved)} unresolved; "
-            f"{len(spec_doubts)} spec doubt(s).",
-            artifacts=["verification_report.txt"],
+            f"{len(spec_doubts)} spec doubt(s)."
+        )
+        arts = ["verification_report.txt", self.report_basename()]
+        bb.record_stage(self.stage, status, summary, artifacts=arts)
+        report_findings = [
+            f"Files reviewed: {len(gen_files)}.",
+            f"Unresolved after repair: {len(unresolved)}.",
+            f"Spec doubts escalated to analysis: {len(spec_doubts)}.",
+            "",
+            "### Verification report excerpt",
+            "```",
+            "\n".join(report)[:6000],
+            "```",
+        ]
+        if unresolved:
+            report_findings.extend([
+                "",
+                "### Unresolved",
+                *[f"- {u}" for u in unresolved[:40]],
+            ])
+        yield from self.emit_consolidated_report(
+            ctx, bb, report_findings,
+            status=status, summary=summary, artifacts=arts,
         )
         yield self.evt_stage_complete()
 

@@ -169,11 +169,32 @@ class CodebaseTeam(Team):
             )
 
         bb.resolve_feedback(self.stage)
-        bb.record_stage(
-            self.stage, "success",
+        summary = (
             f"repo_knowledge {len(repo_knowledge_full):,} chars, gitnexus "
             f"{len(gitnexus_full):,} chars, impact map "
-            f"{len(impact_map):,} chars.",
-            artifacts=artifacts,
+            f"{len(impact_map):,} chars."
+        )
+        bb.record_stage(
+            self.stage, "success", summary, artifacts=artifacts,
+        )
+        report_findings = [
+            f"Repository uploaded: {ctx.has_repo}.",
+            f"Repo knowledge (full): {len(repo_knowledge_full):,} chars.",
+            f"GitNexus report (full): {len(gitnexus_full):,} chars.",
+            f"Impact map: {len(impact_map):,} chars.",
+            "Artifacts: " + (", ".join(f"`{a}`" for a in artifacts) or "(none)") + ".",
+            "",
+            "### Impact map",
+            impact_map[:5000] if impact_map else "(no impact map)",
+            "",
+            "### GitNexus report (head)",
+            "```",
+            (gitnexus_report[:3000] + ("…" if len(gitnexus_report) > 3000 else ""))
+            if gitnexus_report else "(empty)",
+            "```",
+        ]
+        yield from self.emit_consolidated_report(
+            ctx, bb, report_findings,
+            status="success", summary=summary, artifacts=artifacts,
         )
         yield self.evt_stage_complete()

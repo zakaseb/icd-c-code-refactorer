@@ -191,6 +191,7 @@ class GenerationTeam(Team):
         bb.data["generated_files"] = dict(generated)
         bb.resolve_feedback(self.stage)
 
+        arts = sorted(generated)
         if failed_files:
             bb.add_feedback(
                 source_stage=self.stage, target_stage=self.stage,
@@ -203,19 +204,33 @@ class GenerationTeam(Team):
                     f"{_MAX_GEN_ATTEMPTS} attempts."
                 ),
             )
-            bb.record_stage(
-                self.stage, "partial",
+            status = "partial"
+            summary = (
                 f"Generated {len(generated)}/{len(ordered)} file(s); "
-                f"failed: {', '.join(failed_files)}.",
-                artifacts=sorted(generated),
+                f"failed: {', '.join(failed_files)}."
             )
         else:
-            bb.record_stage(
-                self.stage, "success",
+            status = "success"
+            summary = (
                 f"Generated {len(generated)} file(s) "
-                "(headers first, then sources).",
-                artifacts=sorted(generated),
+                "(headers first, then sources)."
             )
+        bb.record_stage(self.stage, status, summary, artifacts=arts)
+        report_findings = [
+            f"Files generated: {len(generated)}.",
+            f"Failed completeness gate: {len(failed_files)} "
+            f"({', '.join(failed_files) if failed_files else 'none'}).",
+            "",
+            "### Generated file inventory",
+            *[
+                f"- `{name}` ({len(code):,} chars)"
+                for name, code in sorted(generated.items())
+            ],
+        ]
+        yield from self.emit_consolidated_report(
+            ctx, bb, report_findings,
+            status=status, summary=summary, artifacts=arts,
+        )
         yield self.evt_stage_complete()
 
     # ------------------------------------------------------------------

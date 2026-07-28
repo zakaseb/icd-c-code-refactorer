@@ -11,6 +11,7 @@ Primary suite: `tests/development/` (as present on this branch).
 | Test module | Focus |
 |-------------|-------|
 | `test_deliverables_live_download.py` | Mid-build sandbox→gen_dir sync for Download All |
+| `test_team_consolidated_reports.py` | Per-team findings report → gen_dir + archive + Download ZIP |
 | `test_agentic_pipeline.py` | Default-on `AGENTIC_PIPELINE`, opt-out, FakeLLM mission coverage |
 | `test_sandbox_retry_ui.py` | Parsing/resolving `sandbox_retries`, UI/API wiring |
 | `test_orchestrator_build_budget.py` | Finite budget hard-stop in orchestrator |
@@ -38,5 +39,6 @@ python -m pytest tests/development/test_agentic_pipeline.py -q
 - Default env → `/api/process` uses the agentic mission.
 - `AGENTIC_PIPELINE=0` → classic sequential processing.
 - Mission writes `agentic_pipeline/blackboard.json`.
+- Each team writes `team_report_{stage}.md` (preview + Download All) and archives under `agentic_pipeline/team_reports/`.
 - UI receives a live `gitnexus` stage on the agentic path.
 - Per-file compile does not indiscriminately sweep `repo_dir`.

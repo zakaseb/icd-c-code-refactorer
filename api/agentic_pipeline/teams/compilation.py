@@ -119,11 +119,27 @@ class CompilationTeam(Team):
             )
 
         bb.resolve_feedback(self.stage)
-        bb.record_stage(
-            self.stage,
-            "success" if not failed else "partial",
+        status = "success" if not failed else "partial"
+        summary = (
             f"Per-file compile: {ok}/{total} succeeded"
-            + (f", {failed} failing." if failed else "."),
-            artifacts=["compile_report.txt"],
+            + (f", {failed} failing." if failed else ".")
+        )
+        arts = ["compile_report.txt", self.report_basename()]
+        bb.record_stage(self.stage, status, summary, artifacts=arts)
+        report_body = ""
+        report = ctx.gen_dir / "compile_report.txt"
+        if report.exists():
+            report_body = report.read_text()[:6000]
+        report_findings = [
+            f"Compile gate result: {ok}/{total} ok, {failed} failed.",
+            "",
+            "### Compile report excerpt",
+            "```",
+            report_body or "(no compile_report.txt)",
+            "```",
+        ]
+        yield from self.emit_consolidated_report(
+            ctx, bb, report_findings,
+            status=status, summary=summary, artifacts=arts,
         )
         yield self.evt_stage_complete()

@@ -42,7 +42,7 @@ Open **http://localhost:8081**. First start downloads the GGUF model into `model
 
 1. **Upload** `.c`/`.h`, Source ICD PDF, Target ICD PDF (optional repo ZIP).
 2. **Process** streams SSE stages via MissionController teams: `analysis` → `gitnexus` → `transform` → `verification` → `compile` → `sandbox_build` (with possible revisits).
-3. **Review** generated code, optionally chat feedback, then **Re-generate**.
-4. **Download** result ZIP and/or built repo ZIP.
+3. **Review** generated code and per-stage `team_report_*.md` findings, optionally chat feedback, then **Re-generate**.
+4. **Download** result ZIP (includes team reports) and/or built repo ZIP.
 
 Set `AGENTIC_PIPELINE=0` to force the classic sequential path. Sandbox build retries are configurable in the UI (`sandbox_retries=N` or `indefinite`).

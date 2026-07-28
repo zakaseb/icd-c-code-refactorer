@@ -44,12 +44,26 @@ api/agentic_pipeline/
 
 1. Pick next pending stage from `STAGE_ORDER`.
 2. Run the mapped team (`team.run`).
-3. Router decides `proceed` vs `revisit` (blockers force revisit; LLM router optional via `AGENTIC_ROUTER_LLM`).
-4. On revisit, `mark_stale_after` so downstream stages re-run.
-5. Bounds: `AGENTIC_MAX_STAGE_RUNS` (default 12), `AGENTIC_MAX_REVISITS_PER_STAGE` (default 2).
-6. `_finalise()` writes `status.json` and emits classic SSE `{type: "complete", ...}`.
+3. After each run, ensure a consolidated team findings report exists (`Team.ensure_consolidated_report` fallback if the team did not emit one).
+4. Router decides `proceed` vs `revisit` (blockers force revisit; LLM router optional via `AGENTIC_ROUTER_LLM`).
+5. On revisit, `mark_stale_after` so downstream stages re-run.
+6. Bounds: `AGENTIC_MAX_STAGE_RUNS` (default 12), `AGENTIC_MAX_REVISITS_PER_STAGE` (default 2).
+7. `_finalise()` writes `status.json` and emits classic SSE `{type: "complete", ...}`.
 
 SSE stage names stay compatible with the UI: `analysis`, `gitnexus`, `transform`, `verification`, `compile`, `sandbox_build`.
+
+## Consolidated team reports
+
+Every team writes **one** Markdown findings report at the end of its run via `Team.emit_consolidated_report` in `teams/base.py`:
+
+| Location | Name pattern | Purpose |
+|----------|--------------|---------|
+| `generated_code/` | `team_report_{stage}.md` | Live preview + Download All (same path as other deliverables) |
+| `agentic_pipeline/team_reports/` | `{stage}_team_report.md` | Durable archive copy |
+
+Reports include status, summary, findings, artefacts, feedback raised/pending, and the agent roster. Emitting a report also sends SSE `deliverables_updated` (same channel as mid-sandbox sync) so the UI/download list stays current without waiting for mission complete.
+
+`GET /api/download/{session_id}` packs both the live `team_report_*.md` files from `generated_code/` and the `agentic_pipeline/team_reports/` archive folder into the ZIP.
 
 ## Teams & agents
 
@@ -81,9 +95,10 @@ Classic artefacts plus mission audit:
 
 ```text
 session_dir/agentic_pipeline/blackboard.json   # stages, feedback, history
+session_dir/agentic_pipeline/team_reports/     # {stage}_team_report.md archive
 session_dir/change_spec.txt / change_spec_raw.txt
 session_dir/repo_knowledge.txt / gitnexus_report.txt
-generated_code/…  verification_report.txt  compile_report.txt
+generated_code/…  team_report_{stage}.md  verification_report.txt  compile_report.txt
 built_repo.zip  sandbox_build_log.txt  agentic_attempts/ (if debug crew on)
 ```
 
@@ -109,7 +124,8 @@ See also [building/configuration.md](../building/configuration.md).
 
 ## Testing
 
-`tests/development/test_agentic_pipeline.py` — default-on flag, opt-out, FakeLLM mission coverage.
+- `tests/development/test_agentic_pipeline.py` — default-on flag, opt-out, FakeLLM mission coverage.
+- `tests/development/test_team_consolidated_reports.py` — per-team report write, SSE `deliverables_updated`, Download ZIP packaging.
 
 ## Relationship diagram
 

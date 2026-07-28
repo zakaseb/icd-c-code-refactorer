@@ -1,6 +1,6 @@
 {
-  "updatedAt": "2026-07-28T10:20:00.000Z",
+  "updatedAt": "2026-07-28T12:40:00.000Z",
   "command": "update",
   "branch": "feature/agentic-multiagent-pipeline",
-  "notes": "Inherited Halcon UI + sandbox_retries (finite/indefinite) from main/sandbox-retry branch; wired through agentic mission IntegrationTeam."
+  "notes": "Each agentic team emits a consolidated findings report (generated_code/team_report_{stage}.md + agentic_pipeline/team_reports/) downloadable via the live deliverables path."
 }

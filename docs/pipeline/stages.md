@@ -15,14 +15,14 @@ Default on this branch: `GET /api/process/{session_id}` → **agentic mission** 
 | Order | SSE `stage` | Agentic team (default) | Classic path | Key artefacts |
 |------:|-------------|------------------------|--------------|---------------|
 | 0 | *(upload)* | — | `upload_*` routes; PDF → text | `original_code/`, `source_icd.txt`, `target_icd.txt`, `repo_contents/` |
-| 1 | `analysis` | `IngestionTeam` | ICD compare + distill in `app.py` | `change_spec.txt`, `change_spec_raw.txt`, `target_summary.txt` |
-| 2 | `gitnexus` | `CodebaseTeam` | Optional / may be absent on classic | `repo_knowledge.txt`, `gitnexus_report.txt` |
-| 3 | `transform` | `GenerationTeam` | Per-file codegen + variants | `generated_code/*.c|.h` (incl. per-variant headers) |
-| 4 | `verification` | `VerificationTeam` | `_structural_verify` + LLM | `verification_report.txt` |
-| 5 | `compile` | `CompilationTeam` | `run_per_file_compile` | `*.o`, `compile_report.txt` |
-| 6 | `sandbox_build` | `IntegrationTeam` | `_sandbox_build_iterate` | `built_repo.zip`, `sandbox_build_log.txt` |
+| 1 | `analysis` | `IngestionTeam` | ICD compare + distill in `app.py` | `change_spec.txt`, `change_spec_raw.txt`, `target_summary.txt`, `team_report_analysis.md` |
+| 2 | `gitnexus` | `CodebaseTeam` | Optional / may be absent on classic | `repo_knowledge.txt`, `gitnexus_report.txt`, `team_report_gitnexus.md` |
+| 3 | `transform` | `GenerationTeam` | Per-file codegen + variants | `generated_code/*.c|.h` (incl. per-variant headers), `team_report_transform.md` |
+| 4 | `verification` | `VerificationTeam` | `_structural_verify` + LLM | `verification_report.txt`, `team_report_verification.md` |
+| 5 | `compile` | `CompilationTeam` | `run_per_file_compile` | `*.o`, `compile_report.txt`, `team_report_compile.md` |
+| 6 | `sandbox_build` | `IntegrationTeam` | `_sandbox_build_iterate` | `built_repo.zip`, `sandbox_build_log.txt`, `team_report_sandbox_build.md` |
 
-Agentic mode may **revisit** earlier stages when blackboard feedback has blockers (bounded by `AGENTIC_MAX_*`). There is no separate `header_doc` SSE stage on this branch; header work is part of GenerationTeam / classic transform.
+In agentic mode each team also archives a copy under `agentic_pipeline/team_reports/{stage}_team_report.md` and emits `deliverables_updated` so Download All can pick up the report immediately. Agentic mode may **revisit** earlier stages when blackboard feedback has blockers (bounded by `AGENTIC_MAX_*`). There is no separate `header_doc` SSE stage on this branch; header work is part of GenerationTeam / classic transform.
 
 ## Analysis & generation
 

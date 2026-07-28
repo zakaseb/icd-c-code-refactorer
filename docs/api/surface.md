@@ -46,9 +46,9 @@ Persisted on the session as `sandbox_retries_mode` ∈ `{env, indefinite, finite
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/api/download/{session_id}` | Generated result ZIP |
+| `GET` | `/api/download/{session_id}` | Generated result ZIP (includes `team_report_*.md` + `agentic_pipeline/team_reports/`) |
 | `GET` | `/api/download-repo/{session_id}` | Built sandbox repo ZIP |
-| `GET` | `/api/preview/{session_id}/{filename}` | Preview a generated file |
+| `GET` | `/api/preview/{session_id}/{filename}` | Preview a generated file (incl. live `team_report_{stage}.md`) |
 | `POST` | `/api/conversation/{session_id}` | Append feedback (`ChatMessage`) |
 | `GET` | `/api/conversation/{session_id}` | Read conversation history |
 
@@ -66,9 +66,9 @@ Persisted on the session as `sandbox_retries_mode` ∈ `{env, indefinite, finite
 - `file_complete` — per-file transform progress
 - `sandbox_build_result` / build log chunks
 - Mission / team info lines; orchestrator or agentic-debug events during `sandbox_build`
-- `deliverables_updated` — mid-sandbox sync of scripts/reports for live download/preview
+- `deliverables_updated` — mid-mission refresh of downloadable files (team consolidated reports after each stage; also mid-sandbox sync of scripts/reports)
 - Final `{type: "complete", files, sandbox_build?}`
 
 UI token batching: `SSE_UI_TOKEN_BATCH_*`. Sandbox log cap: `SANDBOX_SSE_MAX_BUILD_LOG_CHARS`.
 
-Mission audit on disk: `session_dir/agentic_pipeline/blackboard.json`.
+Mission audit on disk: `session_dir/agentic_pipeline/blackboard.json`. Per-team findings: `generated_code/team_report_{stage}.md` and `agentic_pipeline/team_reports/{stage}_team_report.md`.

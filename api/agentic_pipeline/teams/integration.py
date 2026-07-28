@@ -60,9 +60,15 @@ class IntegrationTeam(Team):
                 "skipping the integration build."
             )
             bb.data["sandbox_build_success"] = None
-            bb.record_stage(
-                self.stage, "success",
-                "Skipped (no repository to integrate into).",
+            summary = "Skipped (no repository to integrate into)."
+            bb.record_stage(self.stage, "success", summary)
+            yield from self.emit_consolidated_report(
+                ctx, bb,
+                [
+                    "Integration build skipped: no repository uploaded "
+                    "and remote build disabled.",
+                ],
+                status="success", summary=summary, artifacts=[],
             )
             yield self.evt_stage_complete()
             return
@@ -105,12 +111,19 @@ class IntegrationTeam(Team):
         bb.data["sandbox_build_success"] = success
 
         # ---- IntegrationJudge ----------------------------------------------
+        arts = [
+            "built_repo.zip", "sandbox_build_log.txt", self.report_basename(),
+        ]
         if success:
             bb.resolve_feedback(self.stage)
-            bb.record_stage(
-                self.stage, "success",
-                "Generated files built successfully inside the codebase.",
-            )
+            status = "success"
+            summary = "Generated files built successfully inside the codebase."
+            bb.record_stage(self.stage, status, summary, artifacts=arts)
+            report_findings = [
+                "Sandbox / remote build converged successfully.",
+                "Deliverables include built_repo.zip and sandbox_build_log.txt "
+                "when present.",
+            ]
         else:
             log_tail = ""
             log_file = ctx.session_dir / "sandbox_build_log.txt"
@@ -131,10 +144,22 @@ class IntegrationTeam(Team):
                 f"routed to the '{target}' stage."
             )
             bb.resolve_feedback(self.stage)
-            bb.record_stage(
-                self.stage, "failed",
-                "Sandbox build failed after the debug crew's budget.",
-            )
+            status = "failed"
+            summary = "Sandbox build failed after the debug crew's budget."
+            bb.record_stage(self.stage, status, summary, artifacts=arts)
+            report_findings = [
+                "Sandbox / remote build did not converge.",
+                f"Feedback routed to stage `{target}`.",
+                "",
+                "### Build log (tail)",
+                "```",
+                log_tail or "(no sandbox_build_log.txt)",
+                "```",
+            ]
+        yield from self.emit_consolidated_report(
+            ctx, bb, report_findings,
+            status=status, summary=summary, artifacts=arts,
+        )
         yield self.evt_stage_complete()
 
     # ------------------------------------------------------------------

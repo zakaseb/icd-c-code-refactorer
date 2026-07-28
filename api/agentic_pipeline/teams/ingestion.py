@@ -153,6 +153,17 @@ class IngestionTeam(Team):
                 "Analysis produced no change specification — mission "
                 "control will decide how to proceed."
             )
+            yield from self.emit_consolidated_report(
+                ctx, bb,
+                [
+                    "ICD analysis produced no change specification.",
+                    f"Finding blocks mined before failure: {len(findings)}.",
+                    "Mission control will decide whether to re-run analysis.",
+                ],
+                status="failed",
+                summary="Analysis produced no change specification.",
+                artifacts=[],
+            )
             return
 
         # ---- Distiller + FactAuditor ------------------------------------
@@ -188,12 +199,30 @@ class IngestionTeam(Team):
         (ctx.gen_dir / "icd_analysis.txt").write_text(change_spec)
 
         bb.resolve_feedback(self.stage)
-        bb.record_stage(
-            self.stage, "success",
+        summary = (
             f"change_spec {len(change_spec):,} chars "
             f"(raw {len(raw_change_spec):,}), target_summary "
-            f"{len(target_summary):,} chars.",
-            artifacts=artifacts,
+            f"{len(target_summary):,} chars."
+        )
+        bb.record_stage(
+            self.stage, "success", summary, artifacts=artifacts,
+        )
+        findings = [
+            f"Target ICD summary: {len(target_summary):,} chars.",
+            f"Delta finding blocks mined: {len(findings)}.",
+            f"Raw change_spec: {len(raw_change_spec):,} chars.",
+            f"Distilled change_spec: {len(change_spec):,} chars "
+            f"({'distilled' if change_spec != raw_change_spec else 'raw retained'}).",
+            "Key artifacts: " + ", ".join(f"`{a}`" for a in artifacts) + ".",
+            "",
+            "### Distilled change_spec (head)",
+            "```",
+            change_spec[:4000] + ("…" if len(change_spec) > 4000 else ""),
+            "```",
+        ]
+        yield from self.emit_consolidated_report(
+            ctx, bb, findings,
+            status="success", summary=summary, artifacts=artifacts,
         )
         yield self.evt_stage_complete()
 

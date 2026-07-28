@@ -124,6 +124,9 @@ class MissionController:
                     "consulting the router.",
                     stage=current,
                 )
+            # Guarantee a consolidated team report exists for Download All /
+            # preview even if the team crashed or forgot to emit one.
+            yield from team.ensure_consolidated_report(ctx, bb)
             bb.save()
 
             decision = self._route(current)

@@ -5890,6 +5890,21 @@ async def download_all(session_id: str):
                     added += 1
             if added:
                 log.info("Added %d agentic_attempts/* files", added)
+        # Consolidated per-team findings (agentic multi-agent pipeline).
+        team_reports_dir = (
+            session_dir / "agentic_pipeline" / "team_reports"
+        )
+        if team_reports_dir.exists() and team_reports_dir.is_dir():
+            added = 0
+            for rf in sorted(team_reports_dir.rglob("*")):
+                if rf.is_file():
+                    arc = "agentic_pipeline/team_reports/" + str(
+                        rf.relative_to(team_reports_dir)
+                    )
+                    zf.write(rf, arc)
+                    added += 1
+            if added:
+                log.info("Added %d team_reports/* files", added)
     buf.seek(0)
 
     return StreamingResponse(
