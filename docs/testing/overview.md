@@ -10,6 +10,7 @@ Primary suite: `tests/development/` (as present on this branch).
 
 | Test module | Focus |
 |-------------|-------|
+| `test_deliverables_live_download.py` | Mid-build sandbox→gen_dir sync for Download All |
 | `test_agentic_pipeline.py` | Default-on `AGENTIC_PIPELINE`, opt-out, FakeLLM mission coverage |
 | `test_sandbox_retry_ui.py` | Parsing/resolving `sandbox_retries`, UI/API wiring |
 | `test_orchestrator_build_budget.py` | Finite budget hard-stop in orchestrator |

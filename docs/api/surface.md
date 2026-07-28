@@ -66,6 +66,7 @@ Persisted on the session as `sandbox_retries_mode` ∈ `{env, indefinite, finite
 - `file_complete` — per-file transform progress
 - `sandbox_build_result` / build log chunks
 - Mission / team info lines; orchestrator or agentic-debug events during `sandbox_build`
+- `deliverables_updated` — mid-sandbox sync of scripts/reports for live download/preview
 - Final `{type: "complete", files, sandbox_build?}`
 
 UI token batching: `SSE_UI_TOKEN_BATCH_*`. Sandbox log cap: `SANDBOX_SSE_MAX_BUILD_LOG_CHARS`.

@@ -2195,6 +2195,32 @@ def _sandbox_build_iterate(
         "",
     ]
 
+    def _publish_deliverables(reason: str = "") -> str:
+        """Sync sandbox edits → gen_dir, flush log, return SSE event string."""
+        synced = _sync_sandbox_deliverables(replacement_map, gen_dir)
+        _flush_sandbox_build_log(session_dir, build_log_lines)
+        payload = {
+            "type": "deliverables_updated",
+            "stage": "sandbox_build",
+            "files": _deliverables_file_list(gen_dir),
+            "synced": synced,
+        }
+        if reason:
+            payload["reason"] = reason
+        return _sse(payload)
+
+    # Make scripts/reports downloadable for the entire sandbox stage, and keep
+    # them current as the debugger edits files under sandbox/.
+    yield _publish_deliverables("sandbox_start")
+    yield _sse({
+        "type": "info",
+        "stage": "sandbox_build",
+        "message": (
+            "Deliverables are available for download during the sandbox "
+            "build; mid-build edits are reflected in Download All (ZIP)."
+        ),
+    })
+
     # --- System prompts for generated-file fixes and repo-file patches ------
     cross_note = (
         f"The sandbox is cross-compiling with {cc_label}. "
@@ -2379,6 +2405,12 @@ def _sandbox_build_iterate(
                                 f"step {evt['step']}: phase={evt['phase']}"
                             ),
                         })
+                        if evt.get("phase") in (
+                            "patch", "verify", "decide", "done",
+                        ):
+                            yield _publish_deliverables(
+                                f"phase:{evt.get('phase')}"
+                            )
                     elif et == "thought":
                         snippet = evt["text"]
                         if len(snippet) > 800:
@@ -2414,6 +2446,10 @@ def _sandbox_build_iterate(
                                 f"step {evt['step']}: {evt['tool']}"
                             ),
                         })
+                        if evt.get("tool") in (
+                            "patch", "write_file", "reset_file", "apply_patch",
+                        ):
+                            yield _publish_deliverables(str(evt.get("tool")))
                     elif et == "observation":
                         otext = evt["text"]
                         if len(otext) > 1500:
@@ -2448,6 +2484,7 @@ def _sandbox_build_iterate(
                                 f"{'success' if evt['success'] else 'failed'}"
                             ),
                         })
+                        yield _publish_deliverables("build")
                     elif et == "raw_token":
                         yield _sse({
                             "type": "token",
@@ -2465,6 +2502,7 @@ def _sandbox_build_iterate(
                         })
                     elif et == "done":
                         round_done_event = evt
+                        yield _publish_deliverables("round_done")
                         break
             except Exception as e:
                 log.exception("Agentic round %d crashed", outer_round)
@@ -2758,6 +2796,10 @@ def _sandbox_build_iterate(
                                 f"step {evt['step']}: {evt['tool']}"
                             ),
                         })
+                        if evt.get("tool") in (
+                            "patch", "write_file", "reset_file", "apply_patch",
+                        ):
+                            yield _publish_deliverables(str(evt.get("tool")))
                     elif et == "observation":
                         otext = evt["text"]
                         if len(otext) > 1500:
@@ -2792,6 +2834,7 @@ def _sandbox_build_iterate(
                                 f"{'success' if evt['success'] else 'failed'}"
                             ),
                         })
+                        yield _publish_deliverables("build")
                     elif et == "raw_token":
                         yield _sse({
                             "type": "token",
@@ -2809,6 +2852,7 @@ def _sandbox_build_iterate(
                         })
                     elif et == "done":
                         round_done_event = evt
+                        yield _publish_deliverables("round_done")
                         break
             except Exception as e:
                 log.exception("Orchestrator round %d crashed", outer_round)
@@ -3462,7 +3506,60 @@ def _remote_build_iterate(
         ),
     })
 
+
+def _sync_sandbox_deliverables(
+    replacement_map: dict[str, Path],
+    gen_dir: Path,
+) -> list[str]:
+    """Copy live sandbox contents of generated scripts back into ``gen_dir``.
+
+    Sandbox debug agents edit files under ``sandbox/``; ``/api/download`` and
+    ``/api/preview`` read ``generated_code/``. Keep them aligned so mid-build
+    downloads reflect the latest edits.
+    """
+    synced: list[str] = []
+    for fname, sandbox_path in replacement_map.items():
+        try:
+            if not sandbox_path.is_file():
+                continue
+            content = sandbox_path.read_text(errors="replace")
+            dest = gen_dir / fname
+            if dest.exists():
+                try:
+                    if dest.read_text(errors="replace") == content:
+                        continue
+                except OSError:
+                    pass
+            dest.write_text(content)
+            synced.append(fname)
+        except OSError as e:
+            log.warning("sync deliverable %s failed: %s", fname, e)
+    return synced
+
+
+def _flush_sandbox_build_log(session_dir: Path, lines: list[str]) -> None:
+    """Persist the in-progress sandbox build log so downloads can include it."""
+    try:
+        (session_dir / "sandbox_build_log.txt").write_text(
+            "\n".join(lines) + ("\n" if lines else "")
+        )
+    except OSError as e:
+        log.warning("flush sandbox_build_log failed: %s", e)
+
+
+def _deliverables_file_list(gen_dir: Path) -> list[str]:
+    """Previewable / downloadable artefact names currently in ``gen_dir``."""
+    if not gen_dir.is_dir():
+        return []
+    skip_ext = {".o"}
+    return sorted(
+        p.name for p in gen_dir.iterdir()
+        if p.is_file() and p.suffix.lower() not in skip_ext
+    )
+
+
 def _package_sandbox_zip(session_dir: Path, sandbox_dir: Path) -> Path:
+
     """Write the sandbox directory to ``session_dir/built_repo.zip``."""
     zip_path = session_dir / "built_repo.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -5801,7 +5898,10 @@ async def download_all(session_id: str):
         headers={
             "Content-Disposition": (
                 f"attachment; filename=refactored_code_{session_id[:8]}.zip"
-            )
+            ),
+            # Mid-build downloads must not be served from browser/proxy cache.
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
         },
     )
 

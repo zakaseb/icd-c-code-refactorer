@@ -395,6 +395,23 @@
           }
           break;
 
+        case 'deliverables_updated':
+          // Sandbox stage keeps generated_code/ + reports in sync with live
+          // sandbox edits; refresh tabs/preview and keep Download All visible.
+          generatedFiles = (Array.isArray(msg.files) ? msg.files : generatedFiles).filter(function (f) {
+            return !f.toLowerCase().endsWith('.o');
+          });
+          if (generatedFiles.length) {
+            showResults(generatedFiles, hasSandboxBuild, true);
+            var activeTab = resultTabs.querySelector('.file-tab.active');
+            var activeName = activeTab ? activeTab.dataset.file : null;
+            var synced = Array.isArray(msg.synced) ? msg.synced : [];
+            if (activeName && (!synced.length || synced.indexOf(activeName) >= 0)) {
+              loadPreview(activeName);
+            }
+          }
+          break;
+
         case 'stage_complete':
           if (msg.stage === 'analysis') {
             setStepStatus(analysisStep, 'complete');

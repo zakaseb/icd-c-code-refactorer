@@ -52,3 +52,13 @@ Mission-level revisits still use `AGENTIC_MAX_STAGE_RUNS` / `AGENTIC_MAX_REVISIT
 ## Remote build
 
 `REMOTE_BUILD_ENABLED`, `REMOTE_BUILD_HOST`, `REMOTE_BUILD_USER`, `REMOTE_BUILD_PASS`, `REMOTE_BUILD_SRC`, `REMOTE_BUILD_SCRIPT`, `REMOTE_BUILD_MODE`.
+
+## Deliverables during sandbox build
+
+While `sandbox_build` is running:
+
+- **Download All (ZIP)** stays available (also after per-file compile).
+- Generated scripts under `generated_code/` are kept in sync with live sandbox edits (orchestrator / agentic debug patches).
+- `sandbox_build_log.txt` is flushed incrementally so the ZIP includes the current log.
+- The UI receives `deliverables_updated` SSE events and refreshes previews when the open file changed.
+
