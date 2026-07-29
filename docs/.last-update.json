@@ -1,6 +1,6 @@
 {
-  "updatedAt": "2026-07-28T12:40:00.000Z",
+  "updatedAt": "2026-07-29T10:50:00.000Z",
   "command": "update",
   "branch": "feature/agentic-multiagent-pipeline",
-  "notes": "Each agentic team emits a consolidated findings report (generated_code/team_report_{stage}.md + agentic_pipeline/team_reports/) downloadable via the live deliverables path."
+  "notes": "Restored gitnexus_report kwarg on run_orchestrator/build_brief and run_agentic_debug planner/patcher (regressed when merging sandbox retry budgets)."
 }

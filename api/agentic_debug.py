@@ -1250,6 +1250,7 @@ def _planner_prompt(
     playbook_hints: list[str],
     strategy_mode: str,
     compile_only_success_streak: int,
+    gitnexus_report: str = "",
 ) -> str:
     clusters = lane_result.active_clusters
     cluster_blob = json.dumps(
@@ -1299,6 +1300,16 @@ def _planner_prompt(
         "- Do NOT propose software-lane edits while firmware lane still has errors.\n\n"
         f"## ICD change spec (truncated)\n{change_spec[:4000]}\n\n"
         f"## Repo knowledge (truncated)\n{repo_knowledge[:2000]}\n\n"
+        + (
+            f"## GitNexus codebase understanding (truncated)\n"
+            f"Embedded-systems relationships extracted from the repo "
+            f"(ISR/task wiring, drivers, RTOS/superloop, state machines, "
+            f"comm stacks, memory ownership, HAL boundary, bootloader, "
+            f"FW update, safety chains, cross-module deps, global var "
+            f"graph, script deps). Honor these when patching.\n"
+            f"{gitnexus_report[:3000]}\n\n"
+            if gitnexus_report else ""
+        )
         + f"## Recent metrics history\n```json\n{metrics_blob}\n```\n\n"
         "## Lane-A firmware clusters\n"
         f"```json\n{fw_blob}\n```\n\n"
@@ -1328,6 +1339,7 @@ def _patcher_prompt(
     layer: str,
     clusters: list[ErrorCluster],
     change_spec: str,
+    gitnexus_report: str = "",
 ) -> str:
     files_blob_parts: list[str] = []
     for path, content in file_contents.items():
@@ -1342,10 +1354,19 @@ def _patcher_prompt(
         [c.to_json() for c in clusters[:6]],
         indent=2, ensure_ascii=False,
     )
+    gitnexus_section = (
+        f"## GitNexus codebase understanding (truncated)\n"
+        f"Embedded-systems relationships across the repository. Avoid "
+        f"breaking ISR/task wiring, shared globals, comm-stack callers, "
+        f"state-machine dispatch tables and safety-critical paths.\n"
+        f"{gitnexus_report[:3000]}\n\n"
+        if gitnexus_report else ""
+    )
     return (
         f"## Hypothesis\n```json\n{json.dumps(hypothesis.to_json(), indent=2)}\n```\n\n"
         f"## Active layer\n{layer}\n\n"
         f"## ICD change spec (truncated)\n{change_spec[:4000]}\n\n"
+        f"{gitnexus_section}"
         f"## Top error clusters\n```json\n{cluster_blob}\n```\n\n"
         f"## Current target files\n{files_blob}\n\n"
         f"## Your turn\n"
@@ -1574,6 +1595,7 @@ def run_agentic_debug(
     gen_files: dict[str, str],            # {repo-rel-path: gen_filename}
     change_spec: str,
     repo_knowledge: str,
+    gitnexus_report: str = "",
     file_index: dict[str, list[Path]],
     snapshots: dict[Path, str],
     build_runner: Callable[[], tuple[bool, str]],
@@ -1823,6 +1845,7 @@ def run_agentic_debug(
             playbook_hints=playbook_hints,
             strategy_mode=("second_choice" if second_choice_mode else "primary"),
             compile_only_success_streak=compile_only_success_streak,
+            gitnexus_report=gitnexus_report,
         )
         planner_raw_parts: list[str] = []
 
@@ -1953,6 +1976,7 @@ def run_agentic_debug(
             layer=layer,
             clusters=clusters,
             change_spec=change_spec,
+            gitnexus_report=gitnexus_report,
         )
         patcher_raw_parts: list[str] = []
 

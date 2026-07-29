@@ -15,6 +15,7 @@ Primary suite: `tests/development/` (as present on this branch).
 | `test_agentic_pipeline.py` | Default-on `AGENTIC_PIPELINE`, opt-out, FakeLLM mission coverage |
 | `test_sandbox_retry_ui.py` | Parsing/resolving `sandbox_retries`, UI/API wiring |
 | `test_orchestrator_build_budget.py` | Finite budget hard-stop in orchestrator |
+| `test_orchestrator_gitnexus_kwarg.py` | `run_orchestrator` / agentic accept `gitnexus_report` (no TypeError crash loop) |
 | `test_agentic_xilinx_profile.py` | Agentic Xilinx / superloop profile behaviour |
 | `test_per_file_compile.py` | Per-file compile gate scoping and diagnostics |
 | `test_llm_request_hardening.py` | Prompt clamp, overflow retry, error surfaces |
