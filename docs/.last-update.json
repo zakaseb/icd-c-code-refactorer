@@ -1,6 +1,6 @@
 {
-  "updatedAt": "2026-07-29T10:50:00.000Z",
+  "updatedAt": "2026-07-29T12:45:00.000Z",
   "command": "update",
   "branch": "feature/agentic-multiagent-pipeline",
-  "notes": "Restored gitnexus_report kwarg on run_orchestrator/build_brief and run_agentic_debug planner/patcher (regressed when merging sandbox retry budgets)."
+  "notes": "Indefinite sandbox retries use one unlimited inner campaign (orch_outer=1) instead of unlimited outer reset rounds that flooded SSE and hid the build stage."
 }

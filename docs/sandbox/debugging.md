@@ -23,6 +23,8 @@ ReAct tool loop. Tools: `read_file`, `list_dir`, `search`, `find_files`, `patch`
 
 Accepts optional `gitnexus_report` (from the mission/classic GitNexus stage) and injects it into `build_brief` so patch decisions honor ISR/task wiring and related embedded relationships. `_sandbox_build_iterate` always forwards this kwarg — both `run_orchestrator` and `run_agentic_debug` must accept it (otherwise each outer round TypeErrors and retries forever under indefinite budgets).
 
+**Indefinite UI budget:** one outer campaign with unlimited inner builds/attempts (`orch_outer=1`, `orch_builds=None`). Unlimited outer reset rounds are intentionally avoided — they previously flooded SSE (tens of thousands of crash/reset cycles) and made the sandbox stage disappear from the browser.
+
 | Knob | Env / meaning |
 |------|----------------|
 | `max_steps` | `SANDBOX_ORCH_MAX_STEPS` (`0` = unlimited steps) |

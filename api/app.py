@@ -212,7 +212,10 @@ def _sandbox_retry_plan(sandbox_max_retries: object) -> dict:
     When the budget is unset, mirror the classic env-driven behaviour
     (multiple outer rounds × per-round caps). When the user supplies a
     finite N, collapse to a single round with N builds/attempts. When
-    indefinite, outer rounds and per-round caps are both unlimited.
+    indefinite, use **one** outer campaign with an unlimited per-round
+    build/attempt budget — unlimited *outer* rounds previously caused an
+    endless reset/crash loop that flooded SSE and made the sandbox stage
+    vanish from the UI.
     """
     if sandbox_max_retries is _SANDBOX_RETRIES_UNSET:
         return {
@@ -233,9 +236,10 @@ def _sandbox_retry_plan(sandbox_max_retries: object) -> dict:
         return {
             "mode": "indefinite",
             "label": "indefinite (until build succeeds)",
-            "orch_outer": None,
+            # One continuous campaign; unlimited builds/attempts inside.
+            "orch_outer": 1,
             "orch_builds": None,
-            "agentic_outer": None,
+            "agentic_outer": 1,
             "agentic_attempts": None,
             "legacy_max": None,
         }
@@ -2328,6 +2332,8 @@ def _sandbox_build_iterate(
         success_via_agentic = False
         agentic_outer = retry_plan["agentic_outer"]
         agentic_attempts = retry_plan["agentic_attempts"]
+        identical_crash_streak = 0
+        last_crash_reason = ""
 
         outer_round = 0
         while True:
@@ -2533,8 +2539,8 @@ def _sandbox_build_iterate(
                     "builds": attempts_state["n"],
                 }
 
-            agentic_total_steps += int(round_done_event.get("steps", 0))
-            agentic_total_builds += int(round_done_event.get("builds", 0))
+            agentic_total_steps += int(round_done_event.get("steps") or 0)
+            agentic_total_builds += int(round_done_event.get("builds") or 0)
             build_log_lines.append(
                 f"\n>>> Round {outer_round} ended: "
                 f"{round_done_event['reason']}\n"
@@ -2551,6 +2557,28 @@ def _sandbox_build_iterate(
             if round_done_event.get("success"):
                 success_via_agentic = True
                 break
+
+            reason = str(round_done_event.get("reason") or "")
+            if reason.startswith("crash:"):
+                if reason == last_crash_reason:
+                    identical_crash_streak += 1
+                else:
+                    identical_crash_streak = 1
+                    last_crash_reason = reason
+                if identical_crash_streak >= 3:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "sandbox_build",
+                        "message": (
+                            "Stopping sandbox build after repeated identical "
+                            f"agentic crashes ({identical_crash_streak}×): "
+                            f"{reason}"
+                        ),
+                    })
+                    break
+            else:
+                identical_crash_streak = 0
+                last_crash_reason = ""
 
             # Round failed: reset to initial snapshot before next round.
             if agentic_outer is None or outer_round < agentic_outer:
@@ -2692,6 +2720,10 @@ def _sandbox_build_iterate(
         orch_total_builds = 0
         orch_outer = retry_plan["orch_outer"]
         orch_builds = retry_plan["orch_builds"]
+        # Identical orchestrator crashes must not spin forever (UI/SSE flood),
+        # even if a caller still passes an unlimited outer-round budget.
+        identical_crash_streak = 0
+        last_crash_reason = ""
 
         outer_round = 0
         while True:
@@ -2875,12 +2907,16 @@ def _sandbox_build_iterate(
                     "type": "done",
                     "success": False,
                     "reason": "round ended without explicit done event",
-                    "steps": SANDBOX_ORCH_MAX_STEPS,
+                    "steps": (
+                        SANDBOX_ORCH_MAX_STEPS
+                        if SANDBOX_ORCH_MAX_STEPS is not None
+                        else 0
+                    ),
                     "builds": attempts_state["n"],
                 }
 
-            orch_total_steps += int(round_done_event.get("steps", 0))
-            orch_total_builds += int(round_done_event.get("builds", 0))
+            orch_total_steps += int(round_done_event.get("steps") or 0)
+            orch_total_builds += int(round_done_event.get("builds") or 0)
             build_log_lines.append(
                 f"\n>>> Round {outer_round} ended: "
                 f"{round_done_event['reason']}\n"
@@ -2897,6 +2933,28 @@ def _sandbox_build_iterate(
             if round_done_event.get("success"):
                 success_via_orchestrator = True
                 break
+
+            reason = str(round_done_event.get("reason") or "")
+            if reason.startswith("crash:"):
+                if reason == last_crash_reason:
+                    identical_crash_streak += 1
+                else:
+                    identical_crash_streak = 1
+                    last_crash_reason = reason
+                if identical_crash_streak >= 3:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "sandbox_build",
+                        "message": (
+                            "Stopping sandbox build after repeated identical "
+                            f"orchestrator crashes ({identical_crash_streak}×): "
+                            f"{reason}"
+                        ),
+                    })
+                    break
+            else:
+                identical_crash_streak = 0
+                last_crash_reason = ""
 
             # --- Round failed: reset and let next round try fresh -----------
             if orch_outer is None or outer_round < orch_outer:
@@ -3008,12 +3066,44 @@ def _sandbox_build_iterate(
     # Legacy per-file fix loop (set SANDBOX_USE_ORCHESTRATOR=0 to use it)
     # ---------------------------------------------------------------------
     iteration = 0
+    legacy_max = retry_plan["legacy_max"]
     while True:
         iteration += 1
+        if legacy_max is not None and iteration > legacy_max:
+            build_log_lines.append(
+                f"\n>>> BUILD RETRY BUDGET EXHAUSTED after {legacy_max} "
+                "attempt(s)\n"
+            )
+            yield _sse({
+                "type": "info",
+                "stage": "sandbox_build",
+                "message": (
+                    f"Sandbox retry budget exhausted after {legacy_max} "
+                    "attempt(s) — packaging best-effort repository."
+                ),
+            })
+            _package_sandbox_zip(session_dir, sandbox_dir)
+            build_log_path = session_dir / "sandbox_build_log.txt"
+            build_log_path.write_text("\n".join(build_log_lines) + "\n")
+            yield _sse({
+                "type": "sandbox_build_result",
+                "stage": "sandbox_build",
+                "success": False,
+                "iterations": legacy_max,
+                "message": (
+                    f"Sandbox build did not succeed within {legacy_max} "
+                    "reiteration(s); best-effort repository packaged."
+                ),
+            })
+            return
         yield _sse({
             "type": "info",
             "stage": "sandbox_build",
-            "message": f"Build attempt {iteration}…",
+            "message": (
+                f"Build attempt {iteration}"
+                + (f"/{legacy_max}" if legacy_max is not None else "")
+                + "…"
+            ),
         })
 
         build_log_lines.append("-" * 65)

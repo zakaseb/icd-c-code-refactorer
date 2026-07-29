@@ -71,8 +71,12 @@ check("env orch_builds from constant", plan_env["orch_builds"] == appmod.SANDBOX
 
 plan_inf = appmod._sandbox_retry_plan(None)
 check("indefinite mode", plan_inf["mode"] == "indefinite")
-check("indefinite orch_outer None", plan_inf["orch_outer"] is None)
-check("indefinite orch_builds None", plan_inf["orch_builds"] is None)
+check(
+    "indefinite orch_outer is 1 (single campaign)",
+    plan_inf["orch_outer"] == 1,
+)
+check("indefinite orch_builds None (unlimited builds)", plan_inf["orch_builds"] is None)
+check("indefinite agentic_outer is 1", plan_inf["agentic_outer"] == 1)
 check("indefinite agentic_attempts None", plan_inf["agentic_attempts"] is None)
 check("indefinite legacy_max None", plan_inf["legacy_max"] is None)
 
