@@ -21,6 +21,8 @@ This is separate from the **mission** orchestrator (`MissionController` in `api/
 
 ReAct tool loop. Tools: `read_file`, `list_dir`, `search`, `find_files`, `patch`, `write_file`, `reset_file`, `build`, `note`, `done`.
 
+`parse_action` accepts the canonical `<action>{"tool","args"}</action>` form and common local-LLM variants (Claude-style `<tool_call>/<function=...>`, bare tool JSON, `tool_name` + args JSON, function-call style). Absolute sandbox paths in args are coerced to sandbox-relative paths.
+
 Accepts optional `gitnexus_report` (from the mission/classic GitNexus stage) and injects it into `build_brief` so patch decisions honor ISR/task wiring and related embedded relationships. `_sandbox_build_iterate` always forwards this kwarg — both `run_orchestrator` and `run_agentic_debug` must accept it (otherwise each outer round TypeErrors and retries forever under indefinite budgets).
 
 **Indefinite UI budget:** one outer campaign with unlimited inner builds/attempts (`orch_outer=1`, `orch_builds=None`). Unlimited outer reset rounds are intentionally avoided — they previously flooded SSE (tens of thousands of crash/reset cycles) and made the sandbox stage disappear from the browser.

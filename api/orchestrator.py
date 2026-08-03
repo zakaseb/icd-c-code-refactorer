@@ -201,6 +201,8 @@ OUTPUT RULES
 - The JSON inside <action> MUST be valid; no comments, no trailing commas.
 - Do NOT wrap the action in markdown fences.
 - Do NOT output anything after the closing </action> tag.
+- Do NOT use Claude/Anthropic XML tool formats such as <tool_call>,
+  <function=...>, or invoke/tool_use blocks. Only <action> JSON is accepted.
 """
 
 
@@ -209,40 +211,375 @@ OUTPUT RULES
 # ---------------------------------------------------------------------------
 
 _ACTION_RE = re.compile(r"<action>\s*(.*?)\s*</action>", re.DOTALL | re.IGNORECASE)
+_ACTION_OPEN_RE = re.compile(r"<action\s*>", re.IGNORECASE)
 _THINK_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IGNORECASE)
+# Claude Agent SDK / Anthropic-style tool calls that local models often emit.
+_TOOL_CALL_FN_RE = re.compile(
+    r"<tool_call>\s*<function\s*=\s*([A-Za-z_][\w]*)\s*>\s*(.*?)\s*</function>",
+    re.DOTALL | re.IGNORECASE,
+)
+_FUNCTION_ONLY_RE = re.compile(
+    r"<function\s*=\s*([A-Za-z_][\w]*)\s*>\s*(.*?)\s*</function>",
+    re.DOTALL | re.IGNORECASE,
+)
+# <tool_call>\nsearch\n{args}\n</search>\n</tool_call>
+# or <tool_call>\nfunction=search\n{args}\n</function>
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+_TOOL_CALL_INNER_RE = re.compile(
+    r"(?:<function\s*=\s*|<function\s+|function\s*=\s*)?"
+    r"([A-Za-z_][\w]*)\s*(?:>)?"
+    r"\s*(\{[\s\S]*?\})\s*"
+    r"(?:</\1>|</function>)?",
+    re.IGNORECASE,
+)
+# Bare: tool_name\n{...args...}  (often with a stray </action> after)
+_BARE_TOOL_ARGS_RE = re.compile(
+    r"(?:</think>\s*)?([A-Za-z_][\w]*)\s*[\r\n]+\s*(\{[\s\S]*?\})\s*(?:</action>)?\s*$",
+    re.IGNORECASE,
+)
+# search("pat", "path", max_hits=10, ext="h")
+_FN_CALL_RE = re.compile(
+    r"\b([A-Za-z_][\w]*)\s*\((.*)\)\s*(?:</action>)?\s*$",
+    re.DOTALL,
+)
+# Declared early so parse_action can whitelist bare/fn-call forms without
+# depending on TOOL_REGISTRY (defined later with the tool implementations).
+_KNOWN_TOOL_NAMES = frozenset({
+    "read_file", "list_dir", "search", "find_files", "patch",
+    "write_file", "reset_file", "build", "note", "done",
+})
+
+
+def _extract_thought(text: str) -> str:
+    tm = _THINK_RE.search(text)
+    return tm.group(1).strip() if tm else ""
+
+
+def _loads_json_lenient(body: str) -> dict | None:
+    """Parse a JSON object, tolerating fences / trailing junk."""
+    body = (body or "").strip()
+    if not body:
+        return None
+    body = body.strip("`").strip()
+    if body.lower().startswith("json"):
+        body = body[4:].strip()
+    # Prefer the outermost object when fences/prose wrap it.
+    start = body.find("{")
+    if start < 0:
+        return None
+    body = body[start:]
+    try:
+        data = json.loads(body)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # Brace-balance scan for the first object.
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(body):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    data = json.loads(body[: i + 1])
+                    return data if isinstance(data, dict) else None
+                except json.JSONDecodeError:
+                    return None
+    # Last-ditch: trim after final }
+    end = body.rfind("}")
+    if end > 0:
+        try:
+            data = json.loads(body[: end + 1])
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _action_from_tool_args(
+    tool: str, args: dict | None, *, raw: str, thought: str = "",
+) -> Action | None:
+    tool = (tool or "").strip()
+    if not tool:
+        return None
+    # Allow unknown tools through — dispatch reports the error with the roster.
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return None
+    return Action(tool=tool, args=args, raw=raw, thought=thought)
+
+
+def _action_from_tool_json(data: dict, *, raw: str, thought: str = "") -> Action | None:
+    tool = data.get("tool") or data.get("name")
+    args = data.get("args") if "args" in data else data.get("arguments")
+    if args is None and isinstance(tool, str):
+        # {"tool":"build"} or args flattened onto the object
+        args = {
+            k: v for k, v in data.items()
+            if k not in ("tool", "name", "args", "arguments")
+        }
+    if args is None:
+        args = {}
+    if not isinstance(tool, str) or not isinstance(args, dict):
+        return None
+    return Action(tool=tool, args=args, raw=raw, thought=thought)
+
+
+def _parse_fn_call_args(arg_src: str) -> dict | None:
+    """Parse ``"a", "b", max_hits=10, ext="h"`` into a dict of args."""
+    arg_src = (arg_src or "").strip()
+    if not arg_src:
+        return {}
+    # search(pattern, path?, kwargs...)
+    parts: list[str] = []
+    buf: list[str] = []
+    in_str = False
+    quote = ""
+    esc = False
+    for ch in arg_src:
+        if in_str:
+            buf.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote:
+                in_str = False
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == ",":
+            parts.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf).strip())
+
+    args: dict = {}
+    positionals = ("pattern", "path")
+    pos_i = 0
+    for part in parts:
+        if not part:
+            continue
+        if "=" in part and not part.startswith(("'", '"')):
+            key, _, val = part.partition("=")
+            key = key.strip()
+            val = val.strip()
+            try:
+                args[key] = json.loads(val)
+            except json.JSONDecodeError:
+                args[key] = val.strip("'\"")
+            continue
+        try:
+            val = json.loads(part)
+        except json.JSONDecodeError:
+            val = part.strip("'\"")
+        if pos_i < len(positionals):
+            args[positionals[pos_i]] = val
+            pos_i += 1
+        else:
+            return None
+    return args
 
 
 def parse_action(text: str) -> Action | None:
-    """Pull the first <action>{...}</action> JSON object out of *text*."""
+    """Extract a tool action from model output.
+
+    Accepts the canonical ``<action>{"tool","args"}</action>`` form and the
+    common local-LLM variants seen in practice:
+
+    * Claude-style ``<tool_call><function=NAME>{args}</function>``
+    * Bare ``{"tool":"...","args":{...}}``
+    * ``tool_name`` + args JSON (optionally wrapped with ``</action>``)
+    * ``tool_name("...", kw=...)`` function-call style
+    * Unclosed ``<action>`` blocks (truncated generations)
+    """
+    if not text or not str(text).strip():
+        return None
+    thought = _extract_thought(text)
+
+    # 1) Canonical <action> ... </action>
     m = _ACTION_RE.search(text)
-    if not m:
-        return None
-    body = m.group(1).strip()
-    body = body.strip("`")
-    if body.startswith("json"):
-        body = body[4:].strip()
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        # Try to repair common mistakes: stray trailing text after the
-        # JSON object, or stray markdown fences.
-        end = body.rfind("}")
-        if end > 0:
-            try:
-                data = json.loads(body[:end + 1])
-            except json.JSONDecodeError:
-                return None
+    if m:
+        body = m.group(1).strip()
+        data = _loads_json_lenient(body)
+        if data is not None:
+            act = _action_from_tool_json(data, raw=body, thought=thought)
+            if act:
+                return act
+        # <action> TOOL \n {args} </action>
+        bare = _BARE_TOOL_ARGS_RE.search(body) or _BARE_TOOL_ARGS_RE.search(
+            body + "\n"
+        )
+        # Also: first word + JSON object inside the action body
+        wm = re.match(
+            r"([A-Za-z_][\w]*)\s*(\{[\s\S]*\})\s*$", body.strip(),
+        )
+        if wm:
+            args = _loads_json_lenient(wm.group(2))
+            act = _action_from_tool_args(
+                wm.group(1), args, raw=body, thought=thought,
+            )
+            if act:
+                return act
+
+    # 2) Unclosed <action> { ... }
+    open_m = _ACTION_OPEN_RE.search(text)
+    if open_m and not m:
+        tail = text[open_m.end():]
+        data = _loads_json_lenient(tail)
+        if data is not None:
+            act = _action_from_tool_json(data, raw=tail.strip()[:2000], thought=thought)
+            if act:
+                return act
+
+    # 3) Claude / Anthropic tool_call variants
+    for rx in (_TOOL_CALL_FN_RE, _FUNCTION_ONLY_RE):
+        fm = rx.search(text)
+        if not fm:
+            continue
+        tool = fm.group(1)
+        args = _loads_json_lenient(fm.group(2))
+        if args is None:
+            args = {}
+        if "tool" in args and ("args" in args or "arguments" in args):
+            act = _action_from_tool_json(args, raw=fm.group(0), thought=thought)
+            if act:
+                return act
+        act = _action_from_tool_args(
+            tool, args, raw=fm.group(0), thought=thought,
+        )
+        if act:
+            return act
+
+    # <tool_call>\nsearch\n{args}\n</search>  /  function=search\n{args}
+    for bm in _TOOL_CALL_BLOCK_RE.finditer(text):
+        inner = bm.group(1).strip()
+        im = _TOOL_CALL_INNER_RE.search(inner)
+        if not im:
+            # Fallback: first known tool name + following JSON object
+            wm = re.search(
+                r"\b(" + "|".join(sorted(_KNOWN_TOOL_NAMES, key=len, reverse=True))
+                + r")\b\s*(\{[\s\S]*\})",
+                inner,
+                re.IGNORECASE,
+            )
+            if not wm:
+                continue
+            tool, args_body = wm.group(1), wm.group(2)
         else:
-            return None
-    tool = data.get("tool") or data.get("name")
-    args = data.get("args") or data.get("arguments") or {}
-    if not isinstance(tool, str) or not isinstance(args, dict):
-        return None
-    thought = ""
-    tm = _THINK_RE.search(text)
-    if tm:
-        thought = tm.group(1).strip()
-    return Action(tool=tool, args=args, raw=body, thought=thought)
+            tool, args_body = im.group(1), im.group(2)
+        if tool not in _KNOWN_TOOL_NAMES:
+            continue
+        args = _loads_json_lenient(args_body) or {}
+        if "tool" in args and ("args" in args or "arguments" in args):
+            act = _action_from_tool_json(args, raw=bm.group(0), thought=thought)
+            if act:
+                return act
+        act = _action_from_tool_args(
+            tool, args, raw=bm.group(0), thought=thought,
+        )
+        if act:
+            return act
+
+    # 4) Bare {"tool": "...", "args": {...}} anywhere
+    data = _loads_json_lenient(text)
+    if data is not None and ("tool" in data or "name" in data):
+        act = _action_from_tool_json(data, raw=text.strip()[:2000], thought=thought)
+        if act:
+            return act
+    # More than one object in the text — scan for a tool JSON object.
+    for jm in re.finditer(r"\{", text):
+        data = _loads_json_lenient(text[jm.start():])
+        if data is not None and ("tool" in data or "name" in data):
+            act = _action_from_tool_json(
+                data, raw=text[jm.start(): jm.start() + 2000], thought=thought,
+            )
+            if act:
+                return act
+    # Truncated / missing opening brace:  "tool": "build", "args": {}
+    tm = re.search(
+        r'["\']?(?:tool|name)["\']?\s*:\s*["\']([A-Za-z_][\w]*)["\']',
+        text,
+    )
+    if tm and tm.group(1) in _KNOWN_TOOL_NAMES:
+        # Rebuild a minimal JSON object from the fragment onward.
+        frag = text[tm.start():]
+        # Prefer wrapping from the tool key; add braces if needed.
+        candidate = frag if frag.lstrip().startswith("{") else "{" + frag
+        # Truncate at </action> / </tool_call> if present.
+        for stopper in ("</action>", "</tool_call>", "</function>"):
+            idx = candidate.lower().find(stopper)
+            if idx > 0:
+                candidate = candidate[:idx]
+        candidate = candidate.rstrip().rstrip(",")
+        if not candidate.rstrip().endswith("}"):
+            # Close open braces.
+            opens = candidate.count("{") - candidate.count("}")
+            candidate = candidate + ("}" * max(0, opens))
+        data = _loads_json_lenient(candidate)
+        if data is not None:
+            act = _action_from_tool_json(data, raw=candidate[:2000], thought=thought)
+            if act:
+                return act
+        # Minimal fallback when only the tool name is present.
+        if tm.group(1) in ("build", "done") and "args" not in frag[:80]:
+            act = _action_from_tool_args(
+                tm.group(1), {}, raw=tm.group(0), thought=thought,
+            )
+            if act:
+                return act
+
+    # 5) tool_name\n{args}  (after </think> or alone)
+    bm = _BARE_TOOL_ARGS_RE.search(text.strip())
+    if bm and bm.group(1) in _KNOWN_TOOL_NAMES:
+        args = _loads_json_lenient(bm.group(2))
+        act = _action_from_tool_args(
+            bm.group(1), args, raw=bm.group(0), thought=thought,
+        )
+        if act:
+            return act
+
+    # 6) tool_name("positional", kw=...)
+    # Restrict to known tools so prose like `search for "wind.h"` is ignored.
+    for fm in _FN_CALL_RE.finditer(text.strip()):
+        tool = fm.group(1)
+        if tool not in _KNOWN_TOOL_NAMES:
+            continue
+        arg_src = fm.group(2).strip()
+        if not arg_src and tool not in ("build", "done"):
+            continue
+        args = _parse_fn_call_args(arg_src)
+        if args is None:
+            continue
+        act = _action_from_tool_args(
+            tool, args, raw=fm.group(0), thought=thought,
+        )
+        if act:
+            return act
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -263,11 +600,30 @@ def _normalise_rel(rel: str) -> str:
     return rel
 
 
+def _coerce_rel_path(sandbox_dir: Path, rel: str) -> str:
+    """Turn abs sandbox paths the LLM often emits into sandbox-relative paths."""
+    rel = _normalise_rel(str(rel or ""))
+    if not rel:
+        return ""
+    sb = str(sandbox_dir.resolve()).replace("\\", "/").lstrip("/")
+    if rel == sb:
+        return ""
+    if rel.startswith(sb + "/"):
+        return rel[len(sb) + 1:]
+    # Session layouts: .../sandbox/<repo-rel>
+    marker = "/sandbox/"
+    if marker in ("/" + rel):
+        return ("/" + rel).split(marker, 1)[1]
+    if rel.startswith("sandbox/"):
+        return rel[len("sandbox/"):]
+    return rel
+
+
 def _safe_resolve(sandbox_dir: Path, rel: str) -> Path:
     """Resolve *rel* against *sandbox_dir* refusing escape attempts."""
     if not rel:
         raise ValueError("path is required")
-    rel = _normalise_rel(rel)
+    rel = _coerce_rel_path(sandbox_dir, rel)
     p = (sandbox_dir / rel).resolve()
     sb = sandbox_dir.resolve()
     try:
@@ -898,7 +1254,11 @@ def run_orchestrator(
             obs = Observation(
                 text=(
                     "no parsable <action> JSON detected in response. "
-                    "Try again. Output exactly ONE <action> block with valid JSON."
+                    "Do NOT use <tool_call> / <function=...> XML. "
+                    "Output exactly ONE block like:\n"
+                    "<action>\n"
+                    '{"tool": "search", "args": {"pattern": "wind\\\\.h"}}\n'
+                    "</action>"
                 ),
                 error=True,
             )
