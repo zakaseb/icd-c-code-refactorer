@@ -1,6 +1,6 @@
 {
-  "updatedAt": "2026-08-04T10:10:00.000Z",
+  "updatedAt": "2026-08-04T11:20:00.000Z",
   "command": "update",
   "branch": "fix/docker-build-openwiki",
-  "notes": "Based on main + docs/openwiki-project-documentation. Docker uses /opt/venv + PATH (PEP 668); hf_download fails fast and reuses mounted model cache. No agentic multi-agent pipeline product code."
+  "notes": "SANDBOX_USE_AGENTIC defaults to 1 (agentic debug loop for sandbox stage); set 0 for ReAct orchestrator. Docker image ENV matches."
 }

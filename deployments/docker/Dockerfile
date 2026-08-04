@@ -96,6 +96,10 @@ ENV ANTHROPIC_MODEL="openai/$HF_MODEL"
 ENV ANTHROPIC_SMALL_FAST_MODEL="openai/$HF_MODEL"
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
+# Sandbox build/debug: agentic state-machine loop by default (api/agentic_debug.py).
+# Set SANDBOX_USE_AGENTIC=0 to use the ReAct orchestrator instead.
+ENV SANDBOX_USE_AGENTIC=1
+
 COPY --chown=developer:developer deployments/docker/entrypoint.sh /home/developer/entrypoint.sh
 COPY --chown=developer:developer src/utils/hf_download.py /home/developer/hf_download.py
 COPY --chown=developer:developer api /home/developer/webapp

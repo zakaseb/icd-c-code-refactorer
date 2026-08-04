@@ -45,7 +45,7 @@ UI: http://localhost:8081 — llama-server `:24000`, LiteLLM `:4000` inside the 
 - Confirm the UI is sending `?sandbox_retries=N` (network tab).
 - Session `status.json` should show `sandbox_retries_mode` / `sandbox_max_retries`.
 - Finite mode must hard-stop after budget exhaustion (see `tests/development/test_orchestrator_build_budget.py`).
-- If `SANDBOX_USE_AGENTIC=1`, agentic caps apply instead of orchestrator knobs.
+- Agentic debug is the default (`SANDBOX_USE_AGENTIC=1`); agentic caps apply. Set `SANDBOX_USE_AGENTIC=0` for the ReAct orchestrator.
 
 ## llama-server HTTP 400 / context overflow
 

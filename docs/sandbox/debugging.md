@@ -13,9 +13,11 @@ After verification and the per-file compile gate, the pipeline tries to produce 
 Order of precedence in `api/app.py`:
 
 1. If `REMOTE_BUILD_ENABLED=1` → `_remote_build_iterate` (SSH/remote script path).
-2. Else if `SANDBOX_USE_AGENTIC=1` → `run_agentic_debug` (**wins over orchestrator**).
-3. Else if `SANDBOX_USE_ORCHESTRATOR=1` (default) → `run_orchestrator`.
+2. Else if `SANDBOX_USE_AGENTIC=1` (**default**) → `run_agentic_debug` (**wins over orchestrator**).
+3. Else if `SANDBOX_USE_ORCHESTRATOR=1` → `run_orchestrator`.
 4. Else → legacy per-file rewrite loop in `app.py`.
+
+Set `SANDBOX_USE_AGENTIC=0` to fall back to the ReAct orchestrator.
 
 ## Orchestrator (`api/orchestrator.py`)
 

@@ -30,7 +30,7 @@ tags: [configuration, env]
 | `SANDBOX_ORCH_MAX_STEPS` | `0` (unlimited) | Orchestrator step cap |
 | `SANDBOX_ORCH_MAX_BUILDS` | `25` | Build budget when UI omits retries |
 | `SANDBOX_ORCH_OUTER_ROUNDS` | `4` | Env-mode outer rounds |
-| `SANDBOX_USE_AGENTIC` | `0` | Prefer agentic debug pipeline |
+| `SANDBOX_USE_AGENTIC` | `1` | Prefer agentic debug pipeline (`0` → ReAct orchestrator) |
 | `SANDBOX_AGENTIC_MAX_ATTEMPTS` | `120` | Agentic attempt cap |
 | `SANDBOX_AGENTIC_NO_PROGRESS` | `3` | Stop on stalled progress |
 | `SANDBOX_AGENTIC_OSCILLATION` | `2` | Oscillation detector |
