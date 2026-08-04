@@ -1,11 +1,19 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
-cd $HOME
+cd "$HOME"
 
-source /opt/venv/bin/activate
-python3 hf_download.py
+# Prefer the image venv (PATH also set in Dockerfile). Explicit binary avoids
+# accidentally using system python3 without huggingface_hub (PEP 668).
+if [ -x /opt/venv/bin/python ]; then
+  # shellcheck disable=SC1091
+  source /opt/venv/bin/activate
+  /opt/venv/bin/python hf_download.py
+else
+  echo "ERROR: /opt/venv/bin/python missing — image was not built with the app venv." >&2
+  exit 1
+fi
 
 # Runtime CUDA probe: detect whether GPU offload is actually available.
 # The host-side preflight can pass while CUDA init still fails inside
@@ -32,7 +40,7 @@ tmux send-keys -t llama-server "cd /app; ./llama-server --prio 0 --n-gpu-layers 
 tmux split-window -h -t llama-server
 tmux send-keys -t llama-server 'source /opt/venv/bin/activate && litellm --model $ANTHROPIC_MODEL --temperature $LLAMA_SAMPLING_TEMPERATURE --drop_params' C-m
 tmux split-window -v -t llama-server
-tmux send-keys -t llama-server 'source /opt/venv/bin/activate && cd /home/developer/webapp && python3 -m uvicorn app:app --host 0.0.0.0 --port 8081 --app-dir /home/developer/webapp' C-m
+tmux send-keys -t llama-server 'source /opt/venv/bin/activate && cd /home/developer/webapp && python -m uvicorn app:app --host 0.0.0.0 --port 8081 --app-dir /home/developer/webapp' C-m
 tmux select-layout tiled
 echo 'Loading model (waiting for llama-server health)...'
 READY=0

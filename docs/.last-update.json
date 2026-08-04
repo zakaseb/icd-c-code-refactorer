@@ -1,0 +1,6 @@
+{
+  "updatedAt": "2026-08-04T11:20:00.000Z",
+  "command": "update",
+  "branch": "fix/docker-build-openwiki",
+  "notes": "SANDBOX_USE_AGENTIC defaults to 1 (agentic debug loop for sandbox stage); set 0 for ReAct orchestrator. Docker image ENV matches."
+}

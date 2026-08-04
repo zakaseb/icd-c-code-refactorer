@@ -109,9 +109,10 @@ SANDBOX_ORCH_OUTER_ROUNDS = int(
     os.environ.get("SANDBOX_ORCH_OUTER_ROUNDS", "4")
 )
 # Agentic-AI debug pipeline (state-machine, single-hypothesis-per-iteration).
-# When enabled it takes precedence over SANDBOX_USE_ORCHESTRATOR.
+# Default ON: takes precedence over SANDBOX_USE_ORCHESTRATOR. Set
+# SANDBOX_USE_AGENTIC=0 to restore the ReAct orchestrator path.
 SANDBOX_USE_AGENTIC = os.environ.get(
-    "SANDBOX_USE_AGENTIC", "0"
+    "SANDBOX_USE_AGENTIC", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
 SANDBOX_AGENTIC_MAX_ATTEMPTS = int(
     os.environ.get("SANDBOX_AGENTIC_MAX_ATTEMPTS", "120")
@@ -2429,8 +2430,8 @@ def _sandbox_build_iterate(
     # Treats debugging as a search problem over constrained edits:
     #   BUILD → TRIAGE → ROOT_CAUSE → PLAN → PATCH → VERIFY → DECIDE
     # with snapshots+rollback, per-attempt artifacts, and a memory store.
-    # Enabled by SANDBOX_USE_AGENTIC=1; takes precedence over the
-    # ReAct-style orchestrator.
+    # Default ON (SANDBOX_USE_AGENTIC=1); takes precedence over the
+    # ReAct-style orchestrator. Set SANDBOX_USE_AGENTIC=0 to opt out.
     # ---------------------------------------------------------------------
     if SANDBOX_USE_AGENTIC:
         gen_files_brief: dict[str, str] = {}

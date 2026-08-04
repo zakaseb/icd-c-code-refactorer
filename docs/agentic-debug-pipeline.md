@@ -1,3 +1,9 @@
+---
+type: "Reference"
+title: "Agentic Debug Pipeline"
+openwiki_generated: true
+---
+
 # Agentic Debug Pipeline
 
 A plain-English walkthrough of the build-debug-repair loop introduced on
@@ -288,27 +294,24 @@ The old loop's failure modes, and how this fixes them:
 
 ## How to run it
 
-The new pipeline is **off by default** so prior behaviour (the
-ReAct-style orchestrator on `feature/orchestrator-debug-agent`) is
-preserved bit-for-bit. To turn it on:
+The agentic debug pipeline is **on by default** for the sandbox stage
+(`SANDBOX_USE_AGENTIC=1` in `api/app.py` and the Docker image). It takes
+precedence over the ReAct orchestrator. To restore the orchestrator:
 
 ```bash
-SANDBOX_USE_AGENTIC=1 ./scripts/serve_web.sh
+SANDBOX_USE_AGENTIC=0 ./scripts/serve_web.sh
 ```
 
 Tunables (all optional, defaults shown):
 
 | Variable                            | Default | Meaning                                                          |
 | ----------------------------------- | ------- | ---------------------------------------------------------------- |
-| `SANDBOX_USE_AGENTIC`               | `0`     | Master switch — when on, takes precedence over the orchestrator  |
-| `SANDBOX_AGENTIC_MAX_ATTEMPTS`      | `30`    | Max hypothesis attempts per round                                |
+| `SANDBOX_USE_AGENTIC`               | `1`     | Master switch — when on, takes precedence over the orchestrator  |
+| `SANDBOX_AGENTIC_MAX_ATTEMPTS`      | `120`   | Max hypothesis attempts per round                                |
 | `SANDBOX_AGENTIC_NO_PROGRESS`       | `3`     | Stop after N iterations without error reduction                  |
 | `SANDBOX_AGENTIC_OSCILLATION`       | `2`     | Escalate layer when fingerprint repeats                          |
 | `SANDBOX_AGENTIC_EDIT_BUDGET`       | `60`    | Max distinct files modified across the run                       |
 | `SANDBOX_AGENTIC_OUTER_ROUNDS`      | `2`     | Full-reset rounds before giving up                               |
-
-When the flag is unset, the existing default
-(`SANDBOX_USE_ORCHESTRATOR=1`, the ReAct-style agent) remains active.
 
 ---
 
@@ -330,8 +333,9 @@ The module ships with focused unit + smoke tests covering:
    state machine produces all six per-attempt artifacts and writes a
    playbook entry on success.
 
-All eight tests pass cleanly. With `SANDBOX_USE_AGENTIC=0` the rest of
-the pipeline is bit-for-bit identical to the parent branch.
+All eight tests pass cleanly. With `SANDBOX_USE_AGENTIC=0` the sandbox
+stage falls back to the ReAct orchestrator; the rest of the pipeline is
+unchanged.
 
 ---
 
