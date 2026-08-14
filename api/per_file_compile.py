@@ -610,6 +610,7 @@ def run_per_file_compile(
     """
     # Lazy imports — avoid circular dependency with api/app.py.
     from app import (
+        _read_text_safe,
         SANDBOX_CC_NATIVE,
         MAX_REPO_CONTEXT_CHARS,
         MAX_INPUT_TOKENS,
@@ -875,10 +876,10 @@ def run_per_file_compile(
     # ---- 4. Snapshot the pre-compile-gate generated files (for stall reset)
     snapshots: dict[str, str] = {}
     for cs in c_sources:
-        snapshots[cs.name] = cs.read_text()
+        snapshots[cs.name] = _read_text_safe(cs)
     for hp in gen_dir.iterdir():
         if hp.is_file() and hp.suffix.lower() in _HEADER_EXTS:
-            snapshots[hp.name] = hp.read_text()
+            snapshots[hp.name] = _read_text_safe(hp)
 
     # ---- 5. Per-file compile + agentic fix loop ----------------------------
     uploaded_names = {p.name for p in code_dir.iterdir() if p.is_file()} if code_dir.exists() else set()
@@ -968,14 +969,16 @@ def run_per_file_compile(
         orig_repo_match = (code_dir / fname)
         if orig_repo_match.exists():
             try:
-                original_code = orig_repo_match.read_text()
+                # NB: UnicodeDecodeError is a ValueError, not an OSError, so
+                # the enclosing `except OSError` would not catch a cp1252 file.
+                original_code = _read_text_safe(orig_repo_match)
             except OSError:
                 original_code = ""
         elif has_repo and repo_dir and repo_dir.exists():
             for m in repo_dir.rglob(fname):
                 if m.is_file():
                     try:
-                        original_code = m.read_text()
+                        original_code = _read_text_safe(m)
                     except OSError:
                         original_code = ""
                     break
@@ -1095,8 +1098,8 @@ def run_per_file_compile(
                 })
 
             # ---- Agentic fix prompt --------------------------------------
-            pre_fix_c = cs.read_text()
-            pre_fix_h = companion_h.read_text() if companion_h else ""
+            pre_fix_c = _read_text_safe(cs)
+            pre_fix_h = _read_text_safe(companion_h) if companion_h else ""
 
             file_repo_ctx = ""
             if has_repo and repo_dir and repo_dir.exists():
@@ -1368,7 +1371,7 @@ def run_per_file_compile(
                     })
                     continue
                 target_path = gen_dir / target_name
-                prev_text = target_path.read_text() if target_path.exists() else ""
+                prev_text = _read_text_safe(target_path) if target_path.exists() else ""
                 target_path.write_text(new_code)
                 diff = _generate_diff(
                     prev_text, new_code,
@@ -1474,7 +1477,7 @@ def run_per_file_compile(
         if has_repo and repo_dir and repo_dir.exists():
             try:
                 issues = _structural_verify(
-                    cs.read_text(), repo_dir, original_code, fname,
+                    _read_text_safe(cs), repo_dir, original_code, fname,
                 )
                 if issues:
                     log.info(

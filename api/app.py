@@ -84,7 +84,7 @@ MAX_REPO_CONTEXT_CHARS = 15_000
 SOURCE_SCRIPTS_MAX_CHARS = 25_000
 
 CHARS_PER_TOKEN = 3
-CTX_SIZE_TOKENS = int(os.environ.get("LLAMA_ARG_CTX_SIZE", "32768"))
+CTX_SIZE_TOKENS = 49152
 MAX_OUTPUT_TOKENS = 4096
 MAX_INPUT_TOKENS = CTX_SIZE_TOKENS - MAX_OUTPUT_TOKENS
 LLM_PROMPT_SAFETY_TOKENS = int(os.environ.get("LLM_PROMPT_SAFETY_TOKENS", "1024"))
@@ -889,6 +889,39 @@ def _generate_variant_header(
         if _looks_complete_header(clean):
             break
     return clean
+
+
+# Encodings seen in real embedded-C sources. Order matters: utf-8-sig also
+# accepts plain UTF-8 (and strips a BOM if present); cp1252 is the usual source
+# of 0x91-0x97 smart quotes / en-dashes emitted by Windows editors; latin-1
+# never fails, so it is the terminal fallback.
+TEXT_DECODE_CANDIDATES = ("utf-8-sig", "cp1252", "latin-1")
+
+
+def _decode_bytes(data: bytes) -> tuple[str, str]:
+    """Decode source bytes to text, returning ``(text, encoding_used)``.
+
+    Never raises. Embedded C files routinely carry Windows-1252 punctuation in
+    comment banners, and a UnicodeDecodeError raised inside the transform
+    stage kills the SSE generator *without* emitting an ``error`` event, so
+    the stream simply goes silent and the UI appears to hang.
+    """
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return data.decode("utf-16"), "utf-16"
+        except UnicodeDecodeError:
+            pass
+    for enc in TEXT_DECODE_CANDIDATES:
+        try:
+            return data.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace"), "utf-8/replace"
+
+
+def _read_text_safe(path: Path) -> str:
+    """Encoding-tolerant replacement for ``Path.read_text()``."""
+    return _decode_bytes(path.read_bytes())[0]
 
 
 def extract_pdf_text(pdf_path: Path) -> str:
@@ -2261,11 +2294,11 @@ def _sandbox_build_iterate(
     initial_gen_code: dict[str, str] = {}
 
     for gf in gen_files:
-        initial_gen_code[gf.name] = gf.read_text()
+        initial_gen_code[gf.name] = _read_text_safe(gf)
         matches = _find_file_in_repo(sandbox_dir, gf.name)
         if matches:
             replacement_map[gf.name] = matches[0]
-            original_repo_code[gf.name] = matches[0].read_text()
+            original_repo_code[gf.name] = _read_text_safe(matches[0])
             matches[0].write_text(initial_gen_code[gf.name])
             yield _sse({
                 "type": "info",
@@ -3281,12 +3314,12 @@ def _sandbox_build_iterate(
                 hpath = replacement_map.get(fname)
                 if hpath and hpath.exists():
                     current_gen_headers += (
-                        f"### {fname}\n```c\n{hpath.read_text()}\n```\n\n"
+                        f"### {fname}\n```c\n{_read_text_safe(hpath)}\n```\n\n"
                     )
 
         # --- Fix generated files (ICD re-transform with error feedback) -----
         for fname, errors in gen_errors.items():
-            current_code = (gen_dir / fname).read_text()
+            current_code = _read_text_safe(gen_dir / fname)
             orig_code = original_repo_code.get(fname, "")
 
             build_log_lines.append(
@@ -3449,7 +3482,7 @@ def _sandbox_build_iterate(
         # --- Fix non-generated repo files (API adaptation) ------------------
         for fpath, errors in repo_errors.items():
             rel_name = str(fpath.relative_to(sandbox_dir))
-            current_code = fpath.read_text()
+            current_code = _read_text_safe(fpath)
 
             build_log_lines.append(
                 f"\n--- LLM fix (repo): {rel_name} (after attempt {iteration}) ---"
@@ -3990,6 +4023,7 @@ async def upload_code(session_id: str, files: List[UploadFile] = File(...)):
 
     code_dir = session_dir / "original_code"
     uploaded: list[str] = []
+    encodings: dict[str, str] = {}
     for f in files:
         if not f.filename or not (
             f.filename.endswith(".c") or f.filename.endswith(".h")
@@ -3997,14 +4031,25 @@ async def upload_code(session_id: str, files: List[UploadFile] = File(...)):
             continue
         dest = code_dir / f.filename
         content = await f.read()
-        dest.write_bytes(content)
+        # Normalise to UTF-8 at the boundary so every downstream read_text()
+        # in the pipeline is safe, rather than patching ~27 call sites.
+        text, enc = _decode_bytes(content)
+        if enc != "utf-8-sig":
+            log.info("Upload %s: decoded as %s, transcoding to UTF-8",
+                     f.filename, enc)
+        dest.write_text(text, encoding="utf-8")
+        encodings[f.filename] = enc
         uploaded.append(f.filename)
 
     status = json.loads((session_dir / "status.json").read_text())
     status["files"] = sorted(p.name for p in code_dir.iterdir() if p.is_file())
     (session_dir / "status.json").write_text(json.dumps(status))
 
-    return {"uploaded": uploaded, "total_files": len(status["files"])}
+    return {
+        "uploaded": uploaded,
+        "total_files": len(status["files"]),
+        "encodings": encodings,
+    }
 
 
 @app.post("/api/upload/source-icd/{session_id}")
@@ -4185,8 +4230,8 @@ async def process(
 
     code_dir = session_dir / "original_code"
     gen_dir = session_dir / "generated_code"
-    source_icd = (session_dir / "source_icd.txt").read_text()
-    target_icd = (session_dir / "target_icd.txt").read_text()
+    source_icd = _read_text_safe(session_dir / "source_icd.txt")
+    target_icd = _read_text_safe(session_dir / "target_icd.txt")
     code_files = sorted(p for p in code_dir.iterdir() if p.is_file())
 
     repo_dir = session_dir / "repo_contents"
@@ -4263,8 +4308,8 @@ async def process(
             and (session_dir / "icd_analysis.txt").exists()
         )
         if is_resume and "analysis" in completed_stages and analysis_files_ready:
-            change_spec = (session_dir / "change_spec.txt").read_text()
-            target_summary = (session_dir / "target_summary.txt").read_text()
+            change_spec = _read_text_safe(session_dir / "change_spec.txt")
+            target_summary = _read_text_safe(session_dir / "target_summary.txt")
             yield _sse({
                 "type": "stage",
                 "stage": "analysis",
@@ -4821,7 +4866,7 @@ async def process(
         # Gather cross-file context (the uploaded source files)
         all_code_ctx = ""
         for cf in code_files:
-            all_code_ctx += f"\n### File: {cf.name}\n```c\n{cf.read_text()}\n```\n"
+            all_code_ctx += f"\n### File: {cf.name}\n```c\n{_read_text_safe(cf)}\n```\n"
         all_code_ctx = _truncate_text(all_code_ctx, MAX_CODE_CONTEXT_CHARS, "all_code_ctx")
 
         # ---- Step 2: Transform each file ------------------------------
@@ -4855,7 +4900,7 @@ async def process(
                 "message": f"Transforming {fname}\u2026",
             })
 
-            original = code_file.read_text()
+            original = _read_text_safe(code_file)
 
             transform_system = (
                 "You are an expert C programmer specializing in embedded systems "
@@ -4913,13 +4958,13 @@ async def process(
                 f"## Target ICD Consolidated Summary\n\n{target_summary}"
             )
             sec_repo = ""
-            if file_repo_ctx:
-                sec_repo = (
-                    f"## Repository Dependency Context\n"
-                    f"These are the actual headers and modules this file depends on. "
-                    f"Use the exact type names, function signatures, macros, and "
-                    f"naming conventions from these files.\n\n{file_repo_ctx}"
-                )
+            # if file_repo_ctx:
+            #     sec_repo = (
+            #         f"## Repository Dependency Context\n"
+            #         f"These are the actual headers and modules this file depends on. "
+            #         f"Use the exact type names, function signatures, macros, and "
+            #         f"naming conventions from these files.\n\n{file_repo_ctx}"
+            #     )
             sec_knowledge = ""
             # if repo_knowledge:
             #     sec_knowledge = (
@@ -5105,10 +5150,13 @@ async def process(
                         "and ensure braces/comments/preprocessor blocks are closed.\n\n"
                         f"Previous partial output:\n```c\n{clean}\n```"
                     )
+                meta: dict = {}
                 try:
+                    max_tokens=max(MAX_OUTPUT_TOKENS, int(_estimate_tokens(original) * 1.15))
                     for batch in _batched_stream_text(
                         _call_llm_stream(
-                            transform_system, attempt_prompt, max_tokens=4096
+                            transform_system, attempt_prompt,
+                            max_tokens=max_tokens, meta=meta,
                         )
                     ):
                         file_parts.append(batch)
@@ -5133,7 +5181,41 @@ async def process(
                 else:
                     clean = (clean.rstrip() + "\n" + last_chunk.lstrip()).strip()
 
+                # Diagnostic: distinguish "model hit the token limit" from
+                # "model stopped on its own but the gate rejected the output".
+                finish = meta.get("finish_reason")
+                gate_min = max(120, int(len(original.strip()) * 0.35))
+                log.info(
+                    "Transform %s pass %d/%d: finish_reason=%r requested=%d "
+                    "raw=%d chars, fenced=%d chars, accumulated=%d chars "
+                    "(original=%d, gate needs >=%d)",
+                    fname, attempt, max_attempts, finish, max_tokens,
+                    len(last_raw), len(last_chunk), len(clean),
+                    len(original.strip()), gate_min,
+                )
+                if not _looks_complete_c_file(clean, original, fname):
+                    log.warning(
+                        "Transform %s pass %d rejected by _looks_complete_c_file: "
+                        "braces {=%d }=%d | comments /*=%d */=%d | len=%d/%d | "
+                        "last_line=%r",
+                        fname, attempt,
+                        clean.count("{"), clean.count("}"),
+                        clean.count("/*"), clean.count("*/"),
+                        len(clean.strip()), gate_min,
+                        (clean.strip().splitlines() or [""])[-1][:60],
+                    )
+
                 if _looks_complete_c_file(clean, original, fname):
+                    break
+
+                # finish_reason "stop" means the model ended deliberately -- there
+                # is no remainder to continue from, and asking anyway makes it
+                # re-emit content that the concatenation above then duplicates.
+                if finish is not None and finish != "length":
+                    log.warning(
+                        "Transform %s: not retrying as a continuation "
+                        "(finish_reason=%r, not 'length').", fname, finish,
+                    )
                     break
 
             # When the target ICD describes multiple variations of a
@@ -5216,7 +5298,7 @@ async def process(
                 "message": f"Adding ICD documentation comments to {fname}…",
             })
 
-            header_code = gen_path.read_text()
+            header_code = _read_text_safe(gen_path)
 
             doc_prompt = _build_header_documentation_prompt(
                 fname=fname,
@@ -5307,10 +5389,10 @@ async def process(
 
             for gf in gen_files:
                 gfname = gf.name
-                generated_code = gf.read_text()
+                generated_code = _read_text_safe(gf)
                 pre_verify_code = generated_code
                 orig_path = code_dir / gfname
-                original_code = orig_path.read_text() if orig_path.exists() else ""
+                original_code = _read_text_safe(orig_path) if orig_path.exists() else ""
 
                 yield _sse({
                     "type": "info",
@@ -5418,10 +5500,19 @@ async def process(
 
                     try:
                         verify_pieces = []
+                        # Verification re-emits the GENERATED file, so the
+                        # budget must scale with that, not with the flat
+                        # MAX_OUTPUT_TOKENS. A transform-expanded header is
+                        # routinely several times MAX_OUTPUT_TOKENS, and a flat
+                        # cap silently truncates it.
+                        verify_max_tokens = max(
+                            MAX_OUTPUT_TOKENS,
+                            int(_estimate_tokens(generated_code) * 1.15),
+                        )
                         verify_output = _call_llm_complete(
                             verify_system,
                             verify_prompt,
-                            max_tokens=MAX_OUTPUT_TOKENS,
+                            max_tokens=verify_max_tokens,
                             max_passes=4,
                             on_chunk=lambda c: verify_pieces.append(c),
                         )
@@ -5440,8 +5531,39 @@ async def process(
                             ) if verified_code else ["empty verification output"]
                         )
 
-                        if verified_code and _looks_complete_c_file(
-                            verified_code, original_code, gfname
+                        # Guard against a truncated verification pass silently
+                        # replacing a good file. The gate below compares against
+                        # `generated_code` (what verification was actually given),
+                        # not `original_code` -- an expanded header would
+                        # otherwise only need 35% of the ORIGINAL upload, so a
+                        # badly truncated rewrite sails through.
+                        shrink_ratio = (
+                            len(verified_code) / len(generated_code)
+                            if verified_code and generated_code else 0.0
+                        )
+                        shrank_badly = shrink_ratio < 0.9
+                        if shrank_badly:
+                            log.warning(
+                                "Verification of %s returned %d chars vs %d given "
+                                "(%.0f%%) -- refusing to overwrite.",
+                                gfname, len(verified_code), len(generated_code),
+                                shrink_ratio * 100,
+                            )
+                            yield _sse({
+                                "type": "warning",
+                                "stage": "verification",
+                                "file": gfname,
+                                "message": (
+                                    f"{gfname}: verification returned "
+                                    f"{len(verified_code):,} chars vs "
+                                    f"{len(generated_code):,} given "
+                                    f"({shrink_ratio*100:.0f}%). Keeping the "
+                                    f"pre-verification file."
+                                ),
+                            })
+
+                        if verified_code and not shrank_badly and _looks_complete_c_file(
+                            verified_code, generated_code, gfname
                         ) and not verify_issues:
                             gf.write_text(verified_code)
                             verify_diffs[gfname] = _generate_diff(
@@ -5472,7 +5594,7 @@ async def process(
                             fix_output = _call_llm_complete(
                                 verify_system,
                                 fix_prompt,
-                                max_tokens=MAX_OUTPUT_TOKENS,
+                                max_tokens=verify_max_tokens,
                                 max_passes=3,
                             )
                             fixed_code = _extract_fenced(fix_output, "c").strip()
@@ -5482,9 +5604,24 @@ async def process(
                                     original_code, gfname,
                                 ) if fixed_code else ["empty targeted-fix output"]
                             )
-                            if fixed_code and _looks_complete_c_file(
-                                fixed_code, original_code, gfname
-                            ) and not fixed_issues:
+                            fix_ratio = (
+                                len(fixed_code) / len(generated_code)
+                                if fixed_code and generated_code else 0.0
+                            )
+                            if fix_ratio and fix_ratio < 0.9:
+                                log.warning(
+                                    "Targeted fix for %s returned %d chars vs %d "
+                                    "given (%.0f%%) -- refusing to overwrite.",
+                                    gfname, len(fixed_code), len(generated_code),
+                                    fix_ratio * 100,
+                                )
+                            if (
+                                fixed_code and fix_ratio >= 0.9
+                                and _looks_complete_c_file(
+                                    fixed_code, generated_code, gfname
+                                )
+                                and not fixed_issues
+                            ):
                                 gf.write_text(fixed_code)
                                 verify_diffs[gfname] = _generate_diff(
                                     pre_verify_code, fixed_code,
@@ -5579,7 +5716,7 @@ async def process(
             ])
             for gf_r in gen_files:
                 gfn = gf_r.name
-                final_code = gf_r.read_text()
+                final_code = _read_text_safe(gf_r)
                 variables = _extract_c_variables(final_code, gfn)
                 report_lines.append(f"\n### {gfn}\n")
                 report_lines.append(_format_variable_inventory(variables, gfn))
@@ -5836,7 +5973,7 @@ async def preview_file(session_id: str, filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    return {"filename": filename, "content": file_path.read_text()}
+    return {"filename": filename, "content": _read_text_safe(file_path)}
 
 
 @app.delete("/api/session/{session_id}")
@@ -5928,7 +6065,7 @@ async def regenerate(
     if not conversation:
         raise HTTPException(status_code=400, detail="No feedback messages to incorporate")
 
-    change_spec = (session_dir / "change_spec.txt").read_text()
+    change_spec = _read_text_safe(session_dir / "change_spec.txt")
     code_dir = session_dir / "original_code"
     gen_dir = session_dir / "generated_code"
     code_files = sorted(p for p in code_dir.iterdir() if p.is_file())
@@ -5941,9 +6078,9 @@ async def regenerate(
 
     target_summary_path = session_dir / "target_summary.txt"
     target_summary = (
-        target_summary_path.read_text() if target_summary_path.exists()
+        _read_text_safe(target_summary_path) if target_summary_path.exists()
         else _truncate_text(
-            (session_dir / "target_icd.txt").read_text(), 12_000, "target_icd"
+            _read_text_safe(session_dir / "target_icd.txt"), 12_000, "target_icd"
         )
     )
 
@@ -5973,7 +6110,7 @@ async def regenerate(
         # No live repo to re-distill from — best-effort use of the
         # saved full report.  This puts more pressure on the prompt
         # budget but is preferable to losing repo knowledge entirely.
-        repo_knowledge = repo_knowledge_path.read_text()
+        repo_knowledge = _read_text_safe(repo_knowledge_path)
 
     prev_dir = session_dir / f"generated_code_v{regen_count - 1}"
     if not prev_dir.exists():
@@ -6012,17 +6149,17 @@ async def regenerate(
 
         all_code_ctx = ""
         for cf in code_files:
-            all_code_ctx += f"\n### File: {cf.name}\n```c\n{cf.read_text()}\n```\n"
+            all_code_ctx += f"\n### File: {cf.name}\n```c\n{_read_text_safe(cf)}\n```\n"
         all_code_ctx = _truncate_text(all_code_ctx, MAX_CODE_CONTEXT_CHARS, "all_code_ctx")
 
         regen_diffs: dict[str, str] = {}
 
         for i, code_file in enumerate(code_files):
             fname = code_file.name
-            original = code_file.read_text()
+            original = _read_text_safe(code_file)
 
             prev_gen_path = prev_dir / fname
-            prev_generated = prev_gen_path.read_text() if prev_gen_path.exists() else ""
+            prev_generated = _read_text_safe(prev_gen_path) if prev_gen_path.exists() else ""
 
             yield _sse({
                 "type": "stage",
@@ -6184,9 +6321,10 @@ async def regenerate(
                         f"Previous partial output:\n```c\n{clean}\n```"
                     )
                 try:
+                    max_tokens=max(MAX_OUTPUT_TOKENS, int(_estimate_tokens(original) * 1.15))
                     for batch in _batched_stream_text(
                         _call_llm_stream(
-                            transform_system, attempt_prompt, max_tokens=4096,
+                            transform_system, attempt_prompt, max_tokens=max_tokens,
                         )
                     ):
                         file_parts.append(batch)
@@ -6225,7 +6363,7 @@ async def regenerate(
                 if not incomplete:
                     for vname, vcode in sorted(variation_headers.items()):
                         prev_vtext = (
-                            (gen_dir / vname).read_text()
+                            _read_text_safe(gen_dir / vname)
                             if (gen_dir / vname).exists() else ""
                         )
                         (gen_dir / vname).write_text(vcode)
@@ -6296,10 +6434,10 @@ async def regenerate(
 
             for gf in gen_files:
                 gfname = gf.name
-                generated_code = gf.read_text()
+                generated_code = _read_text_safe(gf)
                 pre_verify_code = generated_code
                 orig_path = code_dir / gfname
-                original_code = orig_path.read_text() if orig_path.exists() else ""
+                original_code = _read_text_safe(orig_path) if orig_path.exists() else ""
 
                 yield _sse({
                     "type": "info",
@@ -6563,7 +6701,7 @@ async def regenerate(
             ])
             for gf_r in gen_files:
                 gfn = gf_r.name
-                final_code = gf_r.read_text()
+                final_code = _read_text_safe(gf_r)
                 variables = _extract_c_variables(final_code, gfn)
                 report_lines.append(f"\n### {gfn}\n")
                 report_lines.append(_format_variable_inventory(variables, gfn))

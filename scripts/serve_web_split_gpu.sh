@@ -44,8 +44,8 @@ echo "Starting GPU container ($LLAMA_CONTAINER) for llama-server..."
 docker rm -f "$LLAMA_CONTAINER" >/dev/null 2>&1 || true
 docker run -d --rm --name "$LLAMA_CONTAINER" --network=host --gpus "device=0" \
   -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
-  -e LLAMA_ARG_CTX_SIZE=32768 \
-  -e LLAMA_ARG_N_PREDICT=32768 \
+  -e LLAMA_ARG_CTX_SIZE=49152 \
+  -e LLAMA_ARG_N_PREDICT=49152 \
   -v "$PROJECT_ROOT/models":/home/developer/models \
   -v "$PROJECT_ROOT/workspace":/home/developer/workspace \
   --entrypoint /bin/bash \
