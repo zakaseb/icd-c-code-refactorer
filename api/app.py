@@ -90,6 +90,59 @@ MAX_INPUT_TOKENS = CTX_SIZE_TOKENS - MAX_OUTPUT_TOKENS
 LLM_PROMPT_SAFETY_TOKENS = int(os.environ.get("LLM_PROMPT_SAFETY_TOKENS", "1024"))
 LLM_MIN_OUTPUT_TOKENS = int(os.environ.get("LLM_MIN_OUTPUT_TOKENS", "768"))
 
+# ---------------------------------------------------------------------------
+# Compile-gate (step 3.5) fix-prompt budget
+# ---------------------------------------------------------------------------
+# The transform stage was fixed by dropping its repo-dependency and
+# repo-knowledge sections (see `sec_repo` / `sec_knowledge` / `sec_code` in the
+# transform loop, now hard-set to ""). The per-file compile gate never got the
+# same treatment: it still builds both, at _assemble_prompt priorities 1 and 2,
+# ahead of `change_spec` at 3. Together they consume the entire
+# MAX_INPUT_TOKENS budget, which
+#   (a) drops `change_spec` outright, and
+#   (b) pushes prompt_tokens past CTX_SIZE_TOKENS - LLM_PROMPT_SAFETY_TOKENS,
+#       so _clamp_chat_request cuts max_tokens 4096 -> ~3048.
+# ~3048 output tokens cannot hold a full .c plus its .h, so every fix pass ends
+# finish_reason == "length"; the continuation pass (see _call_llm_complete)
+# only sees the last 2000 chars and replies with unfenced text, so
+# _extract_per_file_blocks reports "no triple-fenced code blocks found" or
+# "parser saw filenames none" — which is the observed 0/2 failure.
+#
+# 1 (default) = lean prompt: compile gate drops repo_ctx + repo_knowledge.
+# 0           = previous behaviour, for an A/B comparison.
+COMPILE_FIX_LEAN_PROMPT = os.environ.get(
+    "COMPILE_FIX_LEAN_PROMPT", "1"
+).strip().lower() not in ("0", "false", "no", "")
+
+# Hard ceiling on the compile-gate fix prompt, independent of MAX_INPUT_TOKENS.
+# Leaves room for a full MAX_OUTPUT_TOKENS reply so the clamp never fires.
+COMPILE_FIX_MAX_INPUT_TOKENS = int(os.environ.get(
+    "COMPILE_FIX_MAX_INPUT_TOKENS",
+    str(CTX_SIZE_TOKENS - MAX_OUTPUT_TOKENS - LLM_PROMPT_SAFETY_TOKENS - 512),
+))
+
+# ---------------------------------------------------------------------------
+# Compile-gate include path
+# ---------------------------------------------------------------------------
+# By default the compile gate resolves quote-includes on demand and never
+# sweeps the uploaded repository, because a blind sweep can put a foreign
+# cross-toolchain sysroot on the -I path and shadow libc headers such as
+# `string.h` (the failure `_is_toxic_include_dir` guards against).
+#
+# Set COMPILE_INCLUDE_SWEEP_REPO=1 to add EVERY header-bearing directory under
+# the uploaded ZIP to the -I list. Directories that look like a toolchain
+# sysroot are still excluded — that filter is what keeps the sweep survivable,
+# so it is deliberately not made optional.
+COMPILE_INCLUDE_SWEEP_REPO = os.environ.get(
+    "COMPILE_INCLUDE_SWEEP_REPO", "0"
+).strip().lower() not in ("0", "false", "no", "")
+
+# Safety valve: a huge vendor SDK can produce thousands of -I flags and blow
+# past the shell ARG_MAX. 0 disables the cap.
+COMPILE_INCLUDE_SWEEP_MAX_DIRS = int(os.environ.get(
+    "COMPILE_INCLUDE_SWEEP_MAX_DIRS", "400"
+))
+
 SANDBOX_BUILD_TIMEOUT = 120
 # Cap compiler/build output in SSE: large make/cmake logs on high-core hosts
 # can be multi-MB and overwhelm browser JSON parsing and DOM if sent whole.
@@ -3731,7 +3784,13 @@ def _assemble_prompt(
         else:
             log.warning("Dropping section '%s' (%d tokens) — no budget left", label, tokens)
 
-    return "\n\n".join(result_parts)
+    assembled = "\n\n".join(result_parts)
+    log.info(
+        "_assemble_prompt: %d/%d input tokens used (%d sections in, %d kept)",
+        _estimate_tokens(assembled), max_input_tokens,
+        len(sorted_secs), len(result_parts),
+    )
+    return assembled
 
 
 # ---------------------------------------------------------------------------

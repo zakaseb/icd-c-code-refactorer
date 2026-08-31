@@ -615,6 +615,10 @@ def run_per_file_compile(
         MAX_REPO_CONTEXT_CHARS,
         MAX_INPUT_TOKENS,
         MAX_OUTPUT_TOKENS,
+        COMPILE_FIX_LEAN_PROMPT,
+        COMPILE_FIX_MAX_INPUT_TOKENS,
+        COMPILE_INCLUDE_SWEEP_REPO,
+        COMPILE_INCLUDE_SWEEP_MAX_DIRS,
         _detect_build_system,
         _detect_cross_compiler,
         _build_file_repo_context,
@@ -809,6 +813,40 @@ def run_per_file_compile(
             if d not in include_dirs:
                 include_dirs.append(d)
 
+    # ---- 3c. Optional full repo sweep -------------------------------------
+    # COMPILE_INCLUDE_SWEEP_REPO=1: add every header-bearing directory under
+    # the uploaded ZIP. Appended AFTER the demand-driven dirs above so
+    # gen_dir / code_dir / resolved shims keep priority and a repo copy of a
+    # regenerated header cannot shadow the newly generated one.
+    swept_dirs: list[Path] = []
+    swept_toxic: list[Path] = []
+    swept_capped = 0
+    if COMPILE_INCLUDE_SWEEP_REPO and has_repo and repo_dir and repo_dir.exists():
+        for d in _collect_include_dirs(repo_dir):
+            if d in include_dirs or d in swept_dirs:
+                continue
+            # The sysroot guard stays on: without it a vendored
+            # arm-*-eabi/include on the -I path shadows libc string.h
+            # and every file fails with unrelated type errors.
+            if _is_toxic_include_dir(d):
+                swept_toxic.append(d)
+                continue
+            swept_dirs.append(d)
+
+        if (COMPILE_INCLUDE_SWEEP_MAX_DIRS > 0
+                and len(swept_dirs) > COMPILE_INCLUDE_SWEEP_MAX_DIRS):
+            swept_capped = len(swept_dirs) - COMPILE_INCLUDE_SWEEP_MAX_DIRS
+            # _collect_include_dirs already sorts shallow-first, so the
+            # truncation drops the deepest (least likely) dirs.
+            swept_dirs = swept_dirs[:COMPILE_INCLUDE_SWEEP_MAX_DIRS]
+
+        include_dirs.extend(swept_dirs)
+        log.info(
+            "per_file_compile: repo sweep added %d include dirs "
+            "(%d toxic skipped, %d dropped by cap)",
+            len(swept_dirs), len(swept_toxic), swept_capped,
+        )
+
     n_found = sum(
         1 for r in resolutions.values()
         if r.get("status") in ("found", "found_via_shim", "found_case_normalized")
@@ -819,14 +857,29 @@ def run_per_file_compile(
                                 "shim_create_failed", "shim_write_failed")
     )
 
-    scope_msg = (
-        f"Resolved {len(include_dirs)} include directories "
-        f"(scoped to newly generated + verified scripts and "
-        f"demand-driven project-local headers — "
-        f"repository ZIP is intentionally NOT swept; only the specific "
-        f"headers the generated code quote-includes are pulled in, and "
-        f"only from non-toolchain locations)."
-    )
+    if COMPILE_INCLUDE_SWEEP_REPO:
+        scope_msg = (
+            f"Resolved {len(include_dirs)} include directories "
+            f"(FULL REPO SWEEP enabled: {len(swept_dirs)} header-bearing "
+            f"directories from the uploaded ZIP added after gen_dir / "
+            f"original_code / demand-resolved shims"
+            + (f", {len(swept_toxic)} toolchain-sysroot dirs excluded"
+               if swept_toxic else "")
+            + (f", {swept_capped} dropped by the "
+               f"{COMPILE_INCLUDE_SWEEP_MAX_DIRS}-dir cap"
+               if swept_capped else "")
+            + ")."
+        )
+    else:
+        scope_msg = (
+            f"Resolved {len(include_dirs)} include directories "
+            f"(scoped to newly generated + verified scripts and "
+            f"demand-driven project-local headers — "
+            f"repository ZIP is intentionally NOT swept; only the specific "
+            f"headers the generated code quote-includes are pulled in, and "
+            f"only from non-toolchain locations). Set "
+            f"COMPILE_INCLUDE_SWEEP_REPO=1 to add every repo subfolder."
+        )
     yield _sse({"type": "info", "stage": "compile", "message": scope_msg})
 
     if resolutions:
@@ -1102,7 +1155,10 @@ def run_per_file_compile(
             pre_fix_h = _read_text_safe(companion_h) if companion_h else ""
 
             file_repo_ctx = ""
-            if has_repo and repo_dir and repo_dir.exists():
+            if (
+                not COMPILE_FIX_LEAN_PROMPT
+                and has_repo and repo_dir and repo_dir.exists()
+            ):
                 file_repo_ctx = _build_file_repo_context(
                     repo_dir, pre_fix_c, uploaded_names,
                     max_chars=MAX_REPO_CONTEXT_CHARS,
@@ -1182,7 +1238,7 @@ def run_per_file_compile(
             )
             sec_knowledge = (
                 f"## Repository Codebase Knowledge\n{repo_knowledge}"
-                if repo_knowledge else ""
+                if repo_knowledge and not COMPILE_FIX_LEAN_PROMPT else ""
             )
             sec_change = f"## Change Specification\n{change_spec}"
             sec_instr = (
@@ -1259,9 +1315,18 @@ def run_per_file_compile(
                     ("instructions", sec_instr, 0),
                     ("repo_ctx", sec_repo_ctx, 1),
                     ("knowledge", sec_knowledge, 2),
-                    ("change_spec", sec_change, 3),
+                    # change_spec is small and high-signal; with repo_ctx and
+                    # knowledge suppressed it now comfortably fits, so it is
+                    # promoted ahead of them rather than being dropped last.
+                    ("change_spec", sec_change, 1 if COMPILE_FIX_LEAN_PROMPT else 3),
                 ],
-                max_input_tokens=MAX_INPUT_TOKENS - sys_tokens,
+                # Cap against COMPILE_FIX_MAX_INPUT_TOKENS, which already
+                # reserves a full MAX_OUTPUT_TOKENS reply plus the safety
+                # margin, so _clamp_chat_request never has to shrink
+                # max_tokens and truncate the fix mid-fence.
+                max_input_tokens=min(
+                    MAX_INPUT_TOKENS, COMPILE_FIX_MAX_INPUT_TOKENS,
+                ) - sys_tokens,
             )
 
             yield _sse({
@@ -1278,6 +1343,23 @@ def run_per_file_compile(
                 fix_output = _call_llm_complete(
                     fix_system, fix_prompt,
                     max_tokens=MAX_OUTPUT_TOKENS, max_passes=3,
+                )
+                # Persist the raw reply so a discarded fix can be diagnosed
+                # (truncated mid-fence vs. genuinely malformed vs. refused).
+                # Without this the output is lost and the only signal is
+                # "no triple-fenced code blocks found".
+                try:
+                    _raw_dir = session_dir / "compile_fix_raw"
+                    _raw_dir.mkdir(exist_ok=True)
+                    (_raw_dir / f"{fname}.attempt{attempt}.txt").write_text(
+                        fix_output, encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+                log.info(
+                    "per_file_compile: fix output for %s attempt %d: "
+                    "%d chars, %d fenced block(s)",
+                    fname, attempt, len(fix_output), fix_output.count("```") // 2,
                 )
             except Exception as e:
                 log.warning("per_file_compile: LLM fix failed for %s: %s", fname, e)
