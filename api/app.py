@@ -41,6 +41,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from per_file_compile import run_per_file_compile, _extract_per_file_blocks
+from codegraph import (
+    CodeGraph,
+    Symbol,
+    extract_symbols,
+    render_dependency_slices,
+    render_public_surface,
+    render_spec_targets,
+)
 
 app = FastAPI(title="ICD C Code Refactorer", docs_url=None, redoc_url=None)
 
@@ -371,6 +379,45 @@ PERIPHERAL_VARIATION_CODEGEN_GUIDANCE = (
     "exactly as before."
 )
 
+# Appended to the transform system prompt. This is the enforceable half of
+# what rules 10-12 above only gesture at: those say "maintain compatibility
+# with dependent modules" without ever telling the model WHICH symbols have
+# dependents. The `## Change Impact` section of the user prompt supplies that
+# table, and the rules below say what to do with it.
+CHANGE_LOCALITY_GUIDANCE = (
+    "\n\nCHANGE LOCALITY (YOU ARE EDITING ONE FILE INSIDE A LARGER CODEBASE):\n"
+    "The `## Change Impact` section lists the symbols this file defines and "
+    "how many places outside it depend on each one. Those other files are NOT "
+    "being regenerated — whatever you break in them stays broken.\n"
+    "- Symbols marked `FROZEN` are referenced by files you cannot see and are "
+    "not editing. Keep their exact spelling, and for functions their exact "
+    "parameter list and return type.\n"
+    "- Change a FROZEN symbol ONLY when the Target ICD makes keeping it "
+    "impossible. Adding a struct field, widening a field, or adding an "
+    "enumerator almost never requires renaming anything.\n"
+    "- Symbols marked `local` are yours to rename freely.\n"
+    "- Prefer additive change. Do NOT reorder, re-spell, or re-case existing "
+    "members for tidiness, consistency, or style — that is not a "
+    "transformation, it is breakage.\n"
+    "- A renamed identifier is not an improvement the ICD asked for. If the "
+    "ICD renames a *field on the wire*, that does not oblige you to rename "
+    "the C identifier that carries it.\n"
+    "\nIMPACT MANIFEST (REQUIRED):\n"
+    "After the closing ``` of your code, on its own line, output "
+    "`IMPACT-MANIFEST:` followed by a single JSON object recording every "
+    "FROZEN symbol you were forced to change, and why:\n"
+    "IMPACT-MANIFEST: "
+    '{\"renamed\": [{\"from\": \"old_name\", \"to\": \"new_name\", '
+    '\"kind\": \"field\", \"reason\": \"<the ICD clause that forced it>\"}], '
+    '\"signature_changed\": [{\"symbol\": \"fn\", \"from\": \"<old>\", '
+    '\"to\": \"<new>\", \"reason\": \"...\"}], '
+    '\"fields_removed\": [{\"struct\": \"S\", \"field\": \"f\", '
+    '\"reason\": \"...\"}]}\n'
+    "Write `IMPACT-MANIFEST: {}` when you changed no FROZEN symbol — which "
+    "should be the common case. An empty manifest alongside a renamed FROZEN "
+    "symbol will be rejected. The manifest is NOT a `###` heading and must "
+    "not be written as one."
+)
 # ---------------------------------------------------------------------------
 # Header Documentation System Prompt
 # ---------------------------------------------------------------------------
@@ -1906,6 +1953,195 @@ def _build_repo_context(repo_dir: Path, exclude_names: set[str] | None = None) -
     if len(result) > MAX_REPO_CONTEXT_CHARS:
         result = result[:MAX_REPO_CONTEXT_CHARS] + "\n[... TRUNCATED repo_context ...]"
     return result
+
+
+# ---------------------------------------------------------------------------
+# Change-impact audit (transform stage)
+# ---------------------------------------------------------------------------
+
+# The manifest marker deliberately avoids the `### <filename>` protocol used
+# for per-variation header splitting (`_split_variation_header_files`), which
+# would otherwise try to read "IMPACT" as a filename.
+_IMPACT_MANIFEST_RE = re.compile(r"IMPACT[-_ ]?MANIFEST\s*:?", re.IGNORECASE)
+
+
+def _parse_impact_manifest(raw_output: str) -> dict:
+    """Pull the model's impact manifest out of a raw transform response.
+
+    A missing or malformed manifest is reported as empty, never as an error:
+    the deterministic audit is the actual gate, and the manifest only decides
+    whether a detected break counts as declared.
+    """
+    if not raw_output:
+        return {}
+    m = _IMPACT_MANIFEST_RE.search(raw_output)
+    if not m:
+        return {}
+    return _extract_json_object(raw_output[m.end():]) or {}
+
+
+# Symbol kinds whose rename or removal breaks a *compile* of a dependent file.
+# Local variables and parameters are excluded: they are invisible outside the
+# translation unit, so churning them costs nothing.
+_AUDITED_KINDS = {"struct", "union", "enum", "typedef", "func", "macro",
+                  "global", "field", "enumerator"}
+
+
+def _index_generated(text: str, filename: str) -> dict[str, Symbol]:
+    """Index freshly generated source that is not on disk yet."""
+    return {
+        s.name: s
+        for s in extract_symbols(text, Path(filename))
+        if s.kind in _AUDITED_KINDS
+    }
+
+
+def _similar(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _audit_transform_impact(
+    original: str,
+    generated: str,
+    fname: str,
+    graph: "CodeGraph | None",
+    batch: set[Path],
+    manifest: dict,
+) -> dict:
+    """Compare the symbols the file used to export against what it now exports.
+
+    The transform stage edits ONE file inside a larger codebase, so a dropped
+    or renamed symbol is not a local matter: it breaks every dependent file,
+    and those files are not being regenerated. This is the deterministic gate
+    that catches it *at generation time*, instead of leaving it to surface as
+    a wall of compiler errors two stages later.
+
+    Returns a report dict with ``authorized`` (declared in the model's impact
+    manifest) and ``unauthorized`` breaks. Never raises and never blocks: a
+    dirty report degrades to a warning so a working pipeline is not held
+    hostage to a heuristic.
+    """
+    report = {
+        "file": fname,
+        "authorized": [],
+        "unauthorized": [],
+        "manifest": manifest or {},
+    }
+    if graph is None:
+        return report
+
+    before = _index_generated(original, fname)
+    after = _index_generated(generated, fname)
+    vanished = [n for n in before if n not in after]
+    if not vanished:
+        return report
+
+    added = [n for n in after if n not in before]
+
+    # Everything the model declared, flattened to the set of symbol names it
+    # claimed authority over.
+    declared: dict[str, dict] = {}
+    for entry in (manifest or {}).get("renamed", []) or []:
+        if isinstance(entry, dict) and entry.get("from"):
+            declared[str(entry["from"])] = entry
+    for entry in (manifest or {}).get("signature_changed", []) or []:
+        if isinstance(entry, dict) and entry.get("symbol"):
+            declared[str(entry["symbol"])] = entry
+    for entry in (manifest or {}).get("fields_removed", []) or []:
+        if isinstance(entry, dict) and entry.get("field"):
+            declared[str(entry["field"])] = entry
+
+    for name in sorted(vanished):
+        imp = graph.impact_of(name, batch)
+        if not imp.frozen:
+            continue  # nothing outside the batch depends on it — free to change
+        # Report a rename as a rename, not as an unrelated delete plus add:
+        # the fix differs, and so does the wording the repair prompt needs.
+        best, score = "", 0.0
+        for cand in added:
+            ratio = _similar(name, cand)
+            if ratio > score:
+                best, score = cand, ratio
+        break_info = {
+            "symbol": name,
+            "kind": before[name].kind,
+            "parent": before[name].parent,
+            "external_sites": imp.external_sites,
+            "external_files": imp.external_files,
+            "likely_renamed_to": best if score >= 0.6 else "",
+            "sample_sites": [
+                f"{r.file.name}:{r.line}: {r.text[:100]}" for r in imp.samples[:3]
+            ],
+        }
+        if name in declared:
+            break_info["reason"] = declared[name].get("reason", "")
+            report["authorized"].append(break_info)
+        else:
+            report["unauthorized"].append(break_info)
+
+    return report
+
+
+def _format_impact_breaks(breaks: list[dict]) -> str:
+    """Render unauthorized breaks for the repair prompt."""
+    lines: list[str] = []
+    for b in breaks:
+        owner = f" (field of {b['parent']})" if b.get("parent") else ""
+        renamed = (
+            f" — it looks like you renamed it to `{b['likely_renamed_to']}`"
+            if b.get("likely_renamed_to") else " — it is simply gone"
+        )
+        lines.append(
+            f"- `{b['symbol']}`{owner}, a {b['kind']}, used at "
+            f"{b['external_sites']} site(s) across {b['external_files']} file(s) "
+            f"that are NOT being regenerated{renamed}."
+        )
+        for site in b.get("sample_sites", []):
+            lines.append(f"    {site}")
+    return "\n".join(lines)
+
+
+def _format_impact_report(reports: list[dict]) -> str:
+    """Human-readable ``impact_report.txt`` for QA and the downloadable ZIP."""
+    lines = [
+        "=" * 65,
+        "CHANGE IMPACT REPORT",
+        "=" * 65,
+        "",
+        "Symbols the transform changed that other files in the codebase "
+        "depend on.",
+        "AUTHORIZED breaks were declared by the model with an ICD "
+        "justification;",
+        "UNAUTHORIZED breaks were not, and survived a revision pass — the "
+        "files listed",
+        "below reference them and are likely to fail to compile until they "
+        "are updated.",
+        "",
+    ]
+    for rep in reports:
+        lines.append(f"## {rep['file']}")
+        if rep.get("repair_failed"):
+            lines.append(
+                "  (revision pass produced no usable file; original transform "
+                "output kept)"
+            )
+        for tag, key in (("AUTHORIZED", "authorized"),
+                         ("UNAUTHORIZED", "unauthorized")):
+            for b in rep.get(key, []):
+                owner = f" of {b['parent']}" if b.get("parent") else ""
+                lines.append(
+                    f"  [{tag}] {b['symbol']} ({b['kind']}{owner}) — "
+                    f"{b['external_sites']} site(s) in {b['external_files']} "
+                    f"dependent file(s)"
+                )
+                if b.get("likely_renamed_to"):
+                    lines.append(f"      renamed to: {b['likely_renamed_to']}")
+                if b.get("reason"):
+                    lines.append(f"      reason: {b['reason']}")
+                for site in b.get("sample_sites", []):
+                    lines.append(f"      used at: {site}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def _structural_verify(generated: str, repo_dir: Path | None,
@@ -4321,9 +4557,35 @@ async def process(
     )
 
     uploaded_names = {p.name for p in code_files}
+
+    # Deterministic symbol / cross-reference index over the uploaded sources
+    # plus the repo ZIP when present. Built once and reused for every file in
+    # the transform loop: it is what lets the transform know that renaming a
+    # struct field breaks call sites in files nobody is regenerating.
+    # Works with no repo ZIP too — then "external" simply means "another
+    # uploaded file", which is still worth being careful about.
+    try:
+        code_graph = CodeGraph.build(
+            code_dir,
+            repo_dir if has_repo else None,
+            read_text=_read_text_safe,
+        )
+    except Exception as e:                                  # noqa: BLE001
+        # The graph is an enhancement, never a prerequisite: a parse blow-up
+        # on an exotic tree must not take the whole pipeline down with it.
+        log.exception("CodeGraph build failed, continuing without it: %s", e)
+        code_graph = None
+    # Files being regenerated this run. A symbol used only by these is not
+    # "frozen": its consumers get rewritten too.
+    transform_batch: set[Path] = set(code_files)
+
     log.info(
-        "Process %s: %d code files, source_icd=%d chars, target_icd=%d chars, has_repo=%s",
-        session_id[:8], len(code_files), len(source_icd), len(target_icd), has_repo,
+        "Process %s: %d code files, source_icd=%d chars, target_icd=%d chars, "
+        "has_repo=%s, code_graph=%s",
+        session_id[:8], len(code_files), len(source_icd), len(target_icd),
+        has_repo,
+        f"{len(code_graph.files)} files/{len(code_graph.symbols)} symbols"
+        if code_graph else "unavailable",
     )
 
     is_resume = status.get("state") == "resuming"
@@ -4922,13 +5184,10 @@ async def process(
             (gen_dir / "icd_analysis.txt").write_text(full_analysis)
             yield _sse({"type": "stage_complete", "stage": "analysis"})
 
-        # Gather cross-file context (the uploaded source files)
-        all_code_ctx = ""
-        for cf in code_files:
-            all_code_ctx += f"\n### File: {cf.name}\n```c\n{_read_text_safe(cf)}\n```\n"
-        all_code_ctx = _truncate_text(all_code_ctx, MAX_CODE_CONTEXT_CHARS, "all_code_ctx")
-
         # ---- Step 2: Transform each file ------------------------------
+        # Per-file change-impact findings, merged into impact_manifest.json /
+        # impact_report.txt once the loop finishes.
+        impact_reports: list[dict] = []
         for i, code_file in enumerate(code_files):
             fname = code_file.name
             if (
@@ -4994,21 +5253,9 @@ async def process(
                 "and communication patterns from the repository codebase\n"
                 "11. Ensure #include directives reference correct repository headers\n"
                 "12. Maintain compatibility with all dependent modules in the repository"
+                f"{CHANGE_LOCALITY_GUIDANCE}"
                 f"{PERIPHERAL_VARIATION_CODEGEN_GUIDANCE}"
             )
-
-            file_repo_ctx = ""
-            if has_repo:
-                file_repo_ctx = _build_file_repo_context(
-                    repo_dir, original, uploaded_names,
-                    max_chars=MAX_REPO_CONTEXT_CHARS,
-                )
-                if not file_repo_ctx:
-                    file_repo_ctx = _build_repo_context(
-                        repo_dir, exclude_names=uploaded_names,
-                    )
-                log.info("Repo context for %s: %d chars (distilled=%s)",
-                         fname, len(file_repo_ctx), bool(file_repo_ctx))
 
             sec_change = (
                 f"## Change Specification (Source ICD -> Target ICD)\n\n{change_spec}"
@@ -5016,31 +5263,44 @@ async def process(
             sec_target = (
                 f"## Target ICD Consolidated Summary\n\n{target_summary}"
             )
-            sec_repo = ""
-            # if file_repo_ctx:
-            #     sec_repo = (
-            #         f"## Repository Dependency Context\n"
-            #         f"These are the actual headers and modules this file depends on. "
-            #         f"Use the exact type names, function signatures, macros, and "
-            #         f"naming conventions from these files.\n\n{file_repo_ctx}"
-            #     )
-            sec_knowledge = ""
-            # if repo_knowledge:
-            #     sec_knowledge = (
-            #         f"## Repository Codebase Knowledge\n"
-            #         f"Detailed inventory of types, functions, variables, and macros "
-            #         f"from the repository. Use these as ground truth for naming, "
-            #         f"types, and conventions.\n\n{repo_knowledge}"
-            #     )
-            sec_code = ""
-            # sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
+
+            # Codebase-informed context. The three sections below replace the
+            # old repo-dependency / repo-knowledge dumps, which were assembled
+            # by VOLUME rather than relevance: a repo-wide inventory capped at
+            # "the first 30 structs in filesystem order", and the full text of
+            # every transitive #include squeezed into a byte budget that one
+            # xparameters.h could exhaust on its own. Both were then character-
+            # sliced by _assemble_prompt, so the model received declarations cut
+            # off mid-field. These are selected for this file specifically, and
+            # emitted as whole declarations that are dropped intact rather than
+            # truncated when the budget runs out.
+            sec_impact = ""
+            sec_deps = ""
+            sec_targets = ""
+            if code_graph is not None:
+                sec_impact = render_public_surface(
+                    code_graph, code_file, transform_batch,
+                )
+                sec_deps = render_dependency_slices(
+                    code_graph, code_file, original,
+                    max_chars=MAX_REPO_CONTEXT_CHARS,
+                )
+                sec_targets = render_spec_targets(
+                    code_graph, code_file,
+                    _extract_fact_tokens(change_spec), transform_batch,
+                )
+                log.info(
+                    "Codebase context for %s: impact=%d chars, deps=%d chars, "
+                    "spec_targets=%d chars",
+                    fname, len(sec_impact), len(sec_deps), len(sec_targets),
+                )
 
             base_sections = [
-                ("repo_dependencies", sec_repo, 1),
+                ("change_impact", sec_impact, 1),
                 ("change_spec", sec_change, 1),
-                ("repo_knowledge", sec_knowledge, 2),
+                ("dependency_decls", sec_deps, 2),
+                ("spec_targets", sec_targets, 2),
                 ("target_summary", sec_target, 3),
-                ("cross_file_ctx", sec_code, 4),
             ]
 
             is_header = fname.lower().endswith(".h")
@@ -5167,7 +5427,10 @@ async def process(
                 "Apply every relevant change from the change specification. "
                 "Ensure the generated code is FULLY COMPATIBLE with the repository "
                 "codebase — use the exact type names, function signatures, and "
-                "#include paths from the dependency headers above. "
+                "#include paths from the declarations above. "
+                "Keep the change as LOCAL as possible: honour the FROZEN markings "
+                "in the change-impact table, and end your reply with the "
+                "`IMPACT-MANIFEST:` line. "
                 f"{variation_instr}"
                 "Output the complete file — do not omit any sections. "
                 "Do not summarize. Do not truncate. Include the full ending of the file."
@@ -5176,18 +5439,23 @@ async def process(
             system_tokens = _estimate_tokens(transform_system)
             prompt_sections = [
                 ("file_to_transform", sec_file, 0),
-                ("repo_dependencies", sec_repo, 1),
+                ("change_impact", sec_impact, 1),
                 ("change_spec", sec_change, 1),
-                ("repo_knowledge", sec_knowledge, 2),
+                ("dependency_decls", sec_deps, 2),
+                ("spec_targets", sec_targets, 2),
                 ("target_summary", sec_target, 3),
-                ("cross_file_ctx", sec_code, 4),
             ]
             transform_prompt = _assemble_prompt(
                 prompt_sections,
                 max_input_tokens=MAX_INPUT_TOKENS - system_tokens,
             )
-            log.info("Transform prompt for %s: %d chars (%d est. tokens)",
-                     fname, len(transform_prompt), _estimate_tokens(transform_prompt))
+            log.info(
+                "Transform prompt for %s: %d chars (%d est. tokens) — "
+                "impact=%d deps=%d targets=%d spec=%d summary=%d chars",
+                fname, len(transform_prompt), _estimate_tokens(transform_prompt),
+                len(sec_impact), len(sec_deps), len(sec_targets),
+                len(sec_change), len(sec_target),
+            )
             clean = ""
             last_chunk = ""
             last_raw = ""
@@ -5329,12 +5597,156 @@ async def process(
                 })
                 continue
 
+            # ---- Change-impact audit -----------------------------------
+            # Deterministic: did this rewrite drop or rename a symbol that
+            # files outside the batch depend on? Catching it here is worth a
+            # single extra LLM call — the alternative is that it surfaces two
+            # stages later as a wall of compiler errors for the agentic debug
+            # loop to reverse-engineer.
+            manifest = _parse_impact_manifest(last_raw)
+            report = _audit_transform_impact(
+                original, clean, fname, code_graph, transform_batch, manifest,
+            )
+            if report["authorized"]:
+                yield _sse({
+                    "type": "info",
+                    "stage": "transform",
+                    "file": fname,
+                    "message": (
+                        f"{fname}: {len(report['authorized'])} ICD-mandated "
+                        "break(s) to symbols used elsewhere, declared by the "
+                        "model: "
+                        + ", ".join(b["symbol"] for b in report["authorized"])
+                    ),
+                })
+            if report["unauthorized"]:
+                breaks = report["unauthorized"]
+                yield _sse({
+                    "type": "info",
+                    "stage": "transform",
+                    "file": fname,
+                    "message": (
+                        f"{fname}: {len(breaks)} undeclared change(s) to symbols "
+                        "other files depend on ("
+                        + ", ".join(b["symbol"] for b in breaks)
+                        + ") — requesting a localised revision…"
+                    ),
+                })
+                repair_prompt = (
+                    f"{sec_impact}\n\n"
+                    f"## Your Output for {fname}\n```c\n{clean}\n```\n\n"
+                    "## Undeclared Breaking Changes\n"
+                    "Your rewrite changed these symbols, which are referenced by "
+                    "files that are NOT part of this transform and will NOT be "
+                    "regenerated. Your impact manifest did not justify any of "
+                    "them:\n\n"
+                    f"{_format_impact_breaks(breaks)}\n\n"
+                    "Emit the file again, restoring each symbol above to its "
+                    "ORIGINAL spelling and signature, while KEEPING every "
+                    "genuine ICD change you made. If the Target ICD truly makes "
+                    "one of them impossible to keep, leave that one changed and "
+                    "justify it in the manifest by citing the ICD clause. "
+                    "Change nothing else. Output the complete file in ```c "
+                    "fences, then the `IMPACT-MANIFEST:` line."
+                )
+                repair_parts: list[str] = []
+                repair_max_tokens = max(
+                    MAX_OUTPUT_TOKENS, int(_estimate_tokens(clean) * 1.15),
+                )
+                try:
+                    for batch_text in _batched_stream_text(
+                        _call_llm_stream(
+                            transform_system, repair_prompt,
+                            max_tokens=repair_max_tokens,
+                        )
+                    ):
+                        repair_parts.append(batch_text)
+                        yield _sse({
+                            "type": "token",
+                            "stage": "transform",
+                            "file": fname,
+                            "token": batch_text,
+                        })
+                except Exception as e:                      # noqa: BLE001
+                    log.warning("Impact repair for %s failed: %s", fname, e)
+                    repair_parts = []
+
+                repair_raw = "".join(repair_parts)
+                repaired = _extract_fenced(repair_raw, "c").strip()
+                if repaired and _looks_complete_c_file(repaired, original, fname):
+                    clean = repaired
+                    report = _audit_transform_impact(
+                        original, clean, fname, code_graph, transform_batch,
+                        _parse_impact_manifest(repair_raw),
+                    )
+                    report["repair_attempted"] = True
+                else:
+                    log.warning(
+                        "Impact repair for %s produced no usable file; "
+                        "keeping the original transform output.", fname,
+                    )
+                    report["repair_attempted"] = True
+                    report["repair_failed"] = True
+
+                # A still-dirty report is reported, never fatal: a heuristic
+                # must not be able to block a pipeline, and the downstream
+                # compile / sandbox stages still get their shot at it.
+                if report["unauthorized"]:
+                    # Sent as `info`, not a new `warning` type: the web UI's
+                    # SSE switch has no `warning` case, so such an event would
+                    # be dropped silently — and a warning nobody sees is worse
+                    # than no warning at all. The prefix carries the severity.
+                    yield _sse({
+                        "type": "info",
+                        "stage": "transform",
+                        "file": fname,
+                        "message": (
+                            f"⚠ WARNING — {fname}: "
+                            f"{len(report['unauthorized'])} undeclared breaking "
+                            "change(s) remain after revision ("
+                            + ", ".join(
+                                b["symbol"] for b in report["unauthorized"]
+                            )
+                            + "). Dependent files may fail to compile — see "
+                            "impact_report.txt."
+                        ),
+                    })
+                else:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "transform",
+                        "file": fname,
+                        "message": f"{fname}: revision restored the shared symbols.",
+                    })
+
+            if report["authorized"] or report["unauthorized"]:
+                impact_reports.append(report)
+
             (gen_dir / fname).write_text(clean)
             yield _sse({
                 "type": "file_complete",
                 "file": fname,
                 "size": len(clean),
             })
+
+        # Persist the change-impact findings next to the other QA artefacts.
+        # The per-file compile and sandbox stages already repair dependents
+        # from compiler errors; this file is the record of which breaks were
+        # deliberate, so that work is not guesswork.
+        if impact_reports:
+            (session_dir / "impact_manifest.json").write_text(
+                json.dumps(impact_reports, indent=2)
+            )
+            impact_text = _format_impact_report(impact_reports)
+            (session_dir / "impact_report.txt").write_text(impact_text)
+            (gen_dir / "impact_report.txt").write_text(impact_text)
+            log.info(
+                "Change-impact report: %d file(s) with cross-file impact, "
+                "%d authorized / %d unauthorized break(s)",
+                len(impact_reports),
+                sum(len(r["authorized"]) for r in impact_reports),
+                sum(len(r["unauthorized"]) for r in impact_reports),
+            )
 
         # ---- Step 2b: Header documentation pass ---------------------------
         # Runs only on .h files. Adds ICD-grounded inline comments to every
@@ -5914,6 +6326,8 @@ async def download_all(session_id: str):
         session_dir / PAUSE_SUMMARY_FILE,
         session_dir / PIPELINE_EVENTS_FILE,
         session_dir / "status.json",
+        session_dir / "impact_report.txt",
+        session_dir / "impact_manifest.json",
         gen_dir / "verification_report.txt",
         gen_dir / "compile_report.txt",
         gen_dir / "icd_analysis.txt",
@@ -5924,7 +6338,8 @@ async def download_all(session_id: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
-            if f.name in ("icd_analysis.txt", "verification_report.txt"):
+            if f.name in ("icd_analysis.txt", "verification_report.txt",
+                          "impact_report.txt"):
                 continue
             zf.write(f, f.name)
         for candidate in [gen_dir / "icd_analysis.txt",
@@ -5962,6 +6377,8 @@ async def download_all(session_id: str):
             session_dir / "change_spec_raw.txt",
             session_dir / "target_summary.txt",
             session_dir / "repo_knowledge.txt",
+            session_dir / "impact_report.txt",
+            session_dir / "impact_manifest.json",
             session_dir / "playbook.jsonl",
         ]:
             if report.exists():
