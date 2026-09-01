@@ -132,17 +132,26 @@ COMPILE_FIX_MAX_INPUT_TOKENS = int(os.environ.get(
 # ---------------------------------------------------------------------------
 # Compile-gate include path
 # ---------------------------------------------------------------------------
-# By default the compile gate resolves quote-includes on demand and never
-# sweeps the uploaded repository, because a blind sweep can put a foreign
-# cross-toolchain sysroot on the -I path and shadow libc headers such as
-# `string.h` (the failure `_is_toxic_include_dir` guards against).
+# 1 (default) = add EVERY header-bearing directory under the uploaded ZIP to
+# the -I list, on top of the demand-driven quote-include resolution.
+# 0           = demand-driven resolution only.
 #
-# Set COMPILE_INCLUDE_SWEEP_REPO=1 to add EVERY header-bearing directory under
-# the uploaded ZIP to the -I list. Directories that look like a toolchain
-# sysroot are still excluded — that filter is what keeps the sweep survivable,
-# so it is deliberately not made optional.
+# This defaults ON so the web UI matches what the live-API notebook does. The
+# notebook sets COMPILE_INCLUDE_SWEEP_REPO=True on the app module at runtime
+# (section 10), so with an off-by-default constant the same code produced two
+# different -I lists: real-world repos compiled in Jupyter and failed in the
+# container with headers-not-found. An env default is the only difference
+# between those two runs, which makes it the wrong place to hide a behaviour
+# change.
+#
+# The risk this trades against is real but bounded: a blind sweep can put a
+# foreign cross-toolchain sysroot on the -I path and shadow libc headers such
+# as `string.h`. `_is_toxic_include_dir` excludes those directories and stays
+# on regardless of this flag — that filter is what keeps the sweep survivable,
+# so it is deliberately not made optional. Set COMPILE_INCLUDE_SWEEP_REPO=0 to
+# fall back to demand-driven resolution if a repo still defeats the filter.
 COMPILE_INCLUDE_SWEEP_REPO = os.environ.get(
-    "COMPILE_INCLUDE_SWEEP_REPO", "0"
+    "COMPILE_INCLUDE_SWEEP_REPO", "1"
 ).strip().lower() not in ("0", "false", "no", "")
 
 # Safety valve: a huge vendor SDK can produce thousands of -I flags and blow
@@ -2101,8 +2110,12 @@ def _format_impact_breaks(breaks: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _format_impact_report(reports: list[dict]) -> str:
+def _format_impact_report(
+    reports: list[dict], audited: list[dict] | None = None,
+) -> str:
     """Human-readable ``impact_report.txt`` for QA and the downloadable ZIP."""
+    audited = audited or []
+    total_frozen = sum(a["frozen_symbols"] for a in audited)
     lines = [
         "=" * 65,
         "CHANGE IMPACT REPORT",
@@ -2118,6 +2131,55 @@ def _format_impact_report(reports: list[dict]) -> str:
         "are updated.",
         "",
     ]
+
+    if audited:
+        lines += [
+            "-" * 65,
+            "SCOPE OF THIS AUDIT",
+            "-" * 65,
+            f"  files audited            : {len(audited)}",
+            f"  FROZEN symbols in scope  : {total_frozen}",
+            f"  files with breaks        : {len(reports)}",
+            "",
+        ]
+        for a in audited:
+            lines.append(
+                f"  {a['file']:<30} {a['frozen_symbols']:>3} frozen symbol(s), "
+                f"{a['breaks']} break(s)"
+            )
+        lines.append("")
+        if total_frozen == 0:
+            lines += [
+                "  NOTE: no symbol in any transformed file is referenced from "
+                "outside the",
+                "  set of files being regenerated, so nothing could be marked "
+                "FROZEN and the",
+                "  audit had nothing to enforce. This is expected when no "
+                "repository ZIP was",
+                "  uploaded: the uploaded .c/.h files are the entire known "
+                "codebase, and they",
+                "  are all being rewritten together. Upload the repository ZIP "
+                "to give the",
+                "  audit the dependent files it needs to protect.",
+                "",
+            ]
+
+    if not reports:
+        lines += [
+            "=" * 65,
+            "RESULT: no cross-file breaks detected.",
+            "=" * 65,
+            "",
+            "Every transformed file kept the symbols its dependents rely on. "
+            "This is the",
+            "intended outcome — the transform applied the ICD changes without "
+            "churning the",
+            "public surface.",
+            "",
+        ]
+        return "\n".join(lines) + "\n"
+
+
     for rep in reports:
         lines.append(f"## {rep['file']}")
         if rep.get("repair_failed"):
@@ -5186,8 +5248,12 @@ async def process(
 
         # ---- Step 2: Transform each file ------------------------------
         # Per-file change-impact findings, merged into impact_manifest.json /
-        # impact_report.txt once the loop finishes.
+        # impact_report.txt once the loop finishes. `impact_audited` records
+        # every file the audit actually ran on, so a clean report can say what
+        # it checked instead of being indistinguishable from a report that
+        # never ran.
         impact_reports: list[dict] = []
+        impact_audited: list[dict] = []
         for i, code_file in enumerate(code_files):
             fname = code_file.name
             if (
@@ -5277,10 +5343,16 @@ async def process(
             sec_impact = ""
             sec_deps = ""
             sec_targets = ""
+            frozen_syms: list[str] = []
             if code_graph is not None:
                 sec_impact = render_public_surface(
                     code_graph, code_file, transform_batch,
                 )
+                frozen_syms = [
+                    i.name for i in
+                    code_graph.public_surface(code_file, transform_batch)
+                    if i.frozen
+                ]
                 sec_deps = render_dependency_slices(
                     code_graph, code_file, original,
                     max_chars=MAX_REPO_CONTEXT_CHARS,
@@ -5719,6 +5791,11 @@ async def process(
                         "message": f"{fname}: revision restored the shared symbols.",
                     })
 
+            impact_audited.append({
+                "file": fname,
+                "frozen_symbols": len(frozen_syms),
+                "breaks": len(report["authorized"]) + len(report["unauthorized"]),
+            })
             if report["authorized"] or report["unauthorized"]:
                 impact_reports.append(report)
 
@@ -5733,17 +5810,22 @@ async def process(
         # The per-file compile and sandbox stages already repair dependents
         # from compiler errors; this file is the record of which breaks were
         # deliberate, so that work is not guesswork.
-        if impact_reports:
+        #
+        # Written whenever the audit ran at all, including the all-clean case.
+        # A QA artefact that is simply absent on success cannot be told apart
+        # from one that was never produced, which makes "no file" useless as
+        # evidence that the transform kept its changes local.
+        if impact_audited:
             (session_dir / "impact_manifest.json").write_text(
                 json.dumps(impact_reports, indent=2)
             )
-            impact_text = _format_impact_report(impact_reports)
+            impact_text = _format_impact_report(impact_reports, impact_audited)
             (session_dir / "impact_report.txt").write_text(impact_text)
             (gen_dir / "impact_report.txt").write_text(impact_text)
             log.info(
-                "Change-impact report: %d file(s) with cross-file impact, "
-                "%d authorized / %d unauthorized break(s)",
-                len(impact_reports),
+                "Change-impact report: audited %d file(s), %d with cross-file "
+                "impact, %d authorized / %d unauthorized break(s)",
+                len(impact_audited), len(impact_reports),
                 sum(len(r["authorized"]) for r in impact_reports),
                 sum(len(r["unauthorized"]) for r in impact_reports),
             )

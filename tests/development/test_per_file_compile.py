@@ -11,8 +11,11 @@ Exercises:
   Test 8   status["generated_files"] never contains .o entries
   Test 9   _extract_per_file_blocks parser
   Test 10  _collect_include_dirs prefers gen_dir over repo (helper unit)
-  Test 11  REGRESSION: repo_dir is NEVER swept for -I, even when it carries
-           a toxic foreign cross-toolchain header (IMU.c production bug)
+  Test 11  REGRESSION: a toxic foreign cross-toolchain header under
+           repo_dir NEVER reaches -I, even with the repo sweep on
+           (IMU.c production bug); benign repo dirs are swept in
+  Test 11b COMPILE_INCLUDE_SWEEP_REPO=0 restores strict scoping —
+           no repo dir on -I at all
   Test 12  code_dir headers are findable when gen_dir has only the .c
   Test 13  Selective resolution: project-local header from repo is pulled
            in alongside a toxic peer (Timer.h next to xilinx string.h)
@@ -508,7 +511,7 @@ with tempfile.TemporaryDirectory() as tmpd:
 # "unknown type name 'size_t'" errors on code that was otherwise fine.
 # The compile gate must now ignore repo_dir entirely and scope `-I` to
 # the newly generated + verified scripts only.
-print("\n=== Test 11: repo_dir is NOT swept for -I (IMU.c regression) ===")
+print("\n=== Test 11: toxic repo header never reaches -I (IMU.c regression) ===")
 with tempfile.TemporaryDirectory() as tmpd:
     tmp = Path(tmpd)
     sess, gen, code, repo = setup_session_dir(tmp)
@@ -578,29 +581,74 @@ with tempfile.TemporaryDirectory() as tmpd:
         f"-I{toxic_dir.resolve()}" not in inc,
         f"toxic dir {toxic_dir} leaked onto -I:\n{inc}",
     )
-    check(
-        "INCLUDE PATH section never lists ANY repo dir as -I",
-        f"-I{repo.resolve()}" not in inc
-        and not any(
-            l.strip().startswith(f"-I{repo.resolve()}") for l in inc.splitlines()
-        ),
-        "any repo_dir path on the compile -I list is a regression",
-    )
+    # The benign repo dir IS expected on -I now: COMPILE_INCLUDE_SWEEP_REPO
+    # defaults on so the web UI matches the notebook. What must never happen
+    # — and what actually caused the IMU.c production failure — is the TOXIC
+    # dir reaching -I. That guard is `_is_toxic_include_dir`, asserted above,
+    # and it is independent of the sweep flag.
     check(
         "INCLUDE PATH section DOES list gen_dir on the -I path",
         f"-I{gen.resolve()}" in inc,
     )
+    check(
+        "benign repo dir IS swept in under the default-on sweep",
+        f"-I{(repo / 'include').resolve()}" in inc,
+        f"expected the safe repo include dir on -I:\n{inc}",
+    )
 
-    # Also verify the live SSE message advertises the scope.
     info_msgs = [e.get("message", "") for e in events if e.get("type") == "info"]
     check(
-        "SSE info message documents the scope explicitly",
-        any(
-            "scoped to" in m
-            and "repository ZIP" in m
-            and "NOT swept" in m
-            for m in info_msgs
-        ),
+        "SSE info message reports the sweep and the sysroot exclusion",
+        any("FULL REPO SWEEP enabled" in m and "sysroot" in m
+            for m in info_msgs),
+        f"info messages={info_msgs}",
+    )
+
+# The escape hatch must still work: COMPILE_INCLUDE_SWEEP_REPO=0 restores
+# demand-driven resolution with no repo dir on -I at all. Without this the
+# flag would be undefeatable if a repo ever gets past the sysroot filter.
+print("\n=== Test 11b: COMPILE_INCLUDE_SWEEP_REPO=0 restores strict scoping ===")
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    sess, gen, code, repo = setup_session_dir(tmp)
+    (gen / "foo.h").write_text(CLEAN_H)
+    (gen / "foo.c").write_text(CLEAN_C)
+    (code / "foo.c").write_text(CLEAN_C)
+    (code / "foo.h").write_text(CLEAN_H)
+    (repo / "include").mkdir(parents=True, exist_ok=True)
+    (repo / "include" / "junk.h").write_text("/* must not be on -I */\n")
+
+    # run_per_file_compile does `from app import COMPILE_INCLUDE_SWEEP_REPO`
+    # at call time, so patching the module attribute is what the notebook
+    # does too and is the supported way to flip it per run.
+    _saved_sweep = app.COMPILE_INCLUDE_SWEEP_REPO
+    app.COMPILE_INCLUDE_SWEEP_REPO = False
+    try:
+        events = drain(run_per_file_compile(
+            session_dir=sess, gen_dir=gen, code_dir=code, repo_dir=repo,
+            has_repo=True, change_spec="(stub)", repo_knowledge="",
+            is_resume=False, completed_stages=set(),
+            max_fix_attempts=2, compile_timeout=30,
+            cc_override=NATIVE_CC,
+        ))
+    finally:
+        app.COMPILE_INCLUDE_SWEEP_REPO = _saved_sweep
+
+    inc = include_path_section((gen / "compile_report.txt").read_text())
+    check(
+        "sweep off: no repo dir reaches -I",
+        not any(l.strip().startswith(f"-I{repo.resolve()}")
+                for l in inc.splitlines()),
+        f"repo dir leaked onto -I with the sweep disabled:\n{inc}",
+    )
+    check(
+        "sweep off: gen_dir still on -I",
+        f"-I{gen.resolve()}" in inc,
+    )
+    info_msgs = [e.get("message", "") for e in events if e.get("type") == "info"]
+    check(
+        "sweep off: SSE message says the ZIP was not swept",
+        any("NOT swept" in m for m in info_msgs),
         f"info messages={info_msgs}",
     )
 

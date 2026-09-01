@@ -296,11 +296,38 @@ check("audit degrades gracefully with no graph",
 
 
 print("\n=== Test 9: impact report rendering ===")
-text = _format_impact_report([rep, rep_declared])
+audited = [{"file": "comm.h", "frozen_symbols": 7, "breaks": 1},
+           {"file": "comm.c", "frozen_symbols": 2, "breaks": 0}]
+text = _format_impact_report([rep, rep_declared], audited)
 check("report names the file", "comm.h" in text)
 check("report separates authorized from unauthorized",
       "[UNAUTHORIZED]" in text and "[AUTHORIZED]" in text)
 check("report shows dependent-file counts", "dependent file(s)" in text)
+check("report states what it audited", "files audited            : 2" in text, text)
+
+# The all-clean report must be distinguishable from a report that never ran —
+# "no file on disk" is useless as evidence that the transform behaved.
+clean = _format_impact_report([], audited)
+check("clean run still produces a report", bool(clean.strip()))
+check("clean run says so explicitly",
+      "no cross-file breaks detected" in clean, clean)
+check("clean run shows the frozen symbols it protected",
+      "FROZEN symbols in scope  : 9" in clean, clean)
+
+# Nothing frozen at all is a different situation and needs a different answer:
+# usually it means no repository ZIP was uploaded.
+no_frozen = _format_impact_report([], [
+    {"file": "comm.h", "frozen_symbols": 0, "breaks": 0},
+])
+check("zero-frozen report explains why nothing was enforced",
+      "nothing could be marked FROZEN" in no_frozen, no_frozen)
+check("zero-frozen report points at the repository ZIP",
+      "repository ZIP" in no_frozen, no_frozen)
+check("non-zero-frozen report does NOT show the ZIP note",
+      "nothing could be marked FROZEN" not in clean)
+
+check("report tolerates a missing audited list (back-compat)",
+      bool(_format_impact_report([rep]).strip()))
 
 
 print("\n=== Test 10: works with uploaded files only (no repo ZIP) ===")

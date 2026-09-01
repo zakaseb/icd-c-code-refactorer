@@ -875,10 +875,11 @@ def run_per_file_compile(
             f"Resolved {len(include_dirs)} include directories "
             f"(scoped to newly generated + verified scripts and "
             f"demand-driven project-local headers — "
-            f"repository ZIP is intentionally NOT swept; only the specific "
-            f"headers the generated code quote-includes are pulled in, and "
-            f"only from non-toolchain locations). Set "
-            f"COMPILE_INCLUDE_SWEEP_REPO=1 to add every repo subfolder."
+            f"repository ZIP is NOT swept because "
+            f"COMPILE_INCLUDE_SWEEP_REPO=0; only the specific headers the "
+            f"generated code quote-includes are pulled in, and only from "
+            f"non-toolchain locations). Unset it to restore the default "
+            f"full-repo sweep."
         )
     yield _sse({"type": "info", "stage": "compile", "message": scope_msg})
 
