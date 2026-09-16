@@ -11,3 +11,11 @@ __pycache__/
 !.cursor/rules/
 !.cursor/rules/**
 ./dummy_input/
+
+# HALCON HEX / VirtuosoNext RTOS SDK — auto-discovered at runtime by
+# api/hex_sdk.py, ~415 MB of prebuilt libs and Qt binaries which we
+# never want committed. Set HEX_SDK_DIR to point at your local copy.
+VisualDesigner-HEX-*/
+VirtuosoNext*/
+HEX-*/
+hex-sdk/

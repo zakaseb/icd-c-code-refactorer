@@ -59,6 +59,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Generator, Optional
 
+try:
+    from api.hex_sdk import (  # noqa: F401  (re-exported for tests)
+        HexSdkContext,
+        discover as _discover_hex_sdk_raw,
+    )
+except ImportError:  # flat layout (uvicorn app:app)
+    from hex_sdk import (  # type: ignore[no-redef]
+        HexSdkContext,
+        discover as _discover_hex_sdk_raw,
+    )
+
+
+def _discover_hex_sdk(
+    *, repo_dir: Optional[Path], cross_hint: Optional[str],
+) -> Optional["HexSdkContext"]:
+    """Thin wrapper so tests can monkey-patch discovery on this module.
+
+    The compile gate probes for an SDK using the uploaded repository as
+    the search root first (users often bundle the SDK), then falls back
+    to sibling directories / OS install locations handled by
+    :func:`api.hex_sdk.discover`.
+    """
+    extras: list[Path] = []
+    if repo_dir and repo_dir.exists():
+        extras.append(repo_dir)
+    return _discover_hex_sdk_raw(
+        repo_root=repo_dir,
+        extra_search_dirs=tuple(extras),
+        cross_hint=cross_hint,
+    )
+
 _HEADER_EXTS = {'.h', '.hpp', '.hh', '.hxx'}
 _SOURCE_EXTS = {'.c', '.cpp', '.cc', '.cxx'}
 
@@ -371,15 +402,39 @@ def _collect_include_dirs(*roots: Optional[Path]) -> list[Path]:
 
 
 def _compile_command(cc: str, src: Path, obj: Path,
-                     include_dirs: list[Path]) -> str:
-    """Build the per-file compile shell command (single .c → .o)."""
+                     include_dirs: list[Path],
+                     extra_flags: list[str] | None = None) -> str:
+    """Build the per-file compile shell command (single .c → .o).
+
+    *extra_flags* is appended AFTER the include list so any ``-D`` or
+    ``-U`` supplied by the HEX SDK (or another integration point) can
+    influence preprocessor conditionals without being shadowed by an
+    earlier project-local flag.
+    """
     inc_args = " ".join(f'"-I{d}"' for d in include_dirs)
-    return f'{cc} {inc_args} -c -o "{obj}" "{src}" 2>&1'
+    extra = " ".join(_quote_flag(f) for f in (extra_flags or []))
+    return f'{cc} {inc_args} {extra} -c -o "{obj}" "{src}" 2>&1'
+
+
+def _quote_flag(flag: str) -> str:
+    """Shell-safe rendering of a single compiler flag.
+
+    Uses double quotes so path-carrying flags such as ``-I/some/dir``
+    survive spaces / parentheses. Simple ``-D`` and ``-U`` tokens fall
+    back to no quoting so ``-DL1_LOCAL_PTR_SIZE=32`` reaches the
+    compiler with the ``=`` intact.
+    """
+    if not flag:
+        return ""
+    if flag.startswith(("-I", "-L", "-isystem")) or "/" in flag:
+        return f'"{flag}"'
+    return flag
 
 
 def _run_compile(cc: str, src: Path, obj: Path,
                  include_dirs: list[Path], timeout: int,
-                 cwd: Path) -> tuple[bool, str, str]:
+                 cwd: Path,
+                 extra_flags: list[str] | None = None) -> tuple[bool, str, str]:
     """Run one compile.  Returns ``(success, command, combined_output)``.
 
     Removes any stale ``obj`` first so a missing ``.o`` after the run is an
@@ -390,7 +445,7 @@ def _run_compile(cc: str, src: Path, obj: Path,
             obj.unlink()
     except OSError:
         pass
-    cmd = _compile_command(cc, src, obj, include_dirs)
+    cmd = _compile_command(cc, src, obj, include_dirs, extra_flags=extra_flags)
     try:
         r = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
@@ -722,6 +777,46 @@ def run_per_file_compile(
         sandbox_cc = SANDBOX_CC_NATIVE
         is_cross = False
 
+    # ---- 2b. HEX / VirtuosoNext SDK discovery ------------------------------
+    # If a HEX SDK is available (env HEX_SDK_DIR, sibling folder, or an
+    # install under ~/HEX2), pull in its public include dirs and RTOS
+    # preprocessor defines so user code that #includes <L1_api.h> et al.
+    # can actually compile in the per-file gate.  Without this every
+    # generated file that touches the RTOS API fails on the very first
+    # header lookup and the fix loop can never make forward progress.
+    hex_sdk = _discover_hex_sdk(repo_dir=repo_dir, cross_hint=sandbox_cc.split()[0])
+    if hex_sdk is not None:
+        yield _sse({
+            "type": "info",
+            "stage": "compile",
+            "message": (
+                "HEX SDK detected: "
+                + hex_sdk.sdk_root.name
+                + f" (platform={hex_sdk.platform}, variant={hex_sdk.variant}, "
+                + f"CO={hex_sdk.compiler_opts})."
+            ),
+        })
+        # If the toolchain the user's build files nominated doesn't match
+        # the SDK's platform (e.g. the repo has no Makefile so we defaulted
+        # to native gcc but the SDK only ships arm-cortex-a9 libs), swap
+        # in the SDK's cross-compiler hint provided it is actually on PATH.
+        if hex_sdk.is_cross and not is_cross and hex_sdk.cc_hint:
+            preflight = subprocess.run(
+                ["which", hex_sdk.cc_hint], capture_output=True, text=True,
+                timeout=5,
+            )
+            if preflight.returncode == 0 and preflight.stdout.strip():
+                sandbox_cc = f"{hex_sdk.cc_hint} -std=gnu99"
+                is_cross = True
+                yield _sse({
+                    "type": "info",
+                    "stage": "compile",
+                    "message": (
+                        f"Switched compiler to {sandbox_cc} to match "
+                        f"the HEX SDK platform '{hex_sdk.platform}'."
+                    ),
+                })
+
     cc_bin = sandbox_cc.split()[0]
     yield _sse({
         "type": "info",
@@ -846,6 +941,19 @@ def run_per_file_compile(
             "(%d toxic skipped, %d dropped by cap)",
             len(swept_dirs), len(swept_toxic), swept_capped,
         )
+
+    # ---- 3d. HEX SDK include roots + defines -----------------------------
+    # Add the SDK's public ``include/`` on -I so `<L1_api.h>` resolves,
+    # and every -D from the SDK's RTOS.cmake so preprocessor
+    # conditionals (VIRTUOSO_NEXT, L1_LOCAL_PTR_SIZE, ARM_CORTEX_A9 etc.)
+    # evaluate correctly.  Appended AFTER the project-local dirs so a
+    # user-supplied header of the same name can still shadow the SDK.
+    hex_extra_flags: list[str] = []
+    if hex_sdk is not None:
+        for d in hex_sdk.include_dirs:
+            if d.resolve() not in include_dirs:
+                include_dirs.append(d.resolve())
+        hex_extra_flags = list(hex_sdk.defines)
 
     n_found = sum(
         1 for r in resolutions.values()
@@ -1067,6 +1175,7 @@ def run_per_file_compile(
             ok, cmd, output = _run_compile(
                 sandbox_cc, cs, obj_path, include_dirs, compile_timeout,
                 cwd=gen_dir,
+                extra_flags=hex_extra_flags or None,
             )
             attempts_log.append({
                 "attempt": attempt,
@@ -1242,6 +1351,16 @@ def run_per_file_compile(
                 if repo_knowledge and not COMPILE_FIX_LEAN_PROMPT else ""
             )
             sec_change = f"## Change Specification\n{change_spec}"
+            # HEX SDK context (only emitted when discovered). Kept
+            # top-priority-but-optional: it always fits when present
+            # because :func:`render_llm_context` self-caps at 6000 chars.
+            sec_hex_sdk = ""
+            if hex_sdk is not None:
+                try:
+                    from api.hex_sdk import render_llm_context  # type: ignore
+                except ImportError:
+                    from hex_sdk import render_llm_context  # type: ignore
+                sec_hex_sdk = render_llm_context(hex_sdk, max_chars=6000)
             sec_instr = (
                 "## Output format reminder\n"
                 "Output ONLY the complete file(s) inside ```c fences. "
@@ -1313,6 +1432,7 @@ def run_per_file_compile(
                     # priority so it always fits in the prompt budget.
                     ("punchlist", sec_punchlist, 0),
                     ("resolutions", sec_resolutions, 0),
+                    ("hex_sdk", sec_hex_sdk, 0),
                     ("instructions", sec_instr, 0),
                     ("repo_ctx", sec_repo_ctx, 1),
                     ("knowledge", sec_knowledge, 2),
@@ -1597,12 +1717,28 @@ def run_per_file_compile(
         f"Quote-includes:     {len(quote_needs)} parsed, "
         f"{n_found} resolved, {n_missing} unresolved"
         if quote_needs else "Quote-includes:     none",
+    ]
+    if hex_sdk is not None:
+        rep.extend([
+            "",
+            "-" * 65,
+            "HEX / VirtuosoNext SDK",
+            "-" * 65,
+        ])
+        rep.extend(f"  {line}" for line in hex_sdk.summary_lines())
+        rep.append(f"  extra flags : {' '.join(hex_extra_flags)}")
+    rep.extend([
         "",
         "-" * 65,
         "INCLUDE PATH (gen_dir + code_dir + demand-driven project-local "
-        "headers from repo; toolchain sysroots filtered out)",
+        "headers from repo; toolchain sysroots filtered out"
+        + (
+            "; HEX SDK include roots appended"
+            if hex_sdk is not None else ""
+        )
+        + ")",
         "-" * 65,
-    ]
+    ])
     for d in include_dirs:
         rep.append(f"  -I{d}")
 

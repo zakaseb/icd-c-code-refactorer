@@ -49,6 +49,38 @@ from codegraph import (
     render_public_surface,
     render_spec_targets,
 )
+try:
+    from api.hex_sdk import (
+        HexSdkContext,
+        discover as _discover_hex_sdk_raw,
+        render_llm_context as _render_hex_sdk_llm_context,
+        format_summary as _format_hex_sdk_summary,
+    )
+except ImportError:  # flat layout
+    from hex_sdk import (  # type: ignore[no-redef]
+        HexSdkContext,
+        discover as _discover_hex_sdk_raw,
+        render_llm_context as _render_hex_sdk_llm_context,
+        format_summary as _format_hex_sdk_summary,
+    )
+
+
+def _discover_hex_sdk(
+    *,
+    repo_dir: Path | None,
+    cross_hint: str | None,
+) -> "HexSdkContext | None":
+    """Locate a HEX SDK for the current session, searching the uploaded
+    repository first and then the developer's default layout.
+    """
+    extras: list[Path] = []
+    if repo_dir and repo_dir.exists():
+        extras.append(repo_dir)
+    return _discover_hex_sdk_raw(
+        repo_root=repo_dir,
+        extra_search_dirs=tuple(extras),
+        cross_hint=cross_hint,
+    )
 
 app = FastAPI(title="ICD C Code Refactorer", docs_url=None, redoc_url=None)
 
@@ -2364,6 +2396,17 @@ _CROSS_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"aarch64-none-elf-gcc", re.I), SANDBOX_CC_ARM),
     (re.compile(r"mb-gcc|microblaze.*gcc", re.I), SANDBOX_CC_ARM),
 ]
+
+# HEX / VirtuosoNext RTOS example projects carry an ``environment.mk``
+# whose variables (RTOS_DIR / PROJECT_GEN / PROJECT_NAME) uniquely
+# identify a HEX build.  A ``PROJECT_GEN`` that mentions ``arm`` /
+# ``ppc`` / ``mb`` gives us a strong cross-compiler hint even when the
+# top-level Makefile is just a thin ``$(PROJECT_GEN) …`` wrapper that
+# does not name a compiler explicitly.
+_HEX_PROJECT_GEN_RE = re.compile(
+    r"^\s*PROJECT_GEN\s*[:?]?=\s*(.+?)\s*$",
+    re.MULTILINE,
+)
 _LINKER_ERROR_RE = re.compile(
     r"undefined reference to|"
     r"cannot find -l|"
@@ -2378,27 +2421,53 @@ def _detect_cross_compiler(build_info: dict) -> str:
     """Detect whether the project needs a cross-compiler.
 
     Reads the Makefile (or CMakeLists.txt) and checks the ``CC`` variable
-    for known cross-compiler prefixes.  Returns the sandbox ``CC`` string
-    to use (cross or native).
+    for known cross-compiler prefixes.  Also inspects any
+    ``environment.mk`` sibling — HEX / VirtuosoNext example projects
+    hide the cross-toolchain choice inside that file's ``PROJECT_GEN``
+    variable, so the top-level Makefile alone would look native to us.
+
+    Returns the sandbox ``CC`` string to use (cross or native).
     """
     bpath = build_info.get("path")
-    if not bpath or not bpath.exists():
-        return SANDBOX_CC_NATIVE
+    contents_to_scan: list[str] = []
+    if bpath and bpath.exists():
+        try:
+            contents_to_scan.append(bpath.read_text(errors="replace"))
+        except OSError:
+            pass
+    # HEX example projects also carry environment.mk in the same folder.
+    if bpath and bpath.parent:
+        env_mk = bpath.parent / "environment.mk"
+        if env_mk.is_file():
+            try:
+                contents_to_scan.append(env_mk.read_text(errors="replace"))
+            except OSError:
+                pass
 
-    try:
-        content = bpath.read_text(errors="replace")
-    except OSError:
-        return SANDBOX_CC_NATIVE
+    for content in contents_to_scan:
+        for m in _CC_RE.finditer(content):
+            cc_val = m.group(1)
+            for pattern, sandbox_cc in _CROSS_PATTERNS:
+                if pattern.search(cc_val):
+                    return sandbox_cc
 
-    for m in _CC_RE.finditer(content):
-        cc_val = m.group(1)
+    for content in contents_to_scan:
         for pattern, sandbox_cc in _CROSS_PATTERNS:
-            if pattern.search(cc_val):
+            if pattern.search(content):
                 return sandbox_cc
 
-    for pattern, sandbox_cc in _CROSS_PATTERNS:
-        if pattern.search(content):
-            return sandbox_cc
+        # PROJECT_GEN=...ProjectGen-arm.exe / -ppc.exe / -mb.exe from
+        # HEX environment.mk — those wrappers emit an ARM / PowerPC /
+        # MicroBlaze toolchain compile line.
+        for m in _HEX_PROJECT_GEN_RE.finditer(content):
+            gen_val = m.group(1).lower()
+            if "arm" in gen_val or "cortex" in gen_val or "aarch64" in gen_val:
+                return SANDBOX_CC_ARM
+            if "ppc" in gen_val or "powerpc" in gen_val:
+                # No dedicated PPC constant; fall back to native (the
+                # sandbox build's compile-only pass will still surface
+                # any semantic issues).
+                return SANDBOX_CC_NATIVE
 
     return SANDBOX_CC_NATIVE
 
@@ -2418,11 +2487,18 @@ def _run_sandbox_build(
     sandbox_dir: Path,
     build_info: dict,
     timeout: int = SANDBOX_BUILD_TIMEOUT,
+    hex_sdk: "HexSdkContext | None" = None,
 ) -> tuple[bool, str]:
     """Execute the build command inside *sandbox_dir*.
 
     Automatically detects whether the project uses a cross-compiler
     (arm-none-eabi-gcc, mb-gcc, etc.) and uses the matching toolchain.
+
+    When *hex_sdk* is not None, its include roots and preprocessor
+    defines are injected into the ``CFLAGS`` / ``CMAKE_C_FLAGS`` for
+    the full build, and its link libraries into the compile-only
+    fallback so an RTOS-linked project can actually resolve symbols
+    like ``L1_Send_Packet_W`` when the archives are on disk.
 
     If a full build fails with only linker errors (missing BSP libraries
     / linker scripts), a compile-only pass (``-c``) is attempted.  When
@@ -2436,21 +2512,40 @@ def _run_sandbox_build(
     bdir = build_info["build_dir"]
     sandbox_cc = _detect_cross_compiler(build_info)
 
+    # HEX SDK compile-time additions (include roots + defines) are
+    # combined with any user-defined CFLAGS so `#include <L1_api.h>`
+    # etc. resolve.  Link-time additions (`-L`, `-l`) are appended to
+    # LDFLAGS for `make` builds and to CMAKE_EXE_LINKER_FLAGS for
+    # CMake builds.
+    hex_cflags = " ".join(hex_sdk.as_compile_flags()) if hex_sdk else ""
+    hex_ldflags = " ".join(hex_sdk.as_link_flags()) if hex_sdk else ""
+
     if btype == "make":
+        parts = [f"CC='{sandbox_cc}'"]
+        if hex_cflags:
+            parts.append(f"CFLAGS+='{hex_cflags}'")
+        if hex_ldflags:
+            parts.append(f"LDFLAGS+='{hex_ldflags}'")
+        make_env = " ".join(parts)
         full_cmd = (
-            f"make -C {bdir} CC='{sandbox_cc}' clean 2>/dev/null; "
-            f"make -C {bdir} CC='{sandbox_cc}' 2>&1"
+            f"make -C {bdir} {make_env} clean 2>/dev/null; "
+            f"make -C {bdir} {make_env} 2>&1"
         )
     elif btype == "cmake":
         cmake_build = bdir / "_cmake_build"
         cc_bin = sandbox_cc.split()[0]
         cc_flags = " ".join(sandbox_cc.split()[1:])
+        if hex_cflags:
+            cc_flags = f"{cc_flags} {hex_cflags}".strip()
         full_cmd = (
             f"cmake -S {bdir} -B {cmake_build} "
             f"-DCMAKE_C_COMPILER={cc_bin} "
-            f'-DCMAKE_C_FLAGS="{cc_flags}" 2>&1 && '
-            f"cmake --build {cmake_build} 2>&1"
+            f'-DCMAKE_C_FLAGS="{cc_flags}" '
         )
+        if hex_ldflags:
+            full_cmd += f'-DCMAKE_EXE_LINKER_FLAGS="{hex_ldflags}" '
+        full_cmd += "2>&1 && "
+        full_cmd += f"cmake --build {cmake_build} 2>&1"
     else:
         return False, "No supported build system detected in repository."
 
@@ -2477,6 +2572,9 @@ def _run_sandbox_build(
         include_dirs: set[str] = set()
         for inc in bdir.rglob("*.h"):
             include_dirs.add(str(inc.parent))
+        if hex_sdk is not None:
+            for d in hex_sdk.include_dirs:
+                include_dirs.add(str(d))
 
         # Write a shell script to compile each source individually,
         # avoiding shell argument-length limits on large repos.
@@ -2484,9 +2582,14 @@ def _run_sandbox_build(
         lines = ["#!/bin/sh", "set -e", f'CC="{sandbox_cc}"']
         inc_args = " ".join(f'"-I{d}"' for d in sorted(include_dirs))
         lines.append(f"INC={inc_args}")
+        extra = ""
+        if hex_sdk is not None:
+            extra = " ".join(hex_sdk.defines)
+            lines.append(f"HEX_DEFS='{extra}'")
         for src in c_sources:
             obj = src.with_suffix(".o")
-            lines.append(f'$CC $INC -c -o "{obj}" "{src}" 2>&1')
+            hex_arg = " $HEX_DEFS" if hex_sdk is not None else ""
+            lines.append(f'$CC $INC{hex_arg} -c -o "{obj}" "{src}" 2>&1')
         script.write_text("\n".join(lines) + "\n")
         script.chmod(0o755)
 
@@ -2683,6 +2786,38 @@ def _sandbox_build_iterate(
     is_cross = sandbox_cc != SANDBOX_CC_NATIVE
     cc_label = sandbox_cc.split()[0]
 
+    # --- HEX / VirtuosoNext SDK discovery ------------------------------------
+    # Injects RTOS include roots + preprocessor defines into every
+    # build command, plus link libraries for the final link.  The
+    # detection cascade is: env var → sibling of the uploaded repo →
+    # inside the uploaded repo → OS install locations.  Falls back
+    # gracefully (returns None) when the SDK is not available and the
+    # build behaves exactly as before.
+    hex_sdk = _discover_hex_sdk(repo_dir=sandbox_dir, cross_hint=cc_label)
+    if hex_sdk is not None:
+        yield _sse({
+            "type": "info",
+            "stage": "sandbox_build",
+            "message": _format_hex_sdk_summary(hex_sdk),
+        })
+        if hex_sdk.is_cross and not is_cross and hex_sdk.cc_hint:
+            preflight = subprocess.run(
+                ["which", hex_sdk.cc_hint], capture_output=True, text=True,
+                timeout=5,
+            )
+            if preflight.returncode == 0 and preflight.stdout.strip():
+                sandbox_cc = f"{hex_sdk.cc_hint} -std=gnu99"
+                is_cross = True
+                cc_label = hex_sdk.cc_hint
+                yield _sse({
+                    "type": "info",
+                    "stage": "sandbox_build",
+                    "message": (
+                        f"Switched sandbox compiler to {sandbox_cc} to match "
+                        f"HEX SDK platform '{hex_sdk.platform}'."
+                    ),
+                })
+
     yield _sse({
         "type": "info",
         "stage": "sandbox_build",
@@ -2738,8 +2873,13 @@ def _sandbox_build_iterate(
         f"Compiler:      {sandbox_cc}",
         f"Cross-compile: {'yes' if is_cross else 'no'}",
         f"Files injected: {', '.join(sorted(gen_filenames))}",
-        "",
     ]
+    if hex_sdk is not None:
+        build_log_lines.append("")
+        build_log_lines.append("HEX SDK integration:")
+        for line in hex_sdk.summary_lines():
+            build_log_lines.append(f"  {line}")
+    build_log_lines.append("")
 
     # --- System prompts for generated-file fixes and repo-file patches ------
     cross_note = (
@@ -2750,6 +2890,19 @@ def _sandbox_build_iterate(
         "Focus on fixing COMPILE errors, not link errors.\n"
         if is_cross else ""
     )
+    if hex_sdk is not None:
+        cross_note = (
+            (cross_note or "")
+            + f"HEX / VirtuosoNext RTOS SDK v{hex_sdk.version} is on "
+            f"the include path ({hex_sdk.platform_dir / 'include'}). "
+            "Use ONLY APIs the SDK provides — do not invent function "
+            "names, macros or types.  Angle-bracket includes like "
+            "`#include <L1_api.h>` / `#include <kernel/L1_kernel_api.h>` "
+            "resolve to the SDK header tree. Preprocessor defines "
+            f"{', '.join(hex_sdk.defines[:6])}"
+            + (" ..." if len(hex_sdk.defines) > 6 else "")
+            + " are active during compilation.\n"
+        )
 
     gen_fix_system = (
         "You are an expert C programmer. You are transforming C code to "
@@ -2834,7 +2987,7 @@ def _sandbox_build_iterate(
                 local_log.append("-" * 65)
                 local_log.append(f"BUILD ATTEMPT {attempts['n']}")
                 local_log.append("-" * 65)
-                ok, out = _run_sandbox_build(sandbox_dir, build_info)
+                ok, out = _run_sandbox_build(sandbox_dir, build_info, hex_sdk=hex_sdk)
                 local_log.append(f"\n{out}\n")
                 local_log.append(
                     f"\n>>> BUILD {'SUCCEEDED' if ok else 'FAILED'}"
@@ -3190,7 +3343,7 @@ def _sandbox_build_iterate(
                 local_log.append("-" * 65)
                 local_log.append(f"BUILD ATTEMPT {attempts['n']}")
                 local_log.append("-" * 65)
-                ok, out = _run_sandbox_build(sandbox_dir, build_info)
+                ok, out = _run_sandbox_build(sandbox_dir, build_info, hex_sdk=hex_sdk)
                 local_log.append(f"\n{out}\n")
                 local_log.append(
                     f"\n>>> BUILD {'SUCCEEDED' if ok else 'FAILED'}"
@@ -3562,7 +3715,7 @@ def _sandbox_build_iterate(
         build_log_lines.append(f"BUILD ATTEMPT {iteration}")
         build_log_lines.append("-" * 65)
 
-        success, output = _run_sandbox_build(sandbox_dir, build_info)
+        success, output = _run_sandbox_build(sandbox_dir, build_info, hex_sdk=hex_sdk)
 
         build_log_lines.append(f"\n{output}\n")
 
@@ -3726,11 +3879,17 @@ def _sandbox_build_iterate(
                     f"### Error History\n{history_text}"
                 )
 
+            sec_hex_sdk = (
+                _render_hex_sdk_llm_context(hex_sdk, max_chars=5000)
+                if hex_sdk is not None else ""
+            )
+
             fix_sections = [
                 ("original", sec_original, 0),
                 ("current", sec_current, 0),
                 ("errors", sec_errors, 0),
                 ("escalation", sec_escalation, 0) if sec_escalation else ("escalation", "", 99),
+                ("hex_sdk", sec_hex_sdk, 1),
                 ("repo_ctx", sec_repo_ctx, 1),
                 ("knowledge", sec_knowledge, 2),
                 ("change_spec", sec_change, 3),
@@ -3852,10 +4011,16 @@ def _sandbox_build_iterate(
                 f"{_truncate_text(errors, 6000, 'compiler_errors')}\n```"
             )
 
+            sec_hex_sdk_r = (
+                _render_hex_sdk_llm_context(hex_sdk, max_chars=4000)
+                if hex_sdk is not None else ""
+            )
+
             repo_fix_sections = [
                 ("file", sec_file, 0),
                 ("errors", sec_errors_r, 0),
                 ("headers", sec_headers, 0),
+                ("hex_sdk", sec_hex_sdk_r, 1),
             ]
             sys_tokens = _estimate_tokens(repo_fix_system)
             repo_fix_prompt = _assemble_prompt(
@@ -4593,6 +4758,20 @@ async def process(
 
     repo_dir = session_dir / "repo_contents"
     has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
+    # HEX / VirtuosoNext RTOS SDK discovery for the entire session.
+    # Detected once here so the transform, per-file compile, and
+    # sandbox-build stages all share the same platform / variant /
+    # compiler-opts choice.  Returns None when the SDK is not available
+    # and the pipeline behaves exactly as before.
+    hex_sdk = _discover_hex_sdk(
+        repo_dir=repo_dir if has_repo else None,
+        cross_hint=None,
+    )
+    if hex_sdk is not None:
+        log.info(
+            "HEX SDK discovered for session %s: %s (platform=%s variant=%s)",
+            session_id[:8], hex_sdk.sdk_root, hex_sdk.platform, hex_sdk.variant,
+        )
     # The .c/.h scripts uploaded for refactoring are ALWAYS the
     # authoritative pre-change source for the ICD-delta analysis,
     # regardless of whether a broader repository ZIP was also provided.
@@ -5509,10 +5688,15 @@ async def process(
             )
 
             system_tokens = _estimate_tokens(transform_system)
+            sec_hex_sdk = (
+                _render_hex_sdk_llm_context(hex_sdk, max_chars=5000)
+                if hex_sdk is not None else ""
+            )
             prompt_sections = [
                 ("file_to_transform", sec_file, 0),
                 ("change_impact", sec_impact, 1),
                 ("change_spec", sec_change, 1),
+                ("hex_sdk", sec_hex_sdk, 1),
                 ("dependency_decls", sec_deps, 2),
                 ("spec_targets", sec_targets, 2),
                 ("target_summary", sec_target, 3),
@@ -6632,6 +6816,15 @@ async def regenerate(
     has_repo = repo_dir.exists() and any(repo_dir.rglob("*"))
     uploaded_names = {p.name for p in code_files}
 
+    # HEX / VirtuosoNext RTOS SDK discovery for the regeneration run.
+    # Same detection cascade as :func:`process_session`; kept local so
+    # the SDK env may be reconfigured between rounds without restarting
+    # the API server.
+    hex_sdk = _discover_hex_sdk(
+        repo_dir=repo_dir if has_repo else None,
+        cross_hint=None,
+    )
+
     regen_count = status.get("regeneration_count", 0) + 1
 
     target_summary_path = session_dir / "target_summary.txt"
@@ -6841,12 +7034,17 @@ async def regenerate(
             )
 
             system_tokens = _estimate_tokens(transform_system)
+            sec_hex_sdk = (
+                _render_hex_sdk_llm_context(hex_sdk, max_chars=5000)
+                if hex_sdk is not None else ""
+            )
             transform_prompt = _assemble_prompt(
                 [
                     ("file_to_transform", sec_file, 0),
                     ("user_feedback", sec_conv, 0),
                     ("change_spec", sec_change, 1),
                     ("previous_generated", sec_prev, 1),
+                    ("hex_sdk", sec_hex_sdk, 1),
                     ("repo_dependencies", sec_repo, 2),
                     ("repo_knowledge", sec_knowledge, 2),
                     ("target_summary", sec_target_v, 3),

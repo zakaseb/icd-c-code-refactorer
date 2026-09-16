@@ -43,3 +43,9 @@ Open **http://localhost:8081**. First start downloads the GGUF model into `model
 4. **Download** result ZIP and/or built repo ZIP.
 
 Sandbox build retries are configurable in the UI (`sandbox_retries=N` or `indefinite`).
+
+## RTOS builds (HALCON HEX / VirtuosoNext)
+
+Projects targeting the HALCON HEX / VirtuosoNext RTOS depend on a large binary SDK (`VisualDesigner-HEX-<version>/`, ~415 MB). Because it does not fit in git, the pipeline auto-discovers the SDK at runtime and injects its include roots, preprocessor defines, cross-compiler hint, and static-library archives into every build step (compile-gate, sandbox build, and LLM prompts).
+
+Set `HEX_SDK_DIR` to point at your local SDK checkout, or drop it next to the repo root. See [Configuration → HEX / VirtuosoNext RTOS SDK](building/configuration.md#hex--virtuosonext-rtos-sdk) for env variables and [Sandbox Debugging → HEX / VirtuosoNext RTOS SDK injection](sandbox/debugging.md#hex--virtuosonext-rtos-sdk-injection) for how discovery flows through the build.

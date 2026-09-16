@@ -44,6 +44,22 @@ UI `sandbox_retries` overrides the effective build/attempt budget for a run — 
 
 `REMOTE_BUILD_ENABLED`, `REMOTE_BUILD_HOST`, `REMOTE_BUILD_USER`, `REMOTE_BUILD_PASS`, `REMOTE_BUILD_SRC`, `REMOTE_BUILD_SCRIPT`, `REMOTE_BUILD_MODE`.
 
+## HEX / VirtuosoNext RTOS SDK
+
+The `api/hex_sdk.py` module auto-discovers a locally installed HALCON HEX / VirtuosoNext SDK (typically `VisualDesigner-HEX-<version>/`) at runtime. When found, its `targets/<platform>/include` roots and preprocessor defines are pushed into the compile-gate (`api/per_file_compile.py`) and the sandbox build (`api/app.py`) `CFLAGS`/`LDFLAGS`, and a compact API summary is inlined into the transform + fix prompts so the LLM never invents kernel APIs. The SDK tree itself is **not** committed — it's ~415 MB — so the repository's `.gitignore` blocks `VisualDesigner-HEX-*/`, `VirtuosoNext*/`, `HEX-*/` and `hex-sdk/`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEX_SDK_DIR` | (unset) | Absolute path override. Takes highest priority. Skip discovery/search when set. |
+| `HEX_SDK_DISABLE` | (unset) | Set to `1`/`true` to skip discovery entirely (native builds only). |
+| `HEX_SDK_PLATFORM` | auto | e.g. `arm-cortex-a9`, `win64`, `posix32`. Auto-picked from the cross-compiler hint and available `targets/*` dirs. |
+| `HEX_SDK_VARIANT` | `SP` | `SP` (single-processor) or `MP` (multi-processor) kernel. |
+| `HEX_SDK_COMPILER` | `COs` | `CO0`, `CO3`, or `COs` — must match a library-suffix under `targets/<platform>/lib/`. |
+| `HEX_SDK_DEBUG` | (unset) | `D1` or `D2` for debug-instrumented archives. |
+| `HEX_SDK_PROTECTION` | (unset) | `PLNONE` or `PLSPACE` (space-partitioning enable). |
+
+Discovery order: `HEX_SDK_DIR` → sibling of repo root → child of repo root → `~/HEX2/VirtuosoNext` / `~/VirtuosoNext` / `/opt/VirtuosoNext` / `/opt/hex-sdk` / `/usr/local/VirtuosoNext`. See `docs/sandbox/debugging.md` for how the discovery result flows through the build.
+
 ## In-app constants (not env)
 
 Examples from `api/app.py`: ICD chunk size (`ICD_CHUNK_CHARS`), context caps, sandbox compilers (`SANDBOX_CC_NATIVE` / `SANDBOX_CC_ARM`), `SANDBOX_BUILD_TIMEOUT` (often 120s).
