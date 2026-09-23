@@ -38,7 +38,10 @@ one of these locations, in priority order:
        layout).
     3. A ``VisualDesigner-HEX-*`` folder inside the current uploaded
        repository (for users who bundle the SDK with their code).
-    4. A user-installed copy under
+    4. When invoked without ``repo_root`` (typical CLI one-liner):
+       the current working directory, any SDK folder inside it, and
+       any SDK folder in its parent.
+    5. A user-installed copy under
        ``~/HEX2/VirtuosoNext`` /
        ``~/VirtuosoNext`` / ``/opt/hex-sdk`` / ``/opt/VirtuosoNext``.
 
@@ -449,6 +452,38 @@ def _candidate_roots(
                         _push(child)
         except OSError:
             continue
+
+    # Ad-hoc CLI convenience: when the caller did not specify a
+    # ``repo_root`` (typical for one-liner smoke-tests such as
+    # ``python -c "import hex_sdk; hex_sdk.discover()"``), probe the
+    # current working directory too — matches the "auto-discover"
+    # intuition of running the tool from inside the project.  ``app.py``
+    # always supplies an explicit ``repo_dir`` so this branch never
+    # affects the FastAPI code path.
+    if repo_root is None:
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            cwd = None
+        if cwd is not None:
+            # cwd itself, in case the user cd'd into an SDK checkout.
+            if _matches_sdk_dirname(cwd.name):
+                _push(cwd)
+            # Any SDK folder sitting directly inside cwd.
+            try:
+                for child in cwd.iterdir():
+                    if child.is_dir() and _matches_sdk_dirname(child.name):
+                        _push(child)
+            except OSError:
+                pass
+            # One level up (SDK installed next to the project the CLI
+            # was invoked from).
+            try:
+                for child in cwd.parent.iterdir():
+                    if child.is_dir() and _matches_sdk_dirname(child.name):
+                        _push(child)
+            except OSError:
+                pass
 
     # OS-level install locations.
     home = Path.home()

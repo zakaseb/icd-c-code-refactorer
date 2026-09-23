@@ -15,6 +15,10 @@ toolchain either.
     Test 2   `discover()` locates a fake SDK next to the repo root and
              fills in include_dirs / lib_dir / defines / cc_hint.
     Test 3   HEX_SDK_DIR env var takes highest priority.
+    Test 3b  REGRESSION: `discover()` with no args probes the current
+             working directory (fixes the Layer-4 verification one-liner
+             that returned None even when the SDK sat right beside the
+             caller).
     Test 4   Platform / variant / compiler overrides via env vars steer
              both the picked target and the library shortlist.
     Test 5   `_build_key` / `_shortlist_libs` pick the right archives
@@ -214,6 +218,49 @@ with tempfile.TemporaryDirectory() as _td:
     if ctx is not None:
         check("HEX_SDK_DIR resolved to fake root",
               ctx.sdk_root == fake.resolve())
+
+# ---------------------------------------------------------------
+print("\n=== Test 3b: discover() with no args probes the CWD ===")
+# REGRESSION: previously `hex_sdk.discover()` (no repo_root argument)
+# skipped the sibling/child scan entirely and only checked HEX_SDK_DIR
+# + OS-level install paths, so the shipped Layer-4 verification
+# one-liner ``python -c "import hex_sdk; hex_sdk.discover()"`` returned
+# None even when the SDK sat right next to the caller.  The CWD probe
+# now covers that ad-hoc use.
+with tempfile.TemporaryDirectory() as _td:
+    _reset_env()
+    tmp = Path(_td)
+    fake = _make_fake_sdk(tmp)
+    prev_cwd = Path.cwd()
+    try:
+        os.chdir(tmp)
+        # No repo_root, no HEX_SDK_DIR — must still find fake via CWD.
+        ctx = discover()
+        check("discover() with no args finds SDK in CWD",
+              ctx is not None and ctx.sdk_root == fake.resolve(),
+              f"ctx={ctx}")
+
+        # Also probe from a *sibling* of the SDK so parent-of-cwd scan
+        # is exercised.
+        sibling = tmp / "sibling_project"
+        sibling.mkdir()
+        os.chdir(sibling)
+        hex_sdk.clear_cache()
+        ctx2 = discover()
+        check("discover() with no args finds SDK in CWD parent",
+              ctx2 is not None and ctx2.sdk_root == fake.resolve(),
+              f"ctx2={ctx2}")
+
+        # And when CWD *is* the SDK root itself.
+        os.chdir(fake)
+        hex_sdk.clear_cache()
+        ctx3 = discover()
+        check("discover() with no args identifies CWD as SDK root",
+              ctx3 is not None and ctx3.sdk_root == fake.resolve(),
+              f"ctx3={ctx3}")
+    finally:
+        os.chdir(prev_cwd)
+        hex_sdk.clear_cache()
 
 # ---------------------------------------------------------------
 print("\n=== Test 4: platform / variant / compiler overrides ===")
