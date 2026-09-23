@@ -57,8 +57,15 @@ The `api/hex_sdk.py` module auto-discovers a locally installed HALCON HEX / Virt
 | `HEX_SDK_COMPILER` | `COs` | `CO0`, `CO3`, or `COs` — must match a library-suffix under `targets/<platform>/lib/`. |
 | `HEX_SDK_DEBUG` | (unset) | `D1` or `D2` for debug-instrumented archives. |
 | `HEX_SDK_PROTECTION` | (unset) | `PLNONE` or `PLSPACE` (space-partitioning enable). |
+| `HEX_SDK_BOARD` | sniffed | Board package under `include/board/`, e.g. `MCP_P3L`. Sniffed from the upload (`P3L`, `ZC702`, …). Adds that directory and `core_0/` to `-I` so `<L1_CoreSP.h>` resolves. |
 
-Discovery order: `HEX_SDK_DIR` → sibling of repo root → child of repo root → `~/HEX2/VirtuosoNext` / `~/VirtuosoNext` / `/opt/VirtuosoNext` / `/opt/hex-sdk` / `/usr/local/VirtuosoNext`. See `docs/sandbox/debugging.md` for how the discovery result flows through the build.
+Discovery order: `HEX_SDK_DIR` → sibling or child of the uploaded repo → any ancestor of that repo (so `workspace/sessions/<id>/repo_contents` still finds a `VisualDesigner-HEX-*` next to the git checkout) → `~/HEX2/VirtuosoNext` / `~/VirtuosoNext` / `/opt/VirtuosoNext` / `/opt/hex-sdk` / `/usr/local/VirtuosoNext`.
+
+`scripts/serve_web.sh` bind-mounts a host SDK at `/opt/hex-sdk` and sets `HEX_SDK_DIR` for the container. The image does not contain the SDK.
+
+On Linux the default platform is `arm-cortex-a9` (then `posix32`) rather than `win64`, because the win64 headers include `windows.h`. An uploaded tree that mentions `bsp/zynq` or `ARM_CORTEX_A9` selects `arm-cortex-a9` even when the Makefile does not name a cross-compiler. Set `HEX_SDK_PLATFORM` to override.
+
+See `docs/sandbox/debugging.md` for how the discovery result flows through the build.
 
 ## In-app constants (not env)
 

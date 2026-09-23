@@ -63,11 +63,17 @@ try:
     from api.hex_sdk import (  # noqa: F401  (re-exported for tests)
         HexSdkContext,
         discover as _discover_hex_sdk_raw,
+        find_sdk_header as _find_sdk_header,
+        render_generated_header as _render_generated_header,
+        upload_needs_hex_sdk as _upload_needs_hex_sdk,
     )
 except ImportError:  # flat layout (uvicorn app:app)
     from hex_sdk import (  # type: ignore[no-redef]
         HexSdkContext,
         discover as _discover_hex_sdk_raw,
+        find_sdk_header as _find_sdk_header,
+        render_generated_header as _render_generated_header,
+        upload_needs_hex_sdk as _upload_needs_hex_sdk,
     )
 
 
@@ -84,11 +90,17 @@ def _discover_hex_sdk(
     extras: list[Path] = []
     if repo_dir and repo_dir.exists():
         extras.append(repo_dir)
-    return _discover_hex_sdk_raw(
+    ctx = _discover_hex_sdk_raw(
         repo_root=repo_dir,
         extra_search_dirs=tuple(extras),
         cross_hint=cross_hint,
     )
+    # A SDK installed for the whole machine must not retarget an
+    # unrelated native compile. HEX sources mention L1_api.h / the
+    # Zynq BSP; everything else keeps the previous toolchain.
+    if ctx is not None and repo_dir is not None and not _upload_needs_hex_sdk(repo_dir):
+        return None
+    return ctx
 
 _HEADER_EXTS = {'.h', '.hpp', '.hh', '.hxx'}
 _SOURCE_EXTS = {'.c', '.cpp', '.cc', '.cxx'}
@@ -374,6 +386,74 @@ def _quoted_includes_in_dir(directory: Path) -> set[str]:
 _QUOTED_INCLUDE_RE = re.compile(
     r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE,
 )
+_ANGLE_INCLUDE_RE = re.compile(
+    r'^\s*#\s*include\s*<([^>]+)>', re.MULTILINE,
+)
+_LIBC_ANGLE_SKIP = {
+    "assert.h", "ctype.h", "errno.h", "float.h", "limits.h", "math.h",
+    "setjmp.h", "signal.h", "stdarg.h", "stddef.h", "stdint.h", "stdio.h",
+    "stdlib.h", "string.h", "time.h", "wchar.h", "wctype.h", "stdbool.h",
+    "windows.h",
+}
+
+
+def _angle_includes_in_tree(directory: Optional[Path], *, max_files: int = 2500) -> set[str]:
+    """Non-libc ``#include <...>`` paths under *directory*."""
+    out: set[str] = set()
+    if directory is None or not directory.exists():
+        return out
+    seen = 0
+    try:
+        for fp in directory.rglob("*"):
+            if not fp.is_file() or fp.suffix.lower() not in (_HEADER_EXTS | _SOURCE_EXTS):
+                continue
+            seen += 1
+            if seen > max_files:
+                break
+            try:
+                text = fp.read_text(errors="replace")
+            except OSError:
+                continue
+            for m in _ANGLE_INCLUDE_RE.finditer(text):
+                rel = m.group(1).strip().replace("\\", "/")
+                if not rel or Path(rel).name.lower() in _LIBC_ANGLE_SKIP:
+                    continue
+                out.add(rel)
+    except OSError:
+        return out
+    return out
+
+
+def _header_already_on_path(rel: str, include_dirs: list[Path]) -> bool:
+    parts = rel.split("/")
+    for d in include_dirs:
+        cand = d.joinpath(*parts)
+        try:
+            if cand.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _materialise_header_shim(shim_dir: Path, rel: str, target: Path) -> Path | None:
+    """Symlink (or copy) *target* into *shim_dir* under the requested name."""
+    try:
+        shim_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    shim_path = shim_dir.joinpath(*rel.split("/"))
+    try:
+        shim_path.parent.mkdir(parents=True, exist_ok=True)
+        if shim_path.is_symlink() or shim_path.exists():
+            shim_path.unlink()
+        try:
+            shim_path.symlink_to(target.resolve())
+        except OSError:
+            shim_path.write_bytes(target.read_bytes())
+    except OSError:
+        return None
+    return shim_path
 
 
 def _collect_include_dirs(*roots: Optional[Path]) -> list[Path]:
@@ -954,6 +1034,48 @@ def run_per_file_compile(
             if d.resolve() not in include_dirs:
                 include_dirs.append(d.resolve())
         hex_extra_flags = list(hex_sdk.defines)
+        # Angle-bracket headers that are not at the SDK include root
+        # (board/MCP_P3L/core_0/L1_CoreSP.h) or that differ in case
+        # (L1_soCSP.h vs L1_SoCSP.h) still fail with "No such file"
+        # even after the root -I is added. Resolve them against the
+        # SDK tree and, for the two Visual Designer outputs that are
+        # not in the SDK at all, drop a stand-in into the shim dir.
+        angle_needs = _angle_includes_in_tree(gen_dir)
+        if has_repo and repo_dir and repo_dir.exists():
+            angle_needs |= _angle_includes_in_tree(repo_dir)
+        for rel in sorted(angle_needs):
+            if _header_already_on_path(rel, include_dirs):
+                continue
+            found = _find_sdk_header(hex_sdk, rel)
+            if found is not None and found.name == Path(rel).name:
+                root = found
+                for _seg in rel.split("/"):
+                    root = root.parent
+                resolved = root.resolve()
+                if resolved not in include_dirs:
+                    include_dirs.append(resolved)
+                continue
+            if found is not None:
+                shimmed = _materialise_header_shim(shim_dir, rel, found)
+                if shimmed is not None:
+                    s = shim_dir.resolve()
+                    if s not in include_dirs:
+                        include_dirs.append(s)
+                continue
+            body = _render_generated_header(
+                rel, [p for p in (repo_dir, gen_dir) if p is not None],
+            )
+            if not body:
+                continue
+            try:
+                shim_dir.mkdir(parents=True, exist_ok=True)
+                dest = shim_dir / Path(rel).name
+                dest.write_text(body)
+            except OSError:
+                continue
+            s = shim_dir.resolve()
+            if s not in include_dirs:
+                include_dirs.append(s)
 
     n_found = sum(
         1 for r in resolutions.values()

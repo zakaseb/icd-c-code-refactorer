@@ -72,7 +72,7 @@ When enabled, local docker sandbox is skipped in favour of remote host settings:
 
 ## HEX / VirtuosoNext RTOS SDK injection
 
-`_sandbox_build_iterate` in `api/app.py` calls `hex_sdk.discover(...)` at the top of each run. When a `VisualDesigner-HEX-*` tree is located (via `HEX_SDK_DIR`, sibling of the repo, or a common install location — see [Configuration → HEX / VirtuosoNext RTOS SDK](../building/configuration.md#hex--virtuosonext-rtos-sdk)) three things happen:
+`_sandbox_build_iterate` in `api/app.py` calls `hex_sdk.discover(...)` at the top of each run. When a `VisualDesigner-HEX-*` tree is located (via `HEX_SDK_DIR`, an ancestor of the uploaded session, or `/opt/hex-sdk` — see [Configuration → HEX / VirtuosoNext RTOS SDK](../building/configuration.md#hex--virtuosonext-rtos-sdk)) three things happen:
 
 1. **Cross-compiler upgrade** — if the SDK targets an arch that needs a cross-compiler (e.g. `arm-cortex-a9` → `arm-none-eabi-gcc`) and that toolchain is on `$PATH`, `sandbox_cc` is upgraded from `gcc` to the cross-compiler even when the user's `Makefile` doesn't declare it. `_detect_cross_compiler` also parses HEX `environment.mk` / `PROJECT_GEN` values as a fallback.
 2. **Compile-time flag injection** — `_run_sandbox_build` prepends the SDK's `-I<targets/<platform>/include>` and `-D<PLATFORM>` / `-DVIRTUOSO_NEXT` / `-DVN_*` defines to `CFLAGS` (make) or `CMAKE_C_FLAGS` (cmake). The compile-gate (`api/per_file_compile.py`) adds the same flags via its `extra_flags` argument, so a `#include <L1_api.h>` in a generated file resolves in step 3.5 just as it does in the full sandbox build.

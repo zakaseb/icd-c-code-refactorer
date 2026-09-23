@@ -38,12 +38,18 @@ one of these locations, in priority order:
        layout).
     3. A ``VisualDesigner-HEX-*`` folder inside the current uploaded
        repository (for users who bundle the SDK with their code).
-    4. When invoked without ``repo_root`` (typical CLI one-liner):
+    4. Any SDK folder sitting next to an ancestor of ``repo_root``
+       (the uploaded session lives under ``workspace/sessions/<id>/``,
+       several levels below the checkout that actually contains
+       ``VisualDesigner-HEX-*``).
+    5. When invoked without ``repo_root`` (typical CLI one-liner):
        the current working directory, any SDK folder inside it, and
        any SDK folder in its parent.
-    5. A user-installed copy under
+    6. A user-installed copy under
        ``~/HEX2/VirtuosoNext`` /
        ``~/VirtuosoNext`` / ``/opt/hex-sdk`` / ``/opt/VirtuosoNext``.
+       ``scripts/serve_web.sh`` bind-mounts a host SDK at
+       ``/opt/hex-sdk`` so the container hits this last step.
 
 Set ``HEX_SDK_DISABLE=1`` to skip discovery entirely.
 
@@ -93,6 +99,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -316,6 +323,8 @@ class HexSdkContext:
     sdk_root: Path
     version: str
     platform: str
+    board: str              # e.g. "MCP_P3L" or "" when the sources
+                            #   do not name a board support package
     variant: str            # "SP" or "MP"
     compiler_opts: str      # "CO0" | "CO3" | "COs" | ""
     debug_opts: str         # "" | "D1" | "D2"
@@ -400,6 +409,23 @@ def _looks_like_sdk_root(path: Path) -> bool:
         return False
 
 
+def _scan_dir_for_sdk(directory: Path, _push) -> None:
+    """Push *directory* and its immediate children when they look like
+    an SDK checkout (dirname match only — the caller still validates
+    the RTOS.cmake marker).
+    """
+    try:
+        if not directory.is_dir():
+            return
+        if _matches_sdk_dirname(directory.name):
+            _push(directory)
+        for child in directory.iterdir():
+            if child.is_dir() and _matches_sdk_dirname(child.name):
+                _push(child)
+    except OSError:
+        return
+
+
 def _candidate_roots(
     *,
     repo_root: Path | None,
@@ -441,6 +467,26 @@ def _candidate_roots(
                     _push(child)
         except OSError:
             pass
+        # The uploaded project lives at
+        # workspace/sessions/<id>/repo_contents — several levels below
+        # the checkout that holds VisualDesigner-HEX-*. Walk ancestors
+        # so a session path still finds that sibling SDK. Stop before
+        # the filesystem root; /opt is covered explicitly below.
+        try:
+            cur = repo_root.resolve()
+        except OSError:
+            cur = repo_root
+        for _ in range(8):
+            parent = cur.parent
+            if parent == cur:
+                break
+            # Path(".").anchor is "" and Path("") == Path("."), so a
+            # relative walk would stop before scanning the project
+            # directory. Only an absolute filesystem root is a stop.
+            if parent.is_absolute() and parent == Path(parent.anchor):
+                break
+            _scan_dir_for_sdk(parent, _push)
+            cur = parent
 
     for extra in extra_search_dirs:
         try:
@@ -523,16 +569,130 @@ def _list_platforms(sdk_root: Path) -> list[str]:
     return out
 
 
+def _default_platform_order(host_system: str) -> tuple[str, ...]:
+    """Platforms to try when nothing was requested explicitly.
+
+    The win64 SDK headers ``#include <windows.h>``. On a Linux container
+    that include never resolves, so preferring win64 (the old default)
+    turned every HEX compile into a fatal error one header later. Linux
+    and macOS sandboxes therefore prefer the ARM / POSIX targets the
+    image can actually compile (``arm-none-eabi-gcc`` is installed in
+    the project Docker image).
+    """
+    if host_system.startswith("win"):
+        return ("win64", "win32", "arm-cortex-a9", "arm-cortex-a8", "posix32")
+    return ("arm-cortex-a9", "arm-cortex-a8", "posix32", "win64", "win32")
+
+
+# Substrings in uploaded C/headers that name the HEX platform. First
+# match wins. Kept narrow on purpose: a stray "win64" comment must not
+# override a Zynq BSP include.
+_SOURCE_PLATFORM_MARKERS: tuple[tuple[str, str], ...] = (
+    ("bsp/zynq", "arm-cortex-a9"),
+    ("ARM_CORTEX_A9", "arm-cortex-a9"),
+    ("arm-cortex-a9", "arm-cortex-a9"),
+    ("ARM_CORTEX_A8", "arm-cortex-a8"),
+    ("arm-cortex-a8", "arm-cortex-a8"),
+    ("ARM_CORTEX_M7", "arm-cortex-m7"),
+    ("ARM_CORTEX_M4", "arm-cortex-m4f"),
+    ("ARM_CORTEX_M3", "arm-cortex-m3"),
+)
+
+
+# Longer / more specific tokens first. "P3L" is the product name used
+# in HALCON MCP ESS sources; the matching BSP directory is MCP_P3L.
+_SOURCE_BOARD_MARKERS: tuple[tuple[str, str], ...] = (
+    ("MCP_P3L", "MCP_P3L"),
+    ("P3L", "MCP_P3L"),
+    ("MCP_P3", "MCP_P3"),
+    ("MCP_P5", "MCP_P5"),
+    ("MCP_SL", "MCP_SL"),
+    ("IOP_P5", "IOP_P5"),
+    ("ZC702", "ZC702"),
+)
+
+
+def _infer_platform_from_sources(
+    root: Path | None, *, max_files: int = 2500,
+) -> tuple[str | None, str | None, bool]:
+    """Return ``(platform, board, mentions_hex)`` from the uploaded sources.
+
+    Platform and board may be None. ``mentions_hex`` is true when the
+    tree includes an RTOS header (``L1_api.h`` and friends) or a known
+    platform/board marker. Walks until platform and board are both
+    known, or the file cap is hit. Skips VCS junk and nested SDK trees.
+    """
+    if root is None or not root.is_dir():
+        return None, None, False
+    seen = 0
+    platform: str | None = None
+    board: str | None = None
+    mentions = False
+    skip_dirs = {
+        ".git", "node_modules", "__pycache__", ".venv", "workspace",
+        "models",
+    }
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in skip_dirs and not _matches_sdk_dirname(d)
+            ]
+            for fn in filenames:
+                if not fn.endswith((".c", ".h", ".hpp", ".hh", ".mk", ".cmake", ".txt")):
+                    continue
+                seen += 1
+                if seen > max_files:
+                    return platform, board, mentions
+                path = Path(dirpath) / fn
+                try:
+                    with path.open("r", errors="ignore") as fh:
+                        chunk = fh.read(65536)
+                except OSError:
+                    continue
+                if ("L1_api.h" in chunk or "L1_types.h" in chunk
+                        or "L1_CoreSP.h" in chunk or "VIRTUOSO_NEXT" in chunk):
+                    mentions = True
+                if platform is None:
+                    for needle, plat in _SOURCE_PLATFORM_MARKERS:
+                        if needle in chunk:
+                            platform = plat
+                            mentions = True
+                            break
+                if board is None:
+                    for needle, brd in _SOURCE_BOARD_MARKERS:
+                        if needle in chunk:
+                            board = brd
+                            mentions = True
+                            break
+                if platform and board:
+                    return platform, board, True
+    except OSError:
+        return platform, board, mentions
+    return platform, board, mentions
+
+
+def upload_needs_hex_sdk(root: Path | None) -> bool:
+    """True when *root* looks like HEX / VirtuosoNext application code.
+
+    Used so a machine-wide SDK (``HEX_SDK_DIR`` / ``/opt/hex-sdk``) is
+    not injected into an unrelated native compile.
+    """
+    _plat, _board, mentions = _infer_platform_from_sources(root)
+    return mentions
+
+
 def _pick_platform(
     requested: str | None,
     available: Sequence[str],
     *,
     cross_hint: str | None,
+    host_system: str | None = None,
 ) -> str | None:
     """Choose a platform key from *available*.
 
-    Priority: explicit request → cross-compiler hint match → win64 (if
-    available) → arm-cortex-a9 (if available) → the first available.
+    Priority: explicit request → cross-compiler hint match → host
+    default order (ARM/POSIX before win64 on Linux).
     """
     if requested:
         for a in available:
@@ -558,7 +718,8 @@ def _pick_platform(
             for a in available:
                 if a.startswith("powerpc"):
                     return a
-    for pref in ("win64", "arm-cortex-a9", "arm-cortex-a8", "posix32"):
+    host = host_system if host_system is not None else sys.platform
+    for pref in _default_platform_order(host):
         if pref in available:
             return pref
     return available[0] if available else None
@@ -688,20 +849,27 @@ def _lib_link_flags(lib_dir: Path, archives: Iterable[str]) -> list[str]:
     return args
 
 
-def _include_dirs(platform_dir: Path) -> list[Path]:
+def _include_dirs(platform_dir: Path, board: str | None = None) -> list[Path]:
     """Return the ordered ``-I`` list.
 
-    Order matters: the platform's top-level ``include/`` is added first
-    so ``#include <L1_api.h>`` and ``#include <kernel/L1_kernel_api.h>``
-    resolve unambiguously.  Subfolders like ``kernel/hubs/`` do NOT need
-    to be on the -I path individually — GCC resolves the nested path
-    from the parent include root.  We keep the walk shallow (depth 1)
-    so the header resolver doesn't blow past ``ARG_MAX``.
+    The platform ``include/`` comes first so ``#include <L1_api.h>`` and
+    ``#include <kernel/...>`` / ``#include <bsp/...>`` resolve. Board
+    packages ship a few headers (``L1_CoreSP.h``, ``L1_SoCSP.h``) that
+    projects include by basename, so the matching ``board/<name>/`` and
+    ``board/<name>/core_0/`` directories are appended when *board* is
+    known.
     """
     include = platform_dir / "include"
     if not include.is_dir():
         return []
     out = [include]
+    if board:
+        board_dir = include / "board" / board
+        core = board_dir / "core_0"
+        if core.is_dir():
+            out.append(core)
+        if board_dir.is_dir():
+            out.append(board_dir)
     return out
 
 
@@ -761,9 +929,16 @@ def discover(
         if not available:
             continue
 
+        # Uploaded sources that pull in the Zynq BSP (or name a
+        # platform outright) outrank the host default. An explicit
+        # HEX_SDK_PLATFORM / platform_override still wins.
+        sniffed_platform, sniffed_board, _mentions_hex = (
+            _infer_platform_from_sources(repo_root)
+        )
         req_plat = (
             platform_override
             or os.environ.get("HEX_SDK_PLATFORM", "").strip()
+            or sniffed_platform
             or None
         )
         platform = _pick_platform(
@@ -823,7 +998,12 @@ def discover(
         else:
             prot = ""
 
-        include_dirs = tuple(_include_dirs(platform_dir))
+        board = (
+            os.environ.get("HEX_SDK_BOARD", "").strip()
+            or sniffed_board
+            or ""
+        )
+        include_dirs = tuple(_include_dirs(platform_dir, board or None))
         lib_dir = platform_dir / "lib"
         defines_l = list(_COMMON_DEFINES) + _read_platform_defines(platform)
         if variant == "MP":
@@ -850,6 +1030,7 @@ def discover(
             sdk_root=candidate,
             version=_extract_version_from_dirname(candidate.name),
             platform=platform,
+            board=board,
             variant=variant,
             compiler_opts=co_norm,
             debug_opts=dbg,
@@ -901,6 +1082,7 @@ def discover_cached(
 
 def clear_cache() -> None:
     discover_cached.cache_clear()
+    _header_name_index.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -979,6 +1161,130 @@ def render_llm_context(ctx: HexSdkContext | None, *, max_chars: int = 6000) -> s
             if remaining <= 500:
                 break
     return "\n".join(lines)
+
+
+_LIBC_ANGLE_HEADERS = {
+    "assert.h", "ctype.h", "errno.h", "float.h", "limits.h", "math.h",
+    "setjmp.h", "signal.h", "stdarg.h", "stddef.h", "stdint.h", "stdio.h",
+    "stdlib.h", "string.h", "time.h", "wchar.h", "wctype.h", "stdbool.h",
+    "windows.h",
+}
+
+_HUB_TOKEN_RE = re.compile(r"\bHUB_[A-Z][A-Z0-9_]*\b")
+
+
+@lru_cache(maxsize=4)
+def _header_name_index(include_root_s: str) -> dict[str, tuple[str, ...]]:
+    """Map lower-case header basenames to every path under the SDK include tree."""
+    root = Path(include_root_s)
+    acc: dict[str, list[str]] = {}
+    if not root.is_dir():
+        return {}
+    try:
+        for p in root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in {".h", ".hpp", ".hh"}:
+                continue
+            acc.setdefault(p.name.lower(), []).append(str(p))
+    except OSError:
+        return {}
+    return {k: tuple(v) for k, v in acc.items()}
+
+
+def find_sdk_header(ctx: HexSdkContext, requested: str) -> Path | None:
+    """Locate *requested* (an ``#include <...>`` path) under the SDK.
+
+    Prefers an exact relative path, then a case-insensitive basename
+    match. When several copies exist (one per board), the context's
+    ``board`` and ``core_0`` win.
+    """
+    include = ctx.platform_dir / "include"
+    rel = requested.replace("\\", "/").lstrip("/")
+    if not rel or Path(rel).name.lower() in _LIBC_ANGLE_HEADERS:
+        return None
+    exact = include / rel
+    try:
+        if exact.is_file():
+            return exact
+    except OSError:
+        return None
+    leaf = Path(rel).name.lower()
+    raw = _header_name_index(str(include)).get(leaf, ())
+    if not raw:
+        return None
+    cands = [Path(p) for p in raw]
+    if ctx.board:
+        marker = f"{os.sep}board{os.sep}{ctx.board}{os.sep}"
+        preferred = [p for p in cands if marker in str(p)]
+        if preferred:
+            cands = preferred
+    cands.sort(key=lambda p: (
+        "core_1" in p.parts,
+        "core_0" not in p.parts and any(part.startswith("core_") for part in p.parts),
+        len(p.parts),
+        str(p),
+    ))
+    return cands[0]
+
+
+def render_generated_header(
+    name: str, source_roots: Sequence[Path],
+) -> str | None:
+    """Body for a Visual Designer header the upload did not contain.
+
+    ``L1_nodes_data.h`` / ``L1_node_config.h`` are emitted by the HEX
+    project generator from the ``.ove`` model. They are not part of the
+    SDK. Without them ``fw.h`` dies on the include before the compiler
+    ever looks at the generated ``.c``. The stand-in defines every
+    ``HUB_*`` token the uploaded sources mention so those names type-check.
+    Real hub ids are only known to the missing model; the placeholders
+    are zero.
+    """
+    leaf = Path(name.replace("\\", "/")).name.lower()
+    if leaf == "l1_node_config.h":
+        return (
+            "#ifndef L1_NODE_CONFIG_H\n"
+            "#define L1_NODE_CONFIG_H\n"
+            "/* Stand-in: the Visual Designer node config was not in the upload. */\n"
+            "#define L1_NODE_NUMBER_OF_TASKS 1\n"
+            "#define L1_NODE_NUMBER_OF_HUBS 1\n"
+            "#include \"L1_nodes_data.h\"\n"
+            "#include <L1_api.h>\n"
+            "#endif\n"
+        )
+    if leaf != "l1_nodes_data.h":
+        return None
+    hubs: set[str] = set()
+    seen = 0
+    for root in source_roots:
+        if root is None or not root.is_dir():
+            continue
+        try:
+            files = list(root.rglob("*"))
+        except OSError:
+            continue
+        for path in files:
+            if not path.is_file() or path.suffix.lower() not in {".c", ".h", ".hpp"}:
+                continue
+            seen += 1
+            if seen > 4000:
+                break
+            try:
+                text = path.read_text(errors="ignore")
+            except OSError:
+                continue
+            hubs.update(_HUB_TOKEN_RE.findall(text))
+    lines = [
+        "#ifndef L1_NODES_DATA_H",
+        "#define L1_NODES_DATA_H",
+        "#include <L1_types.h>",
+        "/* Stand-in: Visual Designer did not ship L1_nodes_data.h with this tree.",
+        "   HUB_* tokens seen in the upload are defined as 0 so the compile gate",
+        "   can type-check call sites. They are not the real hub ids. */",
+    ]
+    for hub in sorted(hubs):
+        lines.append(f"#define {hub} 0")
+    lines.append("#endif")
+    return "\n".join(lines) + "\n"
 
 
 def augment_toxic_allowlist(ctx: HexSdkContext | None) -> tuple[Path, ...]:

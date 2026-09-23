@@ -55,6 +55,7 @@ try:
         discover as _discover_hex_sdk_raw,
         render_llm_context as _render_hex_sdk_llm_context,
         format_summary as _format_hex_sdk_summary,
+        upload_needs_hex_sdk as _upload_needs_hex_sdk,
     )
 except ImportError:  # flat layout
     from hex_sdk import (  # type: ignore[no-redef]
@@ -62,6 +63,7 @@ except ImportError:  # flat layout
         discover as _discover_hex_sdk_raw,
         render_llm_context as _render_hex_sdk_llm_context,
         format_summary as _format_hex_sdk_summary,
+        upload_needs_hex_sdk as _upload_needs_hex_sdk,
     )
 
 
@@ -76,11 +78,14 @@ def _discover_hex_sdk(
     extras: list[Path] = []
     if repo_dir and repo_dir.exists():
         extras.append(repo_dir)
-    return _discover_hex_sdk_raw(
+    ctx = _discover_hex_sdk_raw(
         repo_root=repo_dir,
         extra_search_dirs=tuple(extras),
         cross_hint=cross_hint,
     )
+    if ctx is not None and repo_dir is not None and not _upload_needs_hex_sdk(repo_dir):
+        return None
+    return ctx
 
 app = FastAPI(title="ICD C Code Refactorer", docs_url=None, redoc_url=None)
 

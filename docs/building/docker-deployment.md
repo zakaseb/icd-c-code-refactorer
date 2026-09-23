@@ -34,6 +34,7 @@ Ubuntu’s system Python is **externally managed** (PEP 668). The Dockerfile the
 3. Reserves host CPU cores for the OS (`LLAMA_THREADS = nproc - 2`).
 4. Checks NVIDIA “GPU Recovery Action: Reboot” and runs a CUDA preflight (`llama-server --list-devices`) with retries.
 5. Starts the container with GPU device 0, mounting `models/` and `workspace/`.
+6. If a HEX SDK is present (`HEX_SDK_DIR`, or `VisualDesigner-HEX-*` / `VirtuosoNext*` / `HEX-*` next to the repo), bind-mounts it read-only at `/opt/hex-sdk` and sets `HEX_SDK_DIR`. The compile gate and sandbox build need that tree for `#include <L1_api.h>`. Restart `serve_web.sh` after adding the SDK; the image itself does not contain it.
 
 Related scripts:
 

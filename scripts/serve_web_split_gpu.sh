@@ -86,11 +86,15 @@ echo "Starting CPU-only container ($WEB_CONTAINER) for LiteLLM + web UI..."
 echo "Once ready, open http://localhost:$WEB_PORT in your browser."
 docker rm -f "$WEB_CONTAINER" >/dev/null 2>&1 || true
 
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/hex_sdk_mount.sh"
+
 # Explicitly hide GPUs from this container so its processes never create CUDA contexts.
 docker run -ti --rm --name "$WEB_CONTAINER" --network=host \
   -e CUDA_VISIBLE_DEVICES= \
   -e NVIDIA_VISIBLE_DEVICES=void \
   -e NVIDIA_DRIVER_CAPABILITIES= \
+  $HEX_DOCKER_ARGS \
   -v "$PROJECT_ROOT/workspace":/home/developer/workspace \
   --entrypoint /bin/bash \
   "$IMAGE" -lc '

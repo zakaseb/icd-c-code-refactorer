@@ -116,11 +116,15 @@ if [ "$GPU_OK" -ne 1 ]; then
   GPU_ENV_ARGS="-e LLAMA_ARG_N_GPU_LAYERS=0"
 fi
 
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/hex_sdk_mount.sh"
+
 docker run -ti --rm --name icd-c-code-refactorer --network=host $GPU_DOCKER_ARGS \
   -e LLAMA_ARG_THREADS="$LLAMA_THREADS" \
   -e LLAMA_ARG_CTX_SIZE=49152 \
   -e LLAMA_ARG_N_PREDICT=49152 \
   $GPU_ENV_ARGS \
+  $HEX_DOCKER_ARGS \
   -v "$PROJECT_ROOT/models":/home/developer/models \
   -v "$PROJECT_ROOT/workspace":/home/developer/workspace \
   icd-c-code-refactorer:llama.cpp

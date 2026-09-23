@@ -382,8 +382,27 @@ plat = _pick_platform(
     None,
     ("win64", "posix32"),
     cross_hint=None,
+    host_system="linux",
 )
-check("no hint -> win64 preferred", plat == "win64", f"got {plat}")
+check("linux host prefers posix32 over win64 (win64 needs windows.h)",
+      plat == "posix32", f"got {plat}")
+
+plat = _pick_platform(
+    None,
+    ("win64", "arm-cortex-a9"),
+    cross_hint=None,
+    host_system="linux",
+)
+check("linux host prefers arm-cortex-a9 over win64",
+      plat == "arm-cortex-a9", f"got {plat}")
+
+plat = _pick_platform(
+    None,
+    ("win64", "arm-cortex-a9"),
+    cross_hint=None,
+    host_system="win32",
+)
+check("windows host prefers win64", plat == "win64", f"got {plat}")
 
 plat = _pick_platform(
     "posix32",
@@ -436,6 +455,9 @@ with tempfile.TemporaryDirectory() as _td:
     repo = tmp / "repo_contents"
     repo.mkdir()
     fake = _make_fake_sdk(tmp)   # tmp/VisualDesigner-HEX-1.2.18.8
+    # The app wrapper ignores an SDK when the upload does not look
+    # like HEX code, so unrelated native projects stay on host gcc.
+    (repo / "fw.h").write_text("#include <L1_api.h>\n")
     hex_sdk.clear_cache()
     ctx = app._discover_hex_sdk(repo_dir=repo, cross_hint=None)
     check("app-level discovery finds sibling SDK",
@@ -443,6 +465,37 @@ with tempfile.TemporaryDirectory() as _td:
           f"ctx={ctx}")
 
 # ---------------------------------------------------------------
+print("\n=== Test 14: session-nested repo still finds the sibling SDK ===")
+# REGRESSION: the compile gate passes repo_root =
+# workspace/sessions/<id>/repo_contents. The SDK lives next to the
+# git checkout, several directories above that. Discovery used to
+# look only at the session folder and returned None, so the UI
+# compiled with native gcc and died on `#include <L1_api.h>`.
+with tempfile.TemporaryDirectory() as _td:
+    _reset_env()
+    tmp = Path(_td)
+    fake = _make_fake_sdk(tmp)
+    nested = tmp / "workspace" / "sessions" / "abc" / "repo_contents"
+    nested.mkdir(parents=True)
+    (nested / "fw.h").write_text(
+        '#include <bsp/zynq/gpiops/gpiops.h>\n'
+        '/* Product: P3L Light MCP */\n'
+    )
+    ctx = discover(repo_root=nested, cross_hint="gcc")
+    check("nested session repo finds ancestor SDK",
+          ctx is not None and ctx.sdk_root == fake.resolve(),
+          f"ctx={ctx}")
+    if ctx is not None:
+        check("zynq include sniffs arm-cortex-a9 (not win64)",
+              ctx.platform == "arm-cortex-a9",
+              f"platform={ctx.platform}")
+        check("arm platform is marked cross",
+              ctx.is_cross and ctx.cc_hint == "arm-none-eabi-gcc",
+              f"is_cross={ctx.is_cross} cc={ctx.cc_hint}")
+        check("P3L product selects the MCP_P3L board package",
+              ctx.board == "MCP_P3L",
+              f"board={ctx.board}")
+
 print("\n=== Test 13: _detect_cross_compiler recognises HEX env.mk ===")
 _reset_env()
 with tempfile.TemporaryDirectory() as _td:
