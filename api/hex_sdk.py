@@ -1171,6 +1171,7 @@ _LIBC_ANGLE_HEADERS = {
 }
 
 _HUB_TOKEN_RE = re.compile(r"\bHUB_[A-Z][A-Z0-9_]*\b")
+_FIFO_TOKEN_RE = re.compile(r"\bFIFO_[A-Z][A-Z0-9_]*\b")
 
 
 @lru_cache(maxsize=4)
@@ -1235,9 +1236,9 @@ def render_generated_header(
     project generator from the ``.ove`` model. They are not part of the
     SDK. Without them ``fw.h`` dies on the include before the compiler
     ever looks at the generated ``.c``. The stand-in defines every
-    ``HUB_*`` token the uploaded sources mention so those names type-check.
-    Real hub ids are only known to the missing model; the placeholders
-    are zero.
+    ``HUB_*`` and ``FIFO_*`` token the uploaded sources mention so those
+    names type-check. Real hub and FIFO ids are only known to the missing
+    model; the placeholders are zero.
     """
     leaf = Path(name.replace("\\", "/")).name.lower()
     if leaf == "l1_node_config.h":
@@ -1254,6 +1255,7 @@ def render_generated_header(
     if leaf != "l1_nodes_data.h":
         return None
     hubs: set[str] = set()
+    fifos: set[str] = set()
     seen = 0
     for root in source_roots:
         if root is None or not root.is_dir():
@@ -1273,16 +1275,19 @@ def render_generated_header(
             except OSError:
                 continue
             hubs.update(_HUB_TOKEN_RE.findall(text))
+            fifos.update(_FIFO_TOKEN_RE.findall(text))
     lines = [
         "#ifndef L1_NODES_DATA_H",
         "#define L1_NODES_DATA_H",
         "#include <L1_types.h>",
         "/* Stand-in: Visual Designer did not ship L1_nodes_data.h with this tree.",
-        "   HUB_* tokens seen in the upload are defined as 0 so the compile gate",
-        "   can type-check call sites. They are not the real hub ids. */",
+        "   HUB_* and FIFO_* tokens seen in the upload are defined as 0 so the",
+        "   compile gate can type-check call sites. They are not the real ids. */",
     ]
     for hub in sorted(hubs):
         lines.append(f"#define {hub} 0")
+    for fifo in sorted(fifos):
+        lines.append(f"#define {fifo} 0")
     lines.append("#endif")
     return "\n".join(lines) + "\n"
 

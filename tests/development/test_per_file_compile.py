@@ -92,6 +92,8 @@ from per_file_compile import (  # noqa: E402
     _index_repo_headers,
     _resolve_quoted_includes_in_repo,
     _quoted_includes_in_dir,
+    _attribute_block_to_original_script,
+    preserve_original_script_names,
 )
 
 client = TestClient(app.app)
@@ -1858,6 +1860,67 @@ with tempfile.TemporaryDirectory() as tmpd:
     check("end-to-end prod scenario: RawData field declared",
           "RawData" in h_after)
 
+
+# ---------------------------------------------------------------
+print("\n=== Test 27: generated scripts keep the original peripheral name ===")
+_orig_c = """\
+#include <fw.h>
+#include <plImu20msg.h>
+/* Publication: EV_IMU_RDY (on start-up) */
+static const EVhandlerEntry_ts evLut[] =
+{
+    { EV_WPN_IMU_TYPE, wpnImuTypeHandler },
+};
+void prxyImu(void)
+{
+    while (RC_OK == L1_DequeueFifo_W(FIFO_PRXY_IMU))
+    {
+    }
+}
+"""
+_gen_c = """\
+#include <fw.h>
+#include <plImu15Msg.h>
+static const EVhandlerEntry_ts evLut[] =
+{
+    { EV_WPN_IMU_TYPE, wpnImuTypeHandler },
+    { EV_IMU_RDY,      imuRdyHandler },
+};
+static bool_t imuRdyHandler(EVENT_t ev)
+{
+    EVENT_publish(EV_IMU15_RDY, NULL, 0);
+    return TRUE;
+}
+void prxyImu(void)
+{
+    while (RC_OK == L1_DequeueFifo_W(FIFO_PRXY_IMU))
+    {
+    }
+}
+"""
+_kept = preserve_original_script_names(_orig_c, _gen_c)
+check("include keeps plImu20msg.h", "#include <plImu20msg.h>" in _kept and "plImu15Msg.h" not in _kept)
+check("FIFO_PRXY_IMU is not renamed", "FIFO_PRXY_IMU" in _kept)
+check("EV_IMU15_RDY is not introduced as code", "EV_IMU15_RDY" not in _kept)
+check("renamed event is not promoted into the lookup table",
+      "EV_IMU_RDY" not in _kept.split("evLut", 1)[-1])
+check("uint widths are left alone",
+      preserve_original_script_names("uint16_t x;\n", "uint32_t x;\n") == "uint32_t x;\n")
+check("trailing impact manifest is not left in the script",
+      "IMPACT-MANIFEST" not in preserve_original_script_names(
+          "int x;\n", "int x;\nIMPACT-MANIFEST: {}\n",
+      ))
+check("same-stem .h block is attributed to the .c under repair",
+      _attribute_block_to_original_script("prxyImu.h", {"prxyImu.c"}) == "prxyImu.c")
+check("peripheral-renamed header is attributed to the original header",
+      _attribute_block_to_original_script("plImu15Msg.h", {"plImu20Msg.h"}) == "plImu20Msg.h")
+_folded = app._fold_variation_headers(
+    "plImu20Msg.h",
+    {"plImu15Msg.h": "#ifndef A\n#define A\n#endif\n",
+     "plImu20Msg_High.h": "#ifndef B\n#define B\n#endif\n"},
+)
+check("variant headers are folded into the original filename",
+      list(_folded) == ["plImu20Msg.h"] and "plImu15Msg.h" not in _folded["plImu20Msg.h"][:80])
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")

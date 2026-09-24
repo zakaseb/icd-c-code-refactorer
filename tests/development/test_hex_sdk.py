@@ -68,6 +68,7 @@ from hex_sdk import (  # noqa: E402
     augment_toxic_allowlist,
     discover,
     format_summary,
+    render_generated_header,
     render_llm_context,
 )
 
@@ -521,6 +522,22 @@ with tempfile.TemporaryDirectory() as _td:
     check("env.mk drives cross detection",
           "arm-none-eabi" in cc_cmd or cc_cmd == app.SANDBOX_CC_ARM,
           f"cc_cmd={cc_cmd}")
+
+
+print("\n=== Test 15: node-data stand-in keeps original FIFO names ===")
+_reset_env()
+with tempfile.TemporaryDirectory() as _td:
+    src = Path(_td)
+    (src / "prxyImu.c").write_text(
+        "void prxyImu(void){ L1_DequeueFifo_W(FIFO_PRXY_IMU); }\n"
+        "void hub(void){ use(HUB_DATA_EV_IMU); }\n"
+    )
+    body = render_generated_header("L1_nodes_data.h", [src])
+    check("stand-in defines the original FIFO id",
+          body is not None and "#define FIFO_PRXY_IMU 0" in body,
+          f"body={body}")
+    check("stand-in still defines HUB tokens",
+          body is not None and "#define HUB_DATA_EV_IMU 0" in body)
 
 
 # ---------------------------------------------------------------

@@ -25,12 +25,12 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 - ICD text is chunked when large (`ICD_CHUNK_CHARS`, map-reduce path).
 - Uploaded source scripts are preferred context over sweeping the whole repo directory.
 - Distillation keeps factual tokens from the raw analysis so `change_spec` is shorter but not empty of requirements.
-- Multiple peripheral variations in one Target ICD can yield separate generated headers.
+- Multiple peripheral variations in one Target ICD stay inside the original script. A new peripheral name does not rename the file or its `#include` paths.
 
 ## Transform & variants
 
 - Each uploaded `.c`/`.h` is transformed against the change spec and available repo knowledge.
-- When variants are detected, the pipeline can emit a distinct `.h` per variation instead of collapsing them into one ambiguous header.
+- When variants are detected, each variation is generated separately and then written into the original header filename. The pipeline does not emit a new script named after the ICD peripheral.
 
 ## Verification & compile gate
 

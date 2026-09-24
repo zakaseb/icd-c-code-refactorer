@@ -40,7 +40,11 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from per_file_compile import run_per_file_compile, _extract_per_file_blocks
+from per_file_compile import (
+    run_per_file_compile,
+    _extract_per_file_blocks,
+    preserve_original_script_names,
+)
 from codegraph import (
     CodeGraph,
     Symbol,
@@ -408,21 +412,28 @@ PERIPHERAL_VARIATION_CODEGEN_GUIDANCE = (
     "variation (variant / configuration / mode) of the same peripheral, you "
     "MUST represent EACH variation separately instead of merging them or "
     "silently picking one:\n"
-    "- In headers (.h): emit a SEPARATE, self-contained .h FILE for EACH "
-    "variation rather than one combined header. Give each file a distinct, "
-    "descriptive name derived from the original header and the ICD variation "
-    "name (e.g. `<Peripheral>_<Variation>.h`). Each file must have its own "
-    "include guard, its own #includes, a clear banner comment naming the "
-    "variation and what makes it different, and only that variation's struct / "
-    "enums / constants / macros — so the integrating engineer simply keeps the "
-    "one header file for the variation they need and deletes the others.\n"
+    "- The output script MUST keep the original filename. A new peripheral "
+    "name in the ICD does not rename the file. Do NOT emit "
+    "`plImu15Msg.h` when the original script is `plImu20Msg.h` / "
+    "`plImu20msg.h`, and do NOT emit `<Peripheral>_<Variation>.h`.\n"
+    "- In headers (.h): keep ONE header under the original name. Give each "
+    "variation its own include-guarded section inside that file, its own "
+    "banner comment naming the variation, and only that variation's struct / "
+    "enums / constants / macros.\n"
     "- In sources (.c): provide the corresponding per-variation code within "
-    "the file (separate, clearly-commented functions / definitions per "
+    "the SAME file (separate, clearly-commented functions / definitions per "
     "variation). Do NOT collapse the variations into a single implementation.\n"
+    "- Every `#include` keeps the exact path spelling from the original file. "
+    "Do not retarget `#include <plImu20msg.h>` at a header named for the new "
+    "peripheral.\n"
+    "- Existing identifiers keep their spelling. Do not rename `EV_IMU_RDY` "
+    "to `EV_IMU15_RDY`, and do not rename `FIFO_*` / `HUB_*` / function names "
+    "to insert the new peripheral number. The new ICD name belongs in "
+    "comments and field documentation.\n"
     "- Keep logic that is common to all variations shared and clearly marked "
     "as common.\n"
-    "- If only ONE variation is present, generate normally (a single header), "
-    "exactly as before."
+    "- If only ONE variation is present, generate normally (a single header "
+    "under the original filename), exactly as before."
 )
 
 # Appended to the transform system prompt. This is the enforceable half of
@@ -788,6 +799,10 @@ def _split_variation_header_files(
     distinct .h files), so the caller falls back to the existing
     single-file write path. Only applies to ``.h`` inputs; ``.c`` files are
     never split.
+
+    Every accepted body is written under ``base_fname``. A model that
+    labels a block ``plImu15Msg.h`` while transforming ``plImu20Msg.h``
+    does not create a new script; the variation stays in the original file.
     """
     if not base_fname.lower().endswith(".h"):
         return {}
@@ -797,9 +812,39 @@ def _split_variation_header_files(
         for name, body in blocks.items()
         if name.lower().endswith(".h") and body.strip()
     }
-    if len(headers) >= 2:
-        return headers
-    return {}
+    complete = {
+        name: body for name, body in headers.items()
+        if _looks_complete_header(body)
+    }
+    if len(complete) < 2:
+        return {}
+    return _fold_variation_headers(base_fname, complete)
+
+
+def _fold_variation_headers(base_fname: str, headers: dict[str, str]) -> dict[str, str]:
+    """Place every variation body into the original script name.
+
+    The ICD may call the device by a new name. The generated script keeps
+    the name of the file that was uploaded.
+    """
+    if not headers:
+        return {}
+    ordered: list[str] = []
+    if base_fname in headers:
+        ordered.append(headers[base_fname])
+    for name in sorted(headers):
+        if name == base_fname:
+            continue
+        ordered.append(headers[name])
+    if len(ordered) == 1:
+        return {base_fname: ordered[0]}
+    body = (
+        f"/* Variations kept in the original script {base_fname}.\n"
+        "   A new peripheral name in the ICD does not rename this file. */\n"
+        + "\n\n".join(ordered)
+        + "\n"
+    )
+    return {base_fname: body}
 
 
 def _variant_slug(name: str) -> str:
@@ -980,16 +1025,22 @@ def _generate_variant_header(
     code (possibly empty / incomplete; the caller validates with
     :func:`_looks_complete_header`).
     """
-    guard = re.sub(r"[^A-Za-z0-9]", "_", header_filename).upper()
+    guard = re.sub(
+        r"[^A-Za-z0-9]", "_", f"{base_header_name}_{variant_name}",
+    ).upper()
     others = [v for v in all_variants if v != variant_name]
     sec_file = (
-        f"## File to Transform: {base_header_name} -> {header_filename} "
-        f"(VARIANT: {variant_name})\n\n```c\n{original}\n```\n\n"
+        f"## File to Transform: {base_header_name} "
+        f"(VARIANT: {variant_name}; filename stays {base_header_name})\n\n"
+        f"```c\n{original}\n```\n\n"
         f"The Target ICD defines multiple variants of this peripheral: "
         f"{', '.join(all_variants)}.\n"
-        f"Generate the header for ONLY the '{variant_name}' variant. Output a "
-        f"SINGLE complete, self-contained C header file (to be saved as "
-        f"{header_filename}) that conforms to the Target ICD for this variant:\n"
+        f"Generate the declarations for ONLY the '{variant_name}' variant. "
+        f"The on-disk script MUST stay named {base_header_name}. Do not "
+        f"rename it to the ICD peripheral or to {header_filename}. Output a "
+        f"SINGLE complete, self-contained C header section that conforms to "
+        f"the Target ICD for this variant and will be placed inside "
+        f"{base_header_name}:\n"
         f"- Use include guard {guard}.\n"
         f"- Start with a banner comment naming the '{variant_name}' variant and "
         f"what makes it distinct.\n"
@@ -5563,16 +5614,14 @@ async def process(
 
             # ---- Deterministic per-variant header generation ----
             # When the Target ICD defines multiple variants of THIS header's
-            # peripheral, generate one self-contained .h FILE per variant
-            # (named after the variant) using a focused call per variant.
-            # This is far more reliable than asking the model to emit several
-            # files with markers inside one capped response.
+            # peripheral, generate each variant with a focused call, then
+            # write them into the ORIGINAL filename. A new peripheral name
+            # must not create plImu15Msg.h beside plImu20Msg.h.
             if is_header:
                 variant_names = _detect_peripheral_variants(
                     original, fname, change_spec, target_summary,
                 )
                 if len(variant_names) >= 2:
-                    base_stem = fname[:-2]  # drop trailing ".h"
                     yield _sse({
                         "type": "info",
                         "stage": "transform",
@@ -5580,7 +5629,7 @@ async def process(
                         "message": (
                             f"{fname}: Target ICD defines {len(variant_names)} "
                             f"variants ({', '.join(variant_names)}) — generating "
-                            "one header file per variant…"
+                            f"each variant inside {fname}…"
                         ),
                     })
                     variant_files: dict[str, str] = {}
@@ -5588,12 +5637,11 @@ async def process(
                         slug = _variant_slug(vname)
                         if not slug:
                             continue
-                        hfn = f"{base_stem}_{slug}.h"
                         yield _sse({
                             "type": "info",
                             "stage": "transform",
-                            "file": hfn,
-                            "message": f"Generating {hfn} for variant '{vname}'…",
+                            "file": fname,
+                            "message": f"Generating variant '{vname}' inside {fname}…",
                         })
                         vcode = _generate_variant_header(
                             base_sections=base_sections,
@@ -5602,44 +5650,47 @@ async def process(
                             original=original,
                             variant_name=vname,
                             all_variants=variant_names,
-                            header_filename=hfn,
+                            header_filename=fname,
                         )
                         if vcode and _looks_complete_header(vcode):
-                            variant_files[hfn] = vcode
+                            variant_files[f"{fname}#{slug}"] = vcode
                         else:
                             yield _sse({
                                 "type": "info",
                                 "stage": "transform",
-                                "file": hfn,
+                                "file": fname,
                                 "message": (
                                     f"Variant '{vname}' header looked incomplete; "
                                     "it will be skipped."
                                 ),
                             })
                     if len(variant_files) >= 2:
-                        for hfn, vcode in sorted(variant_files.items()):
-                            (gen_dir / hfn).write_text(vcode)
+                        folded = _fold_variation_headers(fname, variant_files)
+                        vcode = preserve_original_script_names(
+                            original, folded.get(fname, ""),
+                        )
+                        if vcode and _looks_complete_header(vcode):
+                            (gen_dir / fname).write_text(vcode)
                             yield _sse({
                                 "type": "file_complete",
-                                "file": hfn,
+                                "file": fname,
                                 "size": len(vcode),
                             })
-                        log.info(
-                            "Transform %s: emitted %d per-variant header files: %s",
-                            fname, len(variant_files),
-                            ", ".join(sorted(variant_files)),
-                        )
-                        yield _sse({
-                            "type": "info",
-                            "stage": "transform",
-                            "file": fname,
-                            "message": (
-                                f"{fname}: generated {len(variant_files)} separate "
-                                f"per-variant header files "
-                                f"({', '.join(sorted(variant_files))})."
-                            ),
-                        })
-                        continue
+                            log.info(
+                                "Transform %s: kept %d variants inside the "
+                                "original script",
+                                fname, len(variant_files),
+                            )
+                            yield _sse({
+                                "type": "info",
+                                "stage": "transform",
+                                "file": fname,
+                                "message": (
+                                    f"{fname}: generated {len(variant_files)} "
+                                    f"variants inside the original script."
+                                ),
+                            })
+                            continue
                     log.warning(
                         "Transform %s: deterministic per-variant generation "
                         "produced <2 complete headers; falling back to single "
@@ -5650,32 +5701,34 @@ async def process(
                         "stage": "transform",
                         "file": fname,
                         "message": (
-                            f"{fname}: could not generate separate variant headers "
-                            "reliably — falling back to a single header."
+                            f"{fname}: could not place every variant inside the "
+                            "original script — falling back to a single header."
                         ),
                     })
 
             if is_header:
-                base_stem = fname[:-2]  # drop trailing ".h"
                 variation_instr = (
+                    f"Keep this file's name exactly ({fname}). Do not invent a "
+                    "new script named after the ICD peripheral or a variation. "
                     "If the change specification describes MULTIPLE variations of "
-                    "the same peripheral, output a SEPARATE, COMPLETE .h file for "
-                    "EACH variation instead of one combined header. Precede each "
-                    "file with a line of the form `### <filename>` (for example "
-                    f"`### {base_stem}_<Variation>.h`) immediately followed by its "
-                    "```c fenced block. Each header MUST be fully self-contained: "
-                    "its own include guard, its own #includes, a banner comment "
-                    "naming the variation, and ONLY that variation's struct / "
-                    "enums / constants / macros. Do NOT emit any other `###` "
-                    "headings. If only one variation applies, output a single "
-                    "complete header normally with NO `### ` marker. "
+                    "the same peripheral, represent EACH variation inside THIS "
+                    "file (own banner comment and own declarations). Do NOT emit "
+                    "`### <filename>` markers and do NOT rename the file. Every "
+                    "`#include` and every existing EV_ / FIFO_ / HUB_ identifier "
+                    "keeps the spelling from the original file. If only one "
+                    "variation applies, output a single complete header normally. "
                 )
             else:
                 variation_instr = (
-                    "If the change specification lists multiple variations of the "
-                    "same peripheral, emit a separate, clearly-commented struct (and "
-                    "matching code) for EACH variation so the engineer can keep only "
-                    "the one they need — do not merge or drop variations. "
+                    f"Keep this file's name exactly ({fname}) and keep every "
+                    "`#include` path spelled exactly as in the original file. "
+                    "Do not retarget an include at a header named for the new "
+                    "peripheral. If the change specification lists multiple "
+                    "variations of the same peripheral, emit a separate, "
+                    "clearly-commented struct (and matching code) for EACH "
+                    "variation inside this same file — do not merge or drop "
+                    "variations, and do not rename existing EV_ / FIFO_ / HUB_ "
+                    "identifiers to the new peripheral name. "
                 )
             sec_file = (
                 f"## File to Transform: {fname}\n\n```c\n{original}\n```\n\n"
@@ -5819,6 +5872,7 @@ async def process(
                 ]
                 if not incomplete:
                     for vname, vcode in sorted(variation_headers.items()):
+                        vcode = preserve_original_script_names(original, vcode)
                         (gen_dir / vname).write_text(vcode)
                         yield _sse({
                             "type": "file_complete",
@@ -5857,6 +5911,8 @@ async def process(
                     "file": fname,
                 })
                 continue
+
+            clean = preserve_original_script_names(original, clean)
 
             # ---- Change-impact audit -----------------------------------
             # Deterministic: did this rewrite drop or rename a symbol that
@@ -5988,6 +6044,7 @@ async def process(
             if report["authorized"] or report["unauthorized"]:
                 impact_reports.append(report)
 
+            clean = preserve_original_script_names(original, clean)
             (gen_dir / fname).write_text(clean)
             yield _sse({
                 "type": "file_complete",
@@ -7007,25 +7064,27 @@ async def regenerate(
             sec_code = f"## All Project Files (cross-file context)\n{all_code_ctx}"
             is_header = fname.lower().endswith(".h")
             if is_header:
-                base_stem = fname[:-2]  # drop trailing ".h"
                 regen_variation_instr = (
+                    f"Keep this file's name exactly ({fname}). Do not invent a "
+                    "new script named after the ICD peripheral or a variation. "
                     "If the change specification describes MULTIPLE variations of "
-                    "the same peripheral, output a SEPARATE, COMPLETE .h file for "
-                    "EACH variation instead of one combined header. Precede each "
-                    "file with a line of the form `### <filename>` (for example "
-                    f"`### {base_stem}_<Variation>.h`) immediately followed by its "
-                    "```c fenced block. Each header MUST be self-contained (own "
-                    "include guard, #includes, banner comment naming the variation, "
-                    "and only that variation's declarations). Do NOT emit any other "
-                    "`###` headings. If only one variation applies, output a single "
-                    "complete header with NO `### ` marker. "
+                    "the same peripheral, represent EACH variation inside THIS "
+                    "file. Do NOT emit `### <filename>` markers. Every `#include` "
+                    "and every existing EV_ / FIFO_ / HUB_ identifier keeps the "
+                    "spelling from the original file. If only one variation "
+                    "applies, output a single complete header with NO `### ` marker. "
                 )
             else:
                 regen_variation_instr = (
-                    "If the change specification lists multiple variations of the "
-                    "same peripheral, keep a separate, clearly-commented struct "
-                    "(and matching code) for EACH variation — do not merge or drop "
-                    "variations. "
+                    f"Keep this file's name exactly ({fname}) and keep every "
+                    "`#include` path spelled exactly as in the original file. "
+                    "Do not retarget an include at a header named for the new "
+                    "peripheral. If the change specification lists multiple "
+                    "variations of the same peripheral, keep a separate, "
+                    "clearly-commented struct (and matching code) for EACH "
+                    "variation inside this same file — do not merge or drop "
+                    "variations, and do not rename existing EV_ / FIFO_ / HUB_ "
+                    "identifiers to the new peripheral name. "
                 )
             sec_file = (
                 f"## Original File: {fname}\n\n```c\n{original}\n```\n\n"
@@ -7123,6 +7182,7 @@ async def regenerate(
                 ]
                 if not incomplete:
                     for vname, vcode in sorted(variation_headers.items()):
+                        vcode = preserve_original_script_names(original, vcode)
                         prev_vtext = (
                             _read_text_safe(gen_dir / vname)
                             if (gen_dir / vname).exists() else ""
@@ -7162,6 +7222,7 @@ async def regenerate(
                 })
                 continue
 
+            clean = preserve_original_script_names(original, clean)
             (gen_dir / fname).write_text(clean)
 
             if prev_generated:

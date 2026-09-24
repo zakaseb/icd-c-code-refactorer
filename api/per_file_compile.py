@@ -396,6 +396,264 @@ _LIBC_ANGLE_SKIP = {
     "windows.h",
 }
 
+# Identifiers the ICD is not allowed to respell just because the peripheral
+# number changed (IMU20 -> IMU15). Includes are handled separately.
+_SCRIPT_SYMBOL_PREFIXES = ("EV_", "FIFO_", "HUB_", "HI_", "PERFT_")
+_INCLUDE_LINE_RE = re.compile(
+    r"^([ \t]*#[ \t]*include[ \t]*)([<\"])([^>\"]+)([>\"])",
+    re.MULTILINE,
+)
+_C_IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_IMPACT_MANIFEST_LINE_RE = re.compile(
+    r"^[ \t]*IMPACT[-_ ]?MANIFEST\b[^\n]*\n?",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _peripheral_name_key(text: str) -> str:
+    """Compare script and symbol names with peripheral digits removed.
+
+    ``plImu15Msg.h`` and ``plImu20msg.h`` share the key ``plimumsg.h``.
+    ``EV_IMU15_RDY`` and ``EV_IMU_RDY`` share ``ev_imu_rdy``.
+    """
+    leaf = Path(str(text).replace("\\", "/")).name
+    return re.sub(r"\d+", "", leaf).casefold()
+
+
+def _code_identifiers(text: str) -> set[str]:
+    """Identifiers that appear outside comments and string literals."""
+    found: set[str] = set()
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end + 1
+            continue
+        ch = text[i]
+        if ch in "\"'":
+            i += 1
+            while i < n and text[i] != ch:
+                if text[i] == "\\":
+                    i += 2
+                else:
+                    i += 1
+            i += 1
+            continue
+        match = _C_IDENT_RE.match(text, i)
+        if match:
+            found.add(match.group(0))
+            i = match.end()
+            continue
+        i += 1
+    return found
+
+
+def _drop_code_lines_using(text: str, victims: set[str]) -> str:
+    """Remove lines whose code (not comments or strings) uses *victims*."""
+    kept: list[str] = []
+    in_block = False
+    for line in text.splitlines(keepends=True):
+        code = line
+        if in_block:
+            end = code.find("*/")
+            if end < 0:
+                kept.append(line)
+                continue
+            code = code[end + 2:]
+            in_block = False
+        stripped = []
+        i = 0
+        while i < len(code):
+            if code.startswith("/*", i):
+                end = code.find("*/", i + 2)
+                if end < 0:
+                    in_block = True
+                    break
+                i = end + 2
+                continue
+            if code.startswith("//", i):
+                break
+            if code[i] in "\"'":
+                quote = code[i]
+                i += 1
+                while i < len(code) and code[i] != quote:
+                    i += 2 if code[i] == "\\" else 1
+                i += 1
+                continue
+            stripped.append(code[i])
+            i += 1
+        code_text = "".join(stripped)
+        idents = set(_C_IDENT_RE.findall(code_text))
+        if idents & victims:
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+def preserve_original_script_names(original: str, generated: str) -> str:
+    """Put original script names back into a transformed file.
+
+    The transform is allowed to update ICD fields and comments. It is not
+    allowed to rename the script those fields live in. An include that
+    changed only by a peripheral number (``plImu20msg.h`` -> ``plImu15Msg.h``)
+    is restored to the original spelling, and the same rule applies to
+    ``EV_`` / ``FIFO_`` / ``HUB_`` / ``HI_`` / ``PERFT_`` identifiers.
+    """
+    generated = _IMPACT_MANIFEST_LINE_RE.sub("", generated)
+    if generated and not generated.endswith("\n"):
+        generated += "\n"
+    if not original or not generated or original == generated:
+        return generated
+
+    orig_paths: list[str] = []
+    by_key: dict[str, list[str]] = {}
+    for match in _INCLUDE_LINE_RE.finditer(original):
+        path = match.group(3).strip()
+        if path not in orig_paths:
+            orig_paths.append(path)
+        by_key.setdefault(_peripheral_name_key(path), [])
+        if path not in by_key[_peripheral_name_key(path)]:
+            by_key[_peripheral_name_key(path)].append(path)
+
+    def _restore_include(match: re.Match) -> str:
+        path = match.group(3).strip()
+        if path in orig_paths:
+            return match.group(0)
+        candidates = by_key.get(_peripheral_name_key(path), [])
+        if len(candidates) == 1 and candidates[0] != path:
+            return f"{match.group(1)}{match.group(2)}{candidates[0]}{match.group(4)}"
+        for candidate in candidates:
+            if candidate.casefold() == path.casefold() and candidate != path:
+                return (
+                    f"{match.group(1)}{match.group(2)}{candidate}{match.group(4)}"
+                )
+        return match.group(0)
+
+    text = _INCLUDE_LINE_RE.sub(_restore_include, generated)
+
+    unique: dict[str, str] = {}
+    grouped: dict[str, set[str]] = {}
+    for token in _C_IDENT_RE.findall(original):
+        if not token.startswith(_SCRIPT_SYMBOL_PREFIXES):
+            continue
+        grouped.setdefault(_peripheral_name_key(token), set()).add(token)
+    for key, tokens in grouped.items():
+        if len(tokens) == 1:
+            unique[key] = next(iter(tokens))
+
+    restored: set[str] = set()
+
+    def _restore_symbol(match: re.Match) -> str:
+        token = match.group(0)
+        if not token.startswith(_SCRIPT_SYMBOL_PREFIXES):
+            return token
+        original_token = unique.get(_peripheral_name_key(token))
+        if original_token and original_token != token:
+            restored.add(original_token)
+            return original_token
+        return token
+
+    text = _C_IDENT_RE.sub(_restore_symbol, text)
+    if not restored:
+        return text
+    # A comment-only name (EV_IMU_RDY in the banner) must not be promoted
+    # into executable code under the new peripheral's spelling. Drop those
+    # code lines; comments keep the original name.
+    original_code_idents = _code_identifiers(original)
+    comment_only = restored - original_code_idents
+    if not comment_only:
+        return text
+    return _drop_code_lines_using(text, comment_only)
+
+
+def _attribute_block_to_original_script(
+    name: str, allowed: set[str],
+) -> Optional[str]:
+    """Map a model-chosen filename back onto the script being repaired.
+
+    The fix loop asks for ``prxyImu.c``. A reply labeled ``### prxyImu.h``
+    or ``### plImu15Msg.h`` (when the original header is ``plImu20Msg.h``)
+    is attributed to that original name instead of being discarded.
+    """
+    if name in allowed:
+        return name
+    stem = Path(name).stem.casefold()
+    suffix = Path(name).suffix.lower()
+    same_stem = [
+        candidate for candidate in allowed
+        if Path(candidate).stem.casefold() == stem
+    ]
+    if len(same_stem) == 1:
+        return same_stem[0]
+    key = _peripheral_name_key(name)
+    same_key = [
+        candidate for candidate in allowed
+        if _peripheral_name_key(candidate) == key
+        and Path(candidate).suffix.lower() == suffix
+    ]
+    if len(same_key) == 1:
+        return same_key[0]
+    return None
+
+
+def _restore_script_names_in_gen(
+    gen_dir: Path, code_dir: Optional[Path],
+) -> list[str]:
+    """Rewrite generated scripts so they keep the uploaded filenames.
+
+    A generated ``plImu15Msg.h`` is renamed to ``plImu20Msg.h`` when that
+    is the uploaded header and the generated name is only a peripheral-number
+    change. Includes and event/FIFO identifiers inside each generated file
+    are restored the same way.
+    """
+    notes: list[str] = []
+    if code_dir is None or not code_dir.is_dir():
+        return notes
+    exts = _SOURCE_EXTS | _HEADER_EXTS
+    originals = {
+        path.name: path
+        for path in code_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in exts
+    }
+    for generated_path in list(gen_dir.iterdir()):
+        if (
+            not generated_path.is_file()
+            or generated_path.suffix.lower() not in exts
+            or generated_path.name in originals
+        ):
+            continue
+        matches = [
+            original_name for original_name in originals
+            if _peripheral_name_key(original_name) == _peripheral_name_key(generated_path.name)
+            and Path(original_name).suffix.lower() == generated_path.suffix.lower()
+        ]
+        if len(matches) != 1:
+            continue
+        dest = gen_dir / matches[0]
+        if dest.exists():
+            continue
+        generated_path.rename(dest)
+        notes.append(f"{generated_path.name} -> {matches[0]}")
+    for original_name, original_path in originals.items():
+        generated_path = gen_dir / original_name
+        if not generated_path.is_file():
+            continue
+        try:
+            original_text = original_path.read_text(errors="replace")
+            generated_text = generated_path.read_text(errors="replace")
+        except OSError:
+            continue
+        fixed = preserve_original_script_names(original_text, generated_text)
+        if fixed != generated_text:
+            generated_path.write_text(fixed)
+            notes.append(original_name)
+    return notes
+
 
 def _angle_includes_in_tree(directory: Optional[Path], *, max_files: int = 2500) -> set[str]:
     """Non-libc ``#include <...>`` paths under *directory*."""
@@ -422,6 +680,38 @@ def _angle_includes_in_tree(directory: Optional[Path], *, max_files: int = 2500)
     except OSError:
         return out
     return out
+
+
+def _find_local_header(rel: str, dirs: list[Path]) -> Path | None:
+    """Find a project header by basename, preferring an exact-case match.
+
+    ``#include <plImu20msg.h>`` resolves to on-disk ``plImu20Msg.h``.
+    Search order follows *dirs* (generated, then uploaded, then repo).
+    """
+    leaf = Path(rel.replace("\\", "/")).name
+    if not leaf or leaf.lower() in _LIBC_ANGLE_SKIP:
+        return None
+    leaf_l = leaf.lower()
+    folded: Path | None = None
+    for directory in dirs:
+        if directory is None or not directory.is_dir():
+            continue
+        exact = directory / leaf
+        try:
+            if exact.is_file():
+                return exact
+        except OSError:
+            continue
+        if folded is not None:
+            continue
+        try:
+            for path in directory.iterdir():
+                if path.is_file() and path.name.lower() == leaf_l:
+                    folded = path
+                    break
+        except OSError:
+            continue
+    return folded
 
 
 def _header_already_on_path(rel: str, include_dirs: list[Path]) -> bool:
@@ -836,6 +1126,27 @@ def run_per_file_compile(
         yield _sse({"type": "stage_complete", "stage": "compile"})
         return
 
+    # The transform sometimes renames a script to the new ICD peripheral
+    # (plImu20msg.h -> plImu15Msg.h, EV_IMU_RDY -> EV_IMU15_RDY). Put the
+    # uploaded names back before include resolution, so the compiler looks
+    # up the header that actually exists.
+    restored = _restore_script_names_in_gen(
+        gen_dir, code_dir if code_dir and code_dir.exists() else None,
+    )
+    if restored:
+        yield _sse({
+            "type": "info",
+            "stage": "compile",
+            "message": (
+                "Kept original script names (a new peripheral name does not "
+                "rename the file): " + ", ".join(restored)
+            ),
+        })
+        c_sources = sorted(
+            p for p in gen_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in _SOURCE_EXTS
+        )
+
     # ---- 2. Detect toolchain (same logic as sandbox-build) ------------------
     if cc_override:
         sandbox_cc = cc_override
@@ -1062,6 +1373,33 @@ def run_per_file_compile(
                     if s not in include_dirs:
                         include_dirs.append(s)
                 continue
+            local_dirs = [gen_dir]
+            if code_dir is not None and code_dir.exists():
+                local_dirs.append(code_dir)
+            # gen_dir holds plImu20Msg.h; the original include spells
+            # plImu20msg.h. Match that case here, then fall back to the repo.
+            local = _find_local_header(rel, local_dirs)
+            if local is None and has_repo and repo_dir is not None and repo_dir.exists():
+                leaf_l = Path(rel).name.lower()
+                try:
+                    for path in repo_dir.rglob("*"):
+                        if path.is_file() and path.name.lower() == leaf_l:
+                            local = path
+                            break
+                except OSError:
+                    local = None
+            if local is not None:
+                if local.name == Path(rel).name:
+                    root = local.parent.resolve()
+                    if root not in include_dirs:
+                        include_dirs.append(root)
+                else:
+                    shimmed = _materialise_header_shim(shim_dir, rel, local)
+                    if shimmed is not None:
+                        s = shim_dir.resolve()
+                        if s not in include_dirs:
+                            include_dirs.append(s)
+                continue
             body = _render_generated_header(
                 rel, [p for p in (repo_dir, gen_dir) if p is not None],
             )
@@ -1238,11 +1576,14 @@ def run_per_file_compile(
         "`#include \"<base>.h\"` (or equivalent) if it had one.\n"
         "F. Peripheral variations are intentional. If a .c file declares "
         "MULTIPLE per-variation structs for the same peripheral (each with "
-        "its own banner comment), PRESERVE all of them. If the project ships "
-        "SEPARATE per-variation header files (e.g. `<Peripheral>_<Variation>.h`, "
-        "each scoped to one variation), keep them separate — do NOT merge, "
-        "dedupe, or delete variations to make the compile pass. Unused "
-        "variation structs / headers are intentional and are NOT errors."
+        "its own banner comment), PRESERVE all of them inside the original "
+        "filename. Do NOT rename the script or an `#include` to the new "
+        "peripheral (keep `plImu20msg.h`, do not emit `plImu15Msg.h`). Do "
+        "NOT rename EV_ / FIFO_ / HUB_ identifiers to insert that peripheral "
+        "number. The `### <filename>` marker, when you emit one, MUST be the "
+        "original script name (the .c under repair, or its matching .h) — "
+        "not a new peripheral filename and not the .h when you are rewriting "
+        "the .c."
     )
 
     for cs in c_sources:
@@ -1634,6 +1975,17 @@ def run_per_file_compile(
                 allowed.add(companion_h.name)
 
             parsed = _extract_per_file_blocks(fix_output)
+            attributed: dict[str, str] = {}
+            for parsed_name, parsed_body in parsed.items():
+                target = _attribute_block_to_original_script(parsed_name, allowed)
+                if target is None:
+                    attributed.setdefault(parsed_name, parsed_body)
+                    continue
+                # An exact filename wins over a peripheral-renamed label
+                # for the same original script.
+                if target not in attributed or parsed_name == target:
+                    attributed[target] = parsed_body
+            parsed = attributed
             parsed_filtered = {k: v for k, v in parsed.items() if k in allowed}
 
             new_files: dict[str, str] = dict(parsed_filtered)
@@ -1683,6 +2035,15 @@ def run_per_file_compile(
                 # Sanity-check completeness with the same heuristic the
                 # transform step uses.
                 ref = snapshots.get(target_name, "") or original_code
+                name_anchor = ""
+                if code_dir is not None:
+                    anchor_path = code_dir / target_name
+                    if anchor_path.is_file():
+                        name_anchor = _read_text_safe(anchor_path)
+                if not name_anchor and target_name == fname:
+                    name_anchor = original_code
+                if name_anchor:
+                    new_code = preserve_original_script_names(name_anchor, new_code)
                 if not _looks_complete_c_file(new_code, ref, target_name):
                     detail = _incomplete_file_reason(new_code, ref, target_name)
                     log.info(
