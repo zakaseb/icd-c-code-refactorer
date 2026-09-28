@@ -44,6 +44,7 @@ from per_file_compile import (
     run_per_file_compile,
     _extract_per_file_blocks,
     preserve_original_script_names,
+    repair_stray_closing_braces,
 )
 from codegraph import (
     CodeGraph,
@@ -1450,13 +1451,15 @@ def _extract_fenced(text: str, lang_hint: str = "") -> str:
         return text
     lang_re = rf"(?:{re.escape(lang_hint)})" if lang_hint else r"[A-Za-z0-9_+-]*"
     pattern = re.compile(
-        rf"```[ \t]*{lang_re}[ \t]*\n(.*?)\n```",
+        rf"```[ \t]*{lang_re}[ \t]*\n(.*?)\n```[ \t]*(?:\n|\Z)",
         flags=re.DOTALL,
     )
     m = pattern.search(text)
     if m:
         return m.group(1).strip()
-    fallback = re.search(r"```[^\n]*\n(.*?)\n```", text, flags=re.DOTALL)
+    fallback = re.search(
+        r"```[^\n]*\n(.*?)\n```[ \t]*(?:\n|\Z)", text, flags=re.DOTALL,
+    )
     if fallback:
         return fallback.group(1).strip()
     return text
@@ -2303,8 +2306,18 @@ def _structural_verify(generated: str, repo_dir: Path | None,
     issues: list[str] = []
     text = generated.strip()
 
-    if text.count("{") != text.count("}"):
-        issues.append(f"Unbalanced braces: {text.count('{')} open vs {text.count('}')} close")
+    # A raw count('{') == count('}') check is wrong for this file: both
+    # sides of #ifdef/#else contain a '{', so an extra closer at file
+    # scope looks balanced until GCC compiles the active branch. Trust
+    # the active-branch walk instead.
+    _fixed, brace_notes = repair_stray_closing_braces(generated)
+    if _fixed != generated:
+        issues.append(
+            "Stray file-scope '}' is hidden by a brace in an inactive "
+            "#if/#else branch (a raw brace count stays balanced)"
+        )
+    elif brace_notes:
+        issues.extend(brace_notes)
     if text.count("/*") > text.count("*/"):
         issues.append(f"Unclosed block comment: {text.count('/*')} open vs {text.count('*/')} close")
     if filename.endswith(".h"):
@@ -4011,6 +4024,7 @@ def _sandbox_build_iterate(
                     fix_output = "".join(fix_parts).strip()
 
                 fixed_code = _extract_fenced(fix_output, "c").strip()
+                fixed_code, _brace_notes = repair_stray_closing_braces(fixed_code)
                 ref_code = orig_code if orig_code else current_code
                 if fixed_code and _looks_complete_c_file(
                     fixed_code, ref_code, fname
@@ -6189,6 +6203,18 @@ async def process(
             for gf in gen_files:
                 gfname = gf.name
                 generated_code = _read_text_safe(gf)
+                repaired_code, brace_notes = repair_stray_closing_braces(generated_code)
+                if repaired_code != generated_code:
+                    generated_code = repaired_code
+                    gf.write_text(repaired_code)
+                    yield _sse({
+                        "type": "info",
+                        "stage": "verification",
+                        "file": gfname,
+                        "message": (
+                            f"{gfname}: {brace_notes[0]}"
+                        ),
+                    })
                 pre_verify_code = generated_code
                 orig_path = code_dir / gfname
                 original_code = _read_text_safe(orig_path) if orig_path.exists() else ""
@@ -6323,6 +6349,9 @@ async def process(
                                 "token": batch,
                             })
                         verified_code = _extract_fenced(verify_output, "c").strip()
+                        verified_code, _brace_notes = repair_stray_closing_braces(
+                            verified_code,
+                        )
                         verify_issues = (
                             _structural_verify(
                                 verified_code, repo_dir if has_repo else None,
@@ -6397,6 +6426,9 @@ async def process(
                                 max_passes=3,
                             )
                             fixed_code = _extract_fenced(fix_output, "c").strip()
+                            fixed_code, _brace_notes = repair_stray_closing_braces(
+                                fixed_code,
+                            )
                             fixed_issues = (
                                 _structural_verify(
                                     fixed_code, repo_dir if has_repo else None,
@@ -7257,6 +7289,16 @@ async def regenerate(
             for gf in gen_files:
                 gfname = gf.name
                 generated_code = _read_text_safe(gf)
+                repaired_code, brace_notes = repair_stray_closing_braces(generated_code)
+                if repaired_code != generated_code:
+                    generated_code = repaired_code
+                    gf.write_text(repaired_code)
+                    yield _sse({
+                        "type": "info",
+                        "stage": "verification",
+                        "file": gfname,
+                        "message": f"{gfname}: {brace_notes[0]}",
+                    })
                 pre_verify_code = generated_code
                 orig_path = code_dir / gfname
                 original_code = _read_text_safe(orig_path) if orig_path.exists() else ""
@@ -7382,6 +7424,9 @@ async def regenerate(
                                 "token": batch,
                             })
                         verified_code = _extract_fenced(verify_output, "c").strip()
+                        verified_code, _brace_notes = repair_stray_closing_braces(
+                            verified_code,
+                        )
                         v_issues = (
                             _structural_verify(
                                 verified_code, repo_dir if has_repo else None,
@@ -7416,6 +7461,9 @@ async def regenerate(
                                 max_tokens=MAX_OUTPUT_TOKENS, max_passes=3,
                             )
                             fixed_code = _extract_fenced(fix_output, "c").strip()
+                            fixed_code, _brace_notes = repair_stray_closing_braces(
+                                fixed_code,
+                            )
                             fixed_issues = (
                                 _structural_verify(
                                     fixed_code, repo_dir if has_repo else None,

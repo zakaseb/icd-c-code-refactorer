@@ -1495,6 +1495,31 @@ def run_per_file_compile(
             "message": "\n".join(bits),
         })
 
+    # A raw brace count stays balanced when both sides of an #ifdef open a
+    # block and a later '}' is extra on the branch GCC actually compiles.
+    # Strip that closer before the first compile, and snapshot the repaired
+    # file so a stalled fix attempt does not put the '}' back.
+    brace_defines = _defines_from_flags(hex_extra_flags)
+    brace_fixed: list[str] = []
+    for path in list(gen_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in (_SOURCE_EXTS | _HEADER_EXTS):
+            continue
+        try:
+            current = path.read_text(errors="replace")
+        except OSError:
+            continue
+        fixed, notes = repair_stray_closing_braces(current, brace_defines)
+        if fixed != current and notes:
+            path.write_text(fixed)
+            brace_fixed.append(f"{path.name}: {notes[0]}")
+    if brace_fixed:
+        yield _sse({
+            "type": "info",
+            "stage": "compile",
+            "message": "Removed stray file-scope braces before compile — "
+            + "; ".join(brace_fixed),
+        })
+
     # ---- 4. Snapshot the pre-compile-gate generated files (for stall reset)
     snapshots: dict[str, str] = {}
     for cs in c_sources:
@@ -2044,6 +2069,9 @@ def run_per_file_compile(
                     name_anchor = original_code
                 if name_anchor:
                     new_code = preserve_original_script_names(name_anchor, new_code)
+                new_code, _brace_notes = repair_stray_closing_braces(
+                    new_code, _defines_from_flags(hex_extra_flags),
+                )
                 if not _looks_complete_c_file(new_code, ref, target_name):
                     detail = _incomplete_file_reason(new_code, ref, target_name)
                     log.info(
@@ -2430,9 +2458,255 @@ def _strip_filename_marker_leakage(body: str) -> str:
     while lines and not lines[0].strip():
         lines.pop(0)
         changed = True
+    # ```c / ### file.c / ```c / <code> leaves the inner opener behind
+    # once the filename line is gone. That opener is not C.
+    while lines and re.match(r"^```[ \t]*[A-Za-z0-9_+-]*[ \t]*$", lines[0]):
+        lines.pop(0)
+        changed = True
+        while lines and not lines[0].strip():
+            lines.pop(0)
     if not changed:
         return body
     return "\n".join(lines)
+
+
+_DIRECTIVE_RE = re.compile(r"^#\s*([A-Za-z]+)\b\s*(.*?)\s*$")
+_DEFINED_RE = re.compile(
+    r"^(!)?\s*defined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|([A-Za-z_]\w*))\s*$"
+)
+_IDENT_COND_RE = re.compile(r"^([A-Za-z_]\w*)$")
+
+
+def _defines_from_flags(flags: list[str] | None) -> dict[str, str]:
+    """Turn compiler ``-DNAME`` / ``-DNAME=value`` flags into a macro map."""
+    out: dict[str, str] = {}
+    for flag in flags or []:
+        if not flag.startswith("-D") or len(flag) < 3:
+            continue
+        body = flag[2:]
+        if "=" in body:
+            name, value = body.split("=", 1)
+            out[name] = value
+        else:
+            out[body] = "1"
+    return out
+
+
+def _condition_is_true(expr: str, defines: dict[str, str]) -> Optional[bool]:
+    """Evaluate a simple ``#if`` expression. ``None`` means "leave it alone"."""
+    expr = (expr or "").strip()
+    if expr in {"0", "0L", "0U", "0UL"}:
+        return False
+    if expr in {"1", "1L", "1U", "1UL"}:
+        return True
+    defined = _DEFINED_RE.match(expr)
+    if defined:
+        name = defined.group(2) or defined.group(3)
+        truth = name in defines
+        return (not truth) if defined.group(1) else truth
+    ident = _IDENT_COND_RE.match(expr)
+    if ident:
+        name = ident.group(1)
+        if name not in defines:
+            return False
+        return defines[name] not in {"", "0"}
+    return None
+
+
+def repair_stray_closing_braces(
+    text: str,
+    predefined: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    """Remove a file-scope ``}`` that only balances a brace in an inactive branch.
+
+    A raw ``count('{') == count('}')`` check sees both sides of
+    ``#ifdef`` / ``#else``. When each branch opens a block, the extra
+    closer at the end of the function looks balanced and every stage
+    before the compiler accepts the file. GCC then reports
+    ``expected identifier or '(' before '}' token``.
+
+    This walk follows the active branch (``#define`` in the file, plus
+    any ``-D`` macros). A line whose only code is ``}`` while the active
+    branch is already at file scope is dropped. Anything else — a
+    missing brace, or a condition this walker cannot evaluate — is left
+    untouched and described in the returned notes.
+    """
+    if not text:
+        return text, []
+    defines = dict(predefined or {})
+    lines = text.splitlines(keepends=True)
+    depth = 0
+    in_block = False
+    # Each frame: active for this branch, whether any branch was taken,
+    # whether the parent region was active.
+    stack: list[tuple[bool, bool, bool]] = []
+    uncertain = False
+    drop: list[int] = []
+    hard_error = False
+
+    def active() -> bool:
+        return stack[-1][0] if stack else True
+
+    for idx, line in enumerate(lines):
+        logical = line[:-1] if line.endswith("\n") else line
+        if logical.endswith("\r"):
+            logical = logical[:-1]
+        directive = None if in_block else _DIRECTIVE_RE.match(logical.strip())
+        if directive:
+            kind = directive.group(1)
+            rest = directive.group(2).split("//", 1)[0].strip()
+            parent_active = stack[-1][0] if stack else True
+            if kind in {"ifdef", "ifndef"}:
+                name = rest.split()[0] if rest.split() else ""
+                cond = (name in defines) if kind == "ifdef" else (name not in defines)
+                if not name:
+                    uncertain = True
+                    cond = True
+                taken = bool(parent_active and cond)
+                stack.append((taken, taken, parent_active))
+                continue
+            if kind == "if":
+                cond = _condition_is_true(rest, defines)
+                if cond is None:
+                    uncertain = True
+                    cond = True
+                taken = bool(parent_active and cond)
+                stack.append((taken, taken, parent_active))
+                continue
+            if kind == "elif" and stack:
+                branch_active, taken, parent = stack[-1]
+                cond = _condition_is_true(rest, defines)
+                if cond is None:
+                    uncertain = True
+                    cond = False
+                now = bool(parent and not taken and cond)
+                stack[-1] = (now, taken or now, parent)
+                continue
+            if kind == "else" and stack:
+                _branch_active, taken, parent = stack[-1]
+                now = bool(parent and not taken)
+                stack[-1] = (now, True, parent)
+                continue
+            if kind == "endif" and stack:
+                stack.pop()
+                continue
+            if active() and kind == "define":
+                name = re.match(r"([A-Za-z_]\w*)", rest)
+                if name:
+                    after = rest[name.end():].lstrip()
+                    if after.startswith("("):
+                        defines[name.group(1)] = "1"
+                    else:
+                        defines[name.group(1)] = after.split("/*", 1)[0].strip()
+                continue
+            if active() and kind == "undef":
+                name = rest.split()[0] if rest.split() else ""
+                defines.pop(name, None)
+                continue
+            continue
+
+        if not active():
+            # Still track block comments so a comment opened in a skipped
+            # branch does not hide the code that follows #endif.
+            i = 0
+            while i < len(logical):
+                if in_block:
+                    end = logical.find("*/", i)
+                    if end < 0:
+                        break
+                    in_block = False
+                    i = end + 2
+                    continue
+                if logical.startswith("/*", i):
+                    end = logical.find("*/", i + 2)
+                    if end < 0:
+                        in_block = True
+                        break
+                    i = end + 2
+                    continue
+                i += 1
+            continue
+
+        saw_other = False
+        saw_open = False
+        stray = False
+        i = 0
+        while i < len(logical):
+            if in_block:
+                end = logical.find("*/", i)
+                if end < 0:
+                    break
+                in_block = False
+                i = end + 2
+                continue
+            if logical.startswith("//", i):
+                break
+            if logical.startswith("/*", i):
+                end = logical.find("*/", i + 2)
+                if end < 0:
+                    in_block = True
+                    break
+                i = end + 2
+                continue
+            ch = logical[i]
+            if ch in "\"'":
+                quote = ch
+                i += 1
+                while i < len(logical) and logical[i] != quote:
+                    i += 2 if logical[i] == "\\" else 1
+                saw_other = True
+                i += 1
+                continue
+            if ch == "{":
+                depth += 1
+                saw_open = True
+            elif ch == "}":
+                if depth == 0 and not saw_other and not saw_open:
+                    stray = True
+                elif depth == 0:
+                    hard_error = True
+                else:
+                    depth -= 1
+            elif not ch.isspace():
+                saw_other = True
+            i += 1
+        if stray and not saw_other and not saw_open:
+            drop.append(idx)
+        if hard_error:
+            return text, [
+                "closing brace at file scope is not alone on its line; "
+                "left unchanged for the compile-fix pass"
+            ]
+
+    if uncertain and drop:
+        return text, [
+            "preprocessor condition could not be evaluated; "
+            "stray '}' was not removed"
+        ]
+    if depth != 0:
+        return text, [
+            f"active-branch braces are unbalanced (depth {depth}); "
+            "file was not rewritten"
+        ]
+    if not drop:
+        return text, []
+    kept = [line for i, line in enumerate(lines) if i not in set(drop)]
+    repaired = "".join(kept)
+    if repaired and not repaired.endswith("\n"):
+        repaired += "\n"
+    return repaired, [
+        f"removed {len(drop)} stray file-scope '}}' "
+        "(balanced only by a brace in an inactive #if/#else branch)"
+    ]
+
+
+# A closing fence is a line of backticks only. ```c is an opening fence;
+# treating it as a closer swallows the .c body when the model writes
+# ```c / ### boImuIn.c / ```c / <code> / ```.
+_FENCE_RE = re.compile(
+    r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n```[ \t]*(?:\n|\Z)",
+    flags=re.DOTALL,
+)
 
 
 def _fenced_spans(text: str) -> list[tuple[int, int]]:
@@ -2444,12 +2718,7 @@ def _fenced_spans(text: str) -> list[tuple[int, int]]:
     failure: the LLM repeated `### IMU.c` *inside* its ``` block,
     which confused the strict parser into returning empty).
     """
-    return [
-        (m.start(), m.end())
-        for m in re.finditer(
-            r"```[^\n]*\n.*?\n```", text, flags=re.DOTALL,
-        )
-    ]
+    return [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
 
 
 def _pos_in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
@@ -2497,10 +2766,7 @@ def _extract_per_file_blocks(text: str) -> dict[str, str]:
         start = m.end()
         end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
         chunk = text[start:end]
-        fence = re.search(
-            r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n```",
-            chunk, flags=re.DOTALL,
-        )
+        fence = _FENCE_RE.search(chunk)
         if fence:
             body = _strip_filename_marker_leakage(fence.group(1).strip())
             if body:
@@ -2516,10 +2782,7 @@ def _all_fenced_blocks(text: str) -> list[str]:
     up written to disk.
     """
     out: list[str] = []
-    for m in re.finditer(
-        r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n```",
-        text, flags=re.DOTALL,
-    ):
+    for m in _FENCE_RE.finditer(text):
         body = _strip_filename_marker_leakage(m.group(1).strip())
         if body:
             out.append(body)

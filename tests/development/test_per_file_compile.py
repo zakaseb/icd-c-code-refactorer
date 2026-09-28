@@ -83,6 +83,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import per_file_compile  # noqa: E402  pylint: disable=wrong-import-position
 from per_file_compile import (  # noqa: E402
+    repair_stray_closing_braces,
     run_per_file_compile,
     _collect_include_dirs,
     _compile_command,
@@ -92,6 +93,7 @@ from per_file_compile import (  # noqa: E402
     _index_repo_headers,
     _resolve_quoted_includes_in_repo,
     _quoted_includes_in_dir,
+    _all_fenced_blocks,
     _attribute_block_to_original_script,
     preserve_original_script_names,
 )
@@ -1921,6 +1923,68 @@ _folded = app._fold_variation_headers(
 )
 check("variant headers are folded into the original filename",
       list(_folded) == ["plImu20Msg.h"] and "plImu15Msg.h" not in _folded["plImu20Msg.h"][:80])
+
+# ---------------------------------------------------------------
+print("\n=== Test 28: stray '}' hidden by an inactive #else branch ===")
+_ifdef_extra = """\
+#define USE_DATA_EVENT
+void boImuIn(void)
+{
+    while (initOk)
+    {
+#ifdef USE_DATA_EVENT
+        while (read_event())
+        {
+#else
+        while (read_fifo())
+        {
+            copy();
+#endif
+            handle();
+        }
+    }
+    wait();
+}
+}
+"""
+_fixed, _notes = repair_stray_closing_braces(_ifdef_extra)
+check("inactive-branch brace no longer hides the extra closer",
+      _notes and "stray file-scope" in _notes[0], f"notes={_notes}")
+check("repaired file keeps one function closer",
+      _fixed.strip().endswith("}") and _fixed.count("}") == _ifdef_extra.count("}") - 1)
+_balanced = """\
+#define USE_DATA_EVENT
+void boImuIn(void)
+{
+#ifdef USE_DATA_EVENT
+    ready();
+#else
+    ready();
+#endif
+}
+"""
+_same, _no_notes = repair_stray_closing_braces(_balanced)
+check("balanced ifdef file is left unchanged", _same == _balanced and not _no_notes)
+_missing = "void f(void)\n{\n    return;\n"
+_kept, _miss_notes = repair_stray_closing_braces(_missing)
+check("a missing closer is not guessed",
+      _kept == _missing and _miss_notes and "unbalanced" in _miss_notes[0])
+_nested_fence = (
+    "```c\n"
+    "### boImuIn.c\n"
+    "```c\n"
+    "void boImuIn(void) { return; }\n"
+    "```\n"
+    "\n"
+    "### IMU.h\n"
+    "```c\n"
+    "#ifndef IMU_H\n#define IMU_H\n#endif\n"
+    "```\n"
+)
+_blocks = _all_fenced_blocks(_nested_fence)
+check("```c is not treated as a closing fence",
+      _blocks and "void boImuIn(void)" in _blocks[0] and not _blocks[0].startswith("```"),
+      f"blocks={_blocks!r}"[:300])
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")

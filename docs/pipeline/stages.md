@@ -34,7 +34,7 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 
 ## Verification & compile gate
 
-- Structural verification catches brace imbalance, missing guards, unresolved includes, and missing expected symbols before the LLM pass.
+- Structural verification catches brace imbalance, missing guards, unresolved includes, and missing expected symbols before the LLM pass. A raw `{`/`}` count is not enough when both sides of `#if`/`#else` contain a brace: verification and the compile gate drop a file-scope `}` that is only balanced by the inactive branch, which is the error GCC reports as `expected identifier or '(' before '}' token`.
 - The per-file compile gate scopes to `generated_code` / code dir — it must not compile the entire uploaded repo tree.
 - Failures produce actionable diagnostics that later sandbox agents can consume.
 
