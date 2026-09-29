@@ -37,6 +37,10 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 - Structural verification catches brace imbalance, missing guards, unresolved includes, and missing expected symbols before the LLM pass. A raw `{`/`}` count is not enough when both sides of `#if`/`#else` contain a brace: verification and the compile gate drop a file-scope `}` that is only balanced by the inactive branch, which is the error GCC reports as `expected identifier or '(' before '}' token`.
 - The per-file compile gate scopes to `generated_code` / code dir — it must not compile the entire uploaded repo tree.
 - Failures produce actionable diagnostics that later sandbox agents can consume.
+- When the compiler reports an unknown type, a missing struct member, or a missing declaration, the same compile-fix agent may edit the project header that declares that type. That header does not have to share the `.c` file's name: any project header the `.c` includes, and any project header that already mentions the failing type, is in scope. A complete header-only reply is accepted, so a long `.c` does not have to be rewritten. Libc and SDK headers stay out of scope.
+- A line that is only a markdown code fence is removed before the first compile and again on anything the fix agent writes. If that fence split a statement, the truncated copy of the line is removed too. GCC otherwise reports a stray backtick.
+- The compile-fix reply is allowed a larger completion than a normal chat turn, so a complete header is not cut off mid-comment. A cut-off reply that is continued tends to reopen a code fence inside the file, and that rewrite is discarded.
+- A long `.c` may come back as a unified diff of the lines the compiler named. The header is still a complete file. A missing member is added to the struct that already has that name; a second typedef of the same name is not a fix. An assignment to a const object is reported to the fixer as its own item so it can drop `const` in that diff.
 
 ## Sandbox build
 

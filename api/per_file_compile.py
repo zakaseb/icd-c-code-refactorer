@@ -31,8 +31,9 @@ The repo is never swept blindly.  Full-project header resolution with
 the right sysroot is the responsibility of the sandbox build stage.
 
 If a ``.c`` fails to compile, an agentic fix loop iteratively asks the LLM
-to repair the offending ``.c`` (and matching ``.h``, when relevant) using
-the same prompting strategy as ``_sandbox_build_iterate``:
+to repair the offending ``.c`` and the project headers it includes (not
+only the same-stem ``.h``) using the same prompting strategy as
+``_sandbox_build_iterate``:
 
   - feed the ORIGINAL working code (when available) as a stable anchor,
   - feed the CURRENT generated code that failed,
@@ -55,6 +56,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Generator, Optional
@@ -888,6 +890,9 @@ _INCOMPATIBLE_PTR_RE = re.compile(
 _NO_FILE_RE = re.compile(
     r"fatal error:\s+([^:\n]+):\s+No such file or directory",
 )
+_READONLY_RE = re.compile(
+    rf"assignment of member\s+{_QUOTED}\s+in read-only object",
+)
 
 
 def _structured_compile_errors(output: str) -> dict[str, list]:
@@ -901,6 +906,7 @@ def _structured_compile_errors(output: str) -> dict[str, list]:
       ``conflicting_types``     : list[symbol]
       ``incompatible_pointers`` : list[(lhs_type, rhs_type)]
       ``missing_headers``       : list[header_name]
+      ``readonly_assigns``    : list[member_name]
 
     Empty lists are kept so callers can render a consistent layout.
     """
@@ -937,6 +943,9 @@ def _structured_compile_errors(output: str) -> dict[str, list]:
         ),
         "missing_headers": _uniq(
             [m.group(1).strip() for m in _NO_FILE_RE.finditer(text)]
+        ),
+        "readonly_assigns": _uniq(
+            [m.group(1) for m in _READONLY_RE.finditer(text)]
         ),
     }
 
@@ -995,6 +1004,15 @@ def _format_error_punchlist(struct: dict[str, list]) -> str:
         )
         for a, b in struct["incompatible_pointers"]:
             lines.append(f"  - `{a}` vs `{b}`")
+    if struct.get("readonly_assigns"):
+        lines.append(
+            "Assignment to a const object — remove `const` from that "
+            "object's definition in the .c, or stop assigning to it. "
+            "A unified diff of the .c is enough; do not rewrite the "
+            "whole file:"
+        )
+        for member in struct["readonly_assigns"]:
+            lines.append(f"  - member `{member}`")
     if struct["missing_headers"]:
         lines.append(
             "Headers that could not be resolved (drop the include OR "
@@ -1005,6 +1023,119 @@ def _format_error_punchlist(struct: dict[str, list]) -> str:
     if not lines:
         return ""
     return "## Structured Error Punch List\n" + "\n".join(lines)
+
+
+_MAX_FIX_HEADERS = 8
+_FIX_HEADER_CHARS = 20000
+# A complete project header plus the few members the compiler asked
+# for. Larger than the global reply cap so the fix is not split across
+# a continuation that reopens a code fence.
+_COMPILE_FIX_OUTPUT_TOKENS = 12288
+
+
+def _header_mentions(text: str, names: list[str]) -> bool:
+    """True when ``text`` contains any compiler-named type as a whole word."""
+    for name in names:
+        if not name or len(name) < 2:
+            continue
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            return True
+    return False
+
+
+def _collect_fix_headers(
+    c_text: str,
+    err_struct: dict,
+    gen_dir: Path,
+    code_dir: Optional[Path],
+    companion: Optional[Path],
+) -> list[Path]:
+    """Project headers the compile-fix agent may edit for this ``.c``.
+
+    The same-stem companion is included when it exists. So is every
+    project header the ``.c`` includes, and any project header that
+    already mentions a type or struct named in the compiler errors.
+    The generated-tree copy is the one returned, because that is the
+    file the compiler reads first. Libc and SDK headers are not
+    candidates: they are not in the generated or uploaded tree.
+    """
+    declare_names: list[str] = []
+    declare_names.extend(err_struct.get("unknown_types") or [])
+    declare_names.extend(
+        struct_name for struct_name, _member in (err_struct.get("missing_members") or [])
+    )
+
+    included: set[str] = set()
+    for rx in (_QUOTED_INCLUDE_RE, _ANGLE_INCLUDE_RE):
+        for match in rx.finditer(c_text or ""):
+            base = Path(match.group(1).strip()).name.lower()
+            if base in _LIBC_ANGLE_SKIP:
+                continue
+            included.add(base)
+
+    search_dirs: list[Path] = []
+    if gen_dir is not None and gen_dir.is_dir():
+        search_dirs.append(gen_dir)
+    if (
+        code_dir is not None
+        and code_dir.is_dir()
+        and code_dir.resolve() != gen_dir.resolve()
+    ):
+        search_dirs.append(code_dir)
+
+    # lower-case basename -> (score, path). A higher score wins. An
+    # equal score prefers the generated tree.
+    scored: dict[str, tuple[int, Path]] = {}
+
+    def consider(path: Path, score: int) -> None:
+        if score <= 0 or not path.is_file():
+            return
+        key = path.name.lower()
+        prev = scored.get(key)
+        in_gen = path.parent.resolve() == gen_dir.resolve()
+        if prev is None:
+            scored[key] = (score, path)
+            return
+        prev_score, prev_path = prev
+        prev_in_gen = prev_path.parent.resolve() == gen_dir.resolve()
+        if score > prev_score or (score == prev_score and in_gen and not prev_in_gen):
+            scored[key] = (score, path)
+
+    if companion is not None:
+        consider(companion, 5)
+
+    for directory in search_dirs:
+        for header in directory.iterdir():
+            if not header.is_file() or header.suffix.lower() not in _HEADER_EXTS:
+                continue
+            score = 5 if companion is not None and header.name == companion.name else 0
+            if header.name.lower() in included:
+                score += 3
+            try:
+                text = header.read_text(errors="replace")
+            except OSError:
+                text = ""
+            if declare_names and _header_mentions(text, declare_names):
+                score += 10
+            consider(header, score)
+
+    ranked = sorted(
+        scored.values(),
+        key=lambda item: (-item[0], item[1].name.lower()),
+    )[:_MAX_FIX_HEADERS]
+
+    chosen: list[Path] = []
+    for _score, path in ranked:
+        dest = gen_dir / path.name
+        if path.parent.resolve() != gen_dir.resolve():
+            if not dest.exists():
+                try:
+                    dest.write_text(path.read_text(errors="replace"))
+                except OSError:
+                    continue
+            path = dest
+        chosen.append(path)
+    return chosen
 
 
 def run_per_file_compile(
@@ -1508,15 +1639,17 @@ def run_per_file_compile(
             current = path.read_text(errors="replace")
         except OSError:
             continue
-        fixed, notes = repair_stray_closing_braces(current, brace_defines)
-        if fixed != current and notes:
-            path.write_text(fixed)
+        fixed, fence_notes = strip_markdown_fence_lines(current)
+        braced, notes = repair_stray_closing_braces(fixed, brace_defines)
+        notes = fence_notes + notes
+        if braced != current and notes:
+            path.write_text(braced)
             brace_fixed.append(f"{path.name}: {notes[0]}")
     if brace_fixed:
         yield _sse({
             "type": "info",
             "stage": "compile",
-            "message": "Removed stray file-scope braces before compile — "
+            "message": "Removed stray file-scope braces and markdown fences before compile — "
             + "; ".join(brace_fixed),
         })
 
@@ -1540,7 +1673,8 @@ def run_per_file_compile(
         "You will receive:\n"
         "- The ORIGINAL working code (if available — compiled before ICD changes)\n"
         "- The CURRENT transformed code that failed to compile\n"
-        "- The MATCHING header (.h) the .c depends on, if generated\n"
+        "- The project headers the .c includes or that declare a type "
+        "named in the errors (they may not share the .c file's name)\n"
         "- The compiler errors\n"
         "- The ICD change specification\n"
         "- Repository dependency headers and codebase knowledge\n\n"
@@ -1562,17 +1696,18 @@ def run_per_file_compile(
         "expressions are ACCEPTED here\n"
         "- Use <stdint.h> fixed-width types\n\n"
         "OUTPUT FORMAT (MUST follow exactly — the parser is strict):\n"
-        "1. Output ONLY the COMPLETE final file(s). NEVER patches, diffs, "
-        "ellipses, '...', '// unchanged', or partial code.\n"
-        "2. If exactly one file needs editing, output exactly one fenced\n"
-        "   block wrapped in ```c ... ``` (no header line needed).\n"
-        "3. If BOTH the .c and the .h need editing, output TWO fenced "
-        "blocks. Each block MUST be immediately preceded by a single-line "
-        "filename header of the form:\n"
+        "1. A header must be the COMPLETE file. A long .c may be a "
+        "unified diff of only the lines that must change, inside a "
+        "```diff fence. Do not use ellipses, '...', or '// unchanged' "
+        "inside a full file.\n"
+        "2. If you edit only the .c, output exactly one fenced block "
+        "wrapped in ```c ... ```.\n"
+        "3. If you edit a header — even as the only file — or more than "
+        "one file, precede each block with a single-line filename header:\n"
         "       ### <filename>\n"
-        "   e.g. `### IMU.c` then ```c ... ``` then `### IMU.h` then "
-        "```c ... ```. The filename MUST end in `.c` or `.h` and match "
-        "the file you are rewriting.\n"
+        "   e.g. `### IMU.h` then ```c ... ```, or `### IMU.c` then "
+        "```c ... ``` then `### proto.h` then ```c ... ```. The filename "
+        "MUST end in `.c` or `.h` and match a file you were given.\n"
         "4. NEVER add any other `###` (or `##` / `####`) section headers "
         "anywhere in your reply — no `### Analysis`, `### Reasoning`, "
         "`### Summary`, `### Fix`, etc. They will be interpreted as "
@@ -1591,11 +1726,15 @@ def run_per_file_compile(
         "in its declaring header. If the error says a function is "
         "undeclared, ADD a prototype to the header (or include the "
         "header that already declares it).\n"
-        "D. When the error says `'X' has no member named 'Y'`, the "
-        "correct fix is almost always to output BOTH the `### <name>.c` "
-        "and `### <name>.h` blocks — the .c unchanged (or only the new "
-        "uses preserved) and the .h with the missing fields added to "
-        "struct X.\n"
+        "D. When the error says `'X' has no member named 'Y'`, or reports "
+        "an unknown type, ADD the member or typedef to the declaration "
+        "that already exists. Do not declare that name a second time "
+        "and do not alias a new `*_ext` struct back to it. That header "
+        "is named in the prompt and may not share the .c file's name. "
+        "Output the COMPLETE header. If the error is in a struct defined "
+        "in the .c, or an assignment to a const object, change the .c "
+        "with a unified diff when the .c is long. Leave the .c out of "
+        "the reply when it does not need to change.\n"
         "E. The .h must keep its include guards (`#ifndef <BASE>_H` / "
         "`#define <BASE>_H` ... `#endif`). The .c must keep its "
         "`#include \"<base>.h\"` (or equivalent) if it had one.\n"
@@ -1605,10 +1744,10 @@ def run_per_file_compile(
         "filename. Do NOT rename the script or an `#include` to the new "
         "peripheral (keep `plImu20msg.h`, do not emit `plImu15Msg.h`). Do "
         "NOT rename EV_ / FIFO_ / HUB_ identifiers to insert that peripheral "
-        "number. The `### <filename>` marker, when you emit one, MUST be the "
-        "original script name (the .c under repair, or its matching .h) — "
-        "not a new peripheral filename and not the .h when you are rewriting "
-        "the .c."
+        "number. The `### <filename>` marker, when you emit one, MUST be a "
+        "file you were given: the .c under repair, its same-stem header, or "
+        "another project header listed in the prompt. Do not invent a new "
+        "peripheral filename."
     )
 
     for cs in c_sources:
@@ -1651,6 +1790,12 @@ def run_per_file_compile(
         # banner at the TOP of the next prompt.
         prev_missed_h_side: bool = False
         prev_missed_details: list[str] = []
+        # Headers this file's fixer is allowed to edit. Starts with the
+        # same-stem companion; grows once compiler errors name a type
+        # that lives in a different project header.
+        editable_header_names: set[str] = set()
+        if companion_h is not None:
+            editable_header_names.add(companion_h.name)
 
         yield _sse({
             "type": "info",
@@ -1732,25 +1877,28 @@ def run_per_file_compile(
             # Stall reset: rewind to the pre-gate snapshot before re-prompting,
             # so the LLM doesn't compound its prior misguided edits.
             if stall >= 1:
+                restored = []
                 if fname in snapshots:
                     cs.write_text(snapshots[fname])
-                if companion_h and companion_h.name in snapshots:
-                    companion_h.write_text(snapshots[companion_h.name])
+                    restored.append(fname)
+                for header_name in sorted(editable_header_names):
+                    if header_name in snapshots:
+                        (gen_dir / header_name).write_text(snapshots[header_name])
+                        restored.append(header_name)
                 stall = 0
                 yield _sse({
                     "type": "info",
                     "stage": "compile",
                     "file": fname,
                     "message": (
-                        f"Same compile errors persisted — reset {fname} "
-                        f"(and matching .h) to the pre-compile-gate snapshot "
-                        f"before re-prompting."
+                        "Same compile errors persisted — reset "
+                        + ", ".join(restored)
+                        + " to the pre-compile-gate snapshot before re-prompting."
                     ),
                 })
 
             # ---- Agentic fix prompt --------------------------------------
             pre_fix_c = _read_text_safe(cs)
-            pre_fix_h = _read_text_safe(companion_h) if companion_h else ""
 
             file_repo_ctx = ""
             if (
@@ -1774,6 +1922,20 @@ def run_per_file_compile(
             # re-derive it from raw gcc output.
             err_struct = _structured_compile_errors(output)
             sec_punchlist = _format_error_punchlist(err_struct)
+            declaration_errors = bool(
+                err_struct["missing_members"]
+                or err_struct["unknown_types"]
+                or err_struct["implicit_decls"]
+                or err_struct["conflicting_types"]
+            )
+            fix_headers = _collect_fix_headers(
+                pre_fix_c, err_struct, gen_dir, code_dir, companion_h,
+            )
+            for header_path in fix_headers:
+                editable_header_names.add(header_path.name)
+                if header_path.name not in snapshots:
+                    snapshots[header_path.name] = _read_text_safe(header_path)
+            header_names = [header_path.name for header_path in fix_headers]
 
             # If the PREVIOUS attempt's punch list contained
             # missing-member / undeclared / unknown-type errors that
@@ -1786,24 +1948,32 @@ def run_per_file_compile(
             # never opened.
             sec_focus_banner = ""
             if prev_missed_h_side:
+                banner_headers = header_names or [
+                    companion_h.name if companion_h else fname.replace(".c", ".h")
+                ]
+                header_blocks = "\n\n".join(
+                    f"  ### {header_name}\n"
+                    "  ```c\n"
+                    "  ...the FULL header with the missing declarations"
+                    " / typedefs / struct members ADDED...\n"
+                    "  ```"
+                    for header_name in banner_headers
+                )
                 sec_focus_banner = (
                     "## CRITICAL — READ FIRST\n"
-                    "Your PREVIOUS rewrite attempt only touched the .c "
-                    "file. The compiler errors below STILL list "
-                    "header-side problems that REQUIRE editing the .h, "
-                    "not the .c.\n\n"
+                    "Your PREVIOUS rewrite attempt did not edit a "
+                    "declaring header. The compiler errors below STILL "
+                    "list header-side problems that REQUIRE editing the .h, "
+                    "not a rewrite of the .c.\n\n"
                     "Symptoms the previous attempt failed to address:\n"
                     + "\n".join(f"  - {d}" for d in prev_missed_details)
                     + "\n\n"
-                    "On this attempt you MUST output BOTH:\n"
-                    "  ### "
-                    + fname
-                    + "\n  ```c\n  ...the FULL .c...\n  ```\n\n"
-                    "  ### "
-                    + (companion_h.name if companion_h else fname.replace(".c", ".h"))
-                    + "\n  ```c\n  ...the FULL .h with the missing "
-                    "declarations / typedefs / struct members ADDED...\n"
-                    "  ```\n\n"
+                    "On this attempt you MUST output the COMPLETE header"
+                    "(s) below. A header-only reply is valid. Do not "
+                    "rewrite the .c unless a compiler error is a mistake "
+                    "in the .c itself — a truncated .c is rejected.\n\n"
+                    + header_blocks
+                    + "\n\n"
                     "Stop polishing dates, comments, prose, or "
                     "ICD-cosmetic magic numbers — those are zero-priority "
                     "until the compile is green.\n"
@@ -1820,10 +1990,37 @@ def run_per_file_compile(
                 f"This version failed the per-file compile:\n"
                 f"```c\n{pre_fix_c}\n```"
             )
-            sec_header = (
-                f"## Matching Header ({companion_h.name})\n```c\n{pre_fix_h}\n```"
-                if companion_h else ""
-            )
+            header_chunks: list[str] = []
+            for header_path in fix_headers:
+                body = _read_text_safe(header_path)
+                if len(body) > _FIX_HEADER_CHARS:
+                    body = (
+                        body[:_FIX_HEADER_CHARS]
+                        + "\n/* ... header truncated for the fix prompt ... */\n"
+                    )
+                header_chunks.append(
+                    f"## Project header you may edit ({header_path.name})\n"
+                    f"```c\n{body}\n```"
+                )
+            sec_header = "\n\n".join(header_chunks)
+            if declaration_errors and header_names:
+                listed = "\n".join(f"  - ### {name}" for name in header_names)
+                sec_header = (
+                    "## Headers the compiler errors belong to\n"
+                    "These project headers are included by the .c or "
+                    "already mention a type named in the errors. They "
+                    "may not share the .c file's name. Add the missing "
+                    "member, typedef, or prototype there. Output each "
+                    "COMPLETE header preceded by its `###` filename. A "
+                    "header-only reply is valid. Copy the header and add "
+                    "only the types, members, and macros named in the "
+                    "compiler errors. Do not invent extra structs. Do not "
+                    "rewrite `"
+                    + fname
+                    + "` unless an error is a mistake in that .c file.\n"
+                    + listed
+                    + ("\n\n" + sec_header if sec_header else "")
+                )
             sec_cmd = (
                 "## Per-file Compile Command\n```\n" + cmd + "\n```"
             )
@@ -1849,15 +2046,19 @@ def run_per_file_compile(
                 except ImportError:
                     from hex_sdk import render_llm_context  # type: ignore
                 sec_hex_sdk = render_llm_context(hex_sdk, max_chars=6000)
+            example_header = (
+                header_names[0] if header_names
+                else (companion_h.name if companion_h else fname.replace(".c", ".h"))
+            )
             sec_instr = (
                 "## Output format reminder\n"
                 "Output ONLY the complete file(s) inside ```c fences. "
-                "When TWO files need to change, prefix each block with "
-                "`### <filename>` (e.g. `### "
-                f"{fname}` then ```c ... ``` then `### "
-                f"{companion_h.name if companion_h else fname.replace('.c', '.h')}`"
-                " then ```c ... ```). The filename MUST end in `.c` or "
-                "`.h`. Do NOT add any other `###` headings anywhere "
+                "A header — even when it is the only file you edit — "
+                "must be prefixed with `### <filename>` (e.g. `### "
+                f"{example_header}` then ```c ... ```). The .c, when "
+                f"you also rewrite it, is `### {fname}`. The filename "
+                "MUST end in `.c` or `.h` and MUST be one of the files "
+                "above. Do NOT add any other `###` headings anywhere "
                 "in your reply (`### Analysis`, `### Fix`, `### Notes`, "
                 "etc. will be parsed as filenames and silently dropped)."
             )
@@ -1910,9 +2111,11 @@ def run_per_file_compile(
                     # exists; it's tiny and disposable if there's
                     # nothing to say.
                     ("focus", sec_focus_banner, 0),
+                    # Declaring headers go before the full .c so a long
+                    # source file cannot push them out of the budget.
+                    ("header", sec_header, 0),
                     ("original", sec_original, 0),
                     ("current", sec_current, 0),
-                    ("header", sec_header, 0),
                     ("command", sec_cmd, 0),
                     ("errors", sec_errors, 0),
                     # The structured punch list is a tiny, high-signal
@@ -1949,9 +2152,14 @@ def run_per_file_compile(
             })
 
             try:
+                # 4096 tokens cuts a real header mid-comment. The continuation
+                # pass then reopens a markdown fence inside that comment
+                # and the rewrite is rejected. Ask for a larger reply; the
+                # context clamp shrinks it when the prompt is already full.
                 fix_output = _call_llm_complete(
                     fix_system, fix_prompt,
-                    max_tokens=MAX_OUTPUT_TOKENS, max_passes=3,
+                    max_tokens=max(MAX_OUTPUT_TOKENS, _COMPILE_FIX_OUTPUT_TOKENS),
+                    max_passes=3,
                 )
                 # Persist the raw reply so a discarded fix can be diagnosed
                 # (truncated mid-fence vs. genuinely malformed vs. refused).
@@ -1996,8 +2204,7 @@ def run_per_file_compile(
             #     mode of forgetting / mangling filename headers.
             # (3) Final fallback: single fenced block -> fname.
             allowed = {fname}
-            if companion_h is not None:
-                allowed.add(companion_h.name)
+            allowed.update(editable_header_names)
 
             parsed = _extract_per_file_blocks(fix_output)
             attributed: dict[str, str] = {}
@@ -2023,16 +2230,27 @@ def run_per_file_compile(
                         guess = _guess_filename_for_block(
                             body, c_name=fname,
                             h_name=(companion_h.name if companion_h else None),
+                            header_names=sorted(editable_header_names),
                         )
                         if guess and guess not in new_files:
                             new_files[guess] = body
-                # Fallback B: single fenced block -> fname
+                # Fallback B: a single unmarked block is the .c, unless
+                # it is a header (include guard). A header must not
+                # overwrite the .c.
                 if not new_files:
                     single = _strip_filename_marker_leakage(
                         _extract_fenced(fix_output, "c").strip()
                     )
                     if single:
-                        new_files = {fname: single}
+                        guess = _guess_filename_for_block(
+                            single, c_name=fname,
+                            h_name=(companion_h.name if companion_h else None),
+                            header_names=sorted(editable_header_names),
+                        )
+                        if guess:
+                            new_files = {guess: single}
+                        elif not re.search(r"#\s*ifndef\b", single):
+                            new_files = {fname: single}
 
             # Defence in depth: re-strip every block right before the
             # decision loop. Even if a future code path introduces a
@@ -2067,8 +2285,23 @@ def run_per_file_compile(
                         name_anchor = _read_text_safe(anchor_path)
                 if not name_anchor and target_name == fname:
                     name_anchor = original_code
+                if _looks_like_unified_diff(new_code):
+                    base_text = (
+                        _read_text_safe(gen_dir / target_name)
+                        or snapshots.get(target_name, "")
+                    )
+                    patched = _apply_unified_diff(base_text, new_code)
+                    if patched is None:
+                        decisions.append({
+                            "target": target_name,
+                            "decision": "rejected_incomplete",
+                            "reason": "unified diff did not apply",
+                        })
+                        continue
+                    new_code = patched
                 if name_anchor:
                     new_code = preserve_original_script_names(name_anchor, new_code)
+                new_code, _fence_notes = strip_markdown_fence_lines(new_code)
                 new_code, _brace_notes = repair_stray_closing_braces(
                     new_code, _defines_from_flags(hex_extra_flags),
                 )
@@ -2513,6 +2746,61 @@ def _condition_is_true(expr: str, defines: dict[str, str]) -> Optional[bool]:
     return None
 
 
+_FENCE_ONLY_LINE = re.compile(r"^\s*```[A-Za-z0-9_+-]*\s*$")
+
+
+def strip_markdown_fence_lines(text: str) -> tuple[str, list[str]]:
+    """Drop markdown fence lines an LLM left inside a C translation unit.
+
+    A line whose only text is ````` `` or `````c`` is not C; GCC reports
+    it as ``stray '\\`' in program``. When the fence splits a statement,
+    the line above it is often a truncated copy of the line below
+    (``foo.bar`` then the fence then ``foo.bar = 1;``). That truncated
+    line is dropped as well. A fence that shares its line with other
+    tokens is left alone.
+    """
+    if not text or "```" not in text:
+        return text, []
+    ends_nl = text.endswith("\n")
+    raw = text.splitlines()
+    out: list[str] = []
+    dropped_fences = 0
+    dropped_prefixes = 0
+    i = 0
+    while i < len(raw):
+        if not _FENCE_ONLY_LINE.match(raw[i]):
+            out.append(raw[i])
+            i += 1
+            continue
+        dropped_fences += 1
+        i += 1
+        while i < len(raw) and _FENCE_ONLY_LINE.match(raw[i]):
+            dropped_fences += 1
+            i += 1
+        if i < len(raw) and out:
+            prev = out[-1].strip()
+            nxt = raw[i].strip()
+            if (
+                prev
+                and nxt.startswith(prev)
+                and len(nxt) > len(prev)
+                and not prev.endswith((";", "{", "}", ",", "\\"))
+            ):
+                out.pop()
+                dropped_prefixes += 1
+    if not dropped_fences:
+        return text, []
+    body = "\n".join(out)
+    if ends_nl:
+        body += "\n"
+    notes = [f"removed {dropped_fences} markdown fence line(s)"]
+    if dropped_prefixes:
+        notes.append(
+            f"removed {dropped_prefixes} statement(s) split by a fence"
+        )
+    return body, notes
+
+
 def repair_stray_closing_braces(
     text: str,
     predefined: dict[str, str] | None = None,
@@ -2883,32 +3171,93 @@ def fname_summary(allowed: set) -> str:
     return "{" + ", ".join(sorted(allowed)) + "}"
 
 
+def _looks_like_unified_diff(text: str) -> bool:
+    """True when a fenced block is a unified diff rather than a full file."""
+    lines = [line for line in (text or "").splitlines() if line.strip()][:12]
+    if not lines:
+        return False
+    if any(line.startswith("@@") for line in lines):
+        return True
+    return any(line.startswith("--- ") for line in lines) and any(
+        line.startswith("+++ ") for line in lines
+    )
+
+
+def _apply_unified_diff(original: str, diff_text: str) -> Optional[str]:
+    """Apply a unified diff to ``original``. None when ``patch`` rejects it."""
+    diff = (diff_text or "").strip() + "\n"
+    if "@@" in diff and not diff.startswith("---"):
+        diff = "--- a/file\n+++ b/file\n" + diff
+    original_text = original if original.endswith("\n") or not original else original + "\n"
+    with tempfile.TemporaryDirectory(prefix="icd_diff_") as tmp:
+        src = Path(tmp) / "file"
+        out = Path(tmp) / "out"
+        patch_file = Path(tmp) / "change.diff"
+        src.write_text(original_text)
+        patch_file.write_text(diff)
+        result = subprocess.run(
+            [
+                "patch", "--forward", "--batch",
+                "-o", str(out), str(src), str(patch_file),
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not out.is_file():
+            return None
+        return out.read_text()
+
+
+def _guard_matches_header(body: str, header_name: str) -> bool:
+    """True when an include guard in ``body`` spells ``header_name``.
+
+    ``PL_IMU20_MSG_H`` and ``plImu20Msg.h`` match once punctuation is
+    stripped. A same-stem companion (``IMU_H`` / ``IMU.h``) matches too.
+    """
+    stem_alnum = re.sub(r"[^A-Za-z0-9]", "", Path(header_name).stem).upper()
+    if not stem_alnum:
+        return False
+    for guard in re.findall(r"#\s*ifn?def\s+(\w+)", body):
+        guard_alnum = re.sub(r"[^A-Za-z0-9]", "", guard).upper()
+        if guard_alnum.endswith("H") and len(guard_alnum) > len(stem_alnum):
+            guard_alnum = guard_alnum[:-1]
+        if guard_alnum == stem_alnum:
+            return True
+    return False
+
+
 def _guess_filename_for_block(
     body: str,
     *,
     c_name: str,
     h_name: Optional[str],
+    header_names: Optional[list[str]] = None,
 ) -> Optional[str]:
-    """Decide whether a fenced block looks like the .c or the .h file.
+    """Decide whether a fenced block looks like the .c or a header.
 
     Used as a last-resort fallback when the LLM emitted code blocks but
     forgot to mark them with `### <filename>` headers.  Heuristics:
 
       - A typical .h has an include guard (``#ifndef <BASE>_H`` /
-        ``#define <BASE>_H`` ... ``#endif``).
-      - A typical .c does ``#include "<base>.h"`` and contains
-        function bodies (``int foo(...) {`` patterns).
+        ``#define <BASE>_H`` ... ``#endif``). The guard may belong to
+        the same-stem companion or to another project header the .c
+        includes.
+      - A typical .c contains function bodies (``int foo(...) {``).
     """
     if not body or not c_name:
         return None
-    base = Path(c_name).stem.upper()
-    h_guard = re.search(
-        rf"#\s*ifn?def\s+{re.escape(base)}_H\b", body, flags=re.IGNORECASE,
-    )
-    h_endif = re.search(r"#\s*endif\b", body)
-    looks_like_h = bool(h_guard and h_endif) and h_name is not None
-    if looks_like_h:
-        return h_name
+    candidates: list[str] = []
+    if h_name:
+        candidates.append(h_name)
+    for name in header_names or []:
+        if name not in candidates and name.lower().endswith(".h"):
+            candidates.append(name)
+    has_endif = re.search(r"#\s*endif\b", body) is not None
+    if has_endif and candidates:
+        matched = [
+            name for name in candidates if _guard_matches_header(body, name)
+        ]
+        if len(matched) == 1:
+            return matched[0]
     # Cheap "this looks like a .c" check: at least one function body
     # opener with `{` on a non-comment line.
     looks_like_c = bool(

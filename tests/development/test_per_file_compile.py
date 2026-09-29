@@ -58,6 +58,10 @@ Exercises:
   Test 26  End-to-end fix of the IMU.c production report: M_PI,
            DeltaAngle / DeltaVelocity (missing in sIMU_InertialData),
            AND RawData (missing in sIMU) all resolved in one shot.
+  Test 29  A declaration error in a header that does not share the
+           .c file's name is fixed by the existing compile-fix agent:
+           the header is in the prompt and in the allowed edit set,
+           and a header-only reply compiles.
 
 The test does NOT require a running LLM — we monkey-patch
 `app._call_llm_complete` to a deterministic stub that returns a corrected
@@ -1033,11 +1037,15 @@ from per_file_compile import (  # noqa: E402
     _looks_like_c_filename,
     _all_fenced_blocks,
     _guess_filename_for_block,
+    _collect_fix_headers,
     _structured_compile_errors,
     _format_error_punchlist,
     _incomplete_file_reason,
     _summarise_reject_reason,
     _strip_filename_marker_leakage,
+    strip_markdown_fence_lines,
+    _apply_unified_diff,
+    _looks_like_unified_diff,
 )
 
 
@@ -1985,6 +1993,150 @@ _blocks = _all_fenced_blocks(_nested_fence)
 check("```c is not treated as a closing fence",
       _blocks and "void boImuIn(void)" in _blocks[0] and not _blocks[0].startswith("```"),
       f"blocks={_blocks!r}"[:300])
+_fenced_src = (
+    "void f(void)\n{\n"
+    "    imu.x\n"
+    "```c\n"
+    "    imu.x = 1;\n"
+    "}\n"
+)
+_stripped, _fence_notes = strip_markdown_fence_lines(_fenced_src)
+check("markdown fence line is removed from a C file",
+      "```" not in _stripped and "imu.x = 1;" in _stripped, _stripped)
+check("truncated statement split by a fence is dropped",
+      "\n    imu.x\n" not in _stripped and _fence_notes)
+_kept_fence, _no_fence_notes = strip_markdown_fence_lines(
+    "const char *s = \"```\";\n"
+)
+check("a fence that shares its line with code is kept",
+      _kept_fence.startswith("const char") and not _no_fence_notes)
+
+# ---------------------------------------------------------------
+print("\n=== Test 29: declaration errors may edit a differently named header ===")
+# The .c includes proto.h (not driver.h) and uses a type that header
+# does not declare, plus a member the declared struct does not have.
+# The compile-fix agent must be allowed to edit proto.h, and a
+# header-only reply must be enough for both .c files to compile.
+PROTO_H_PRE = (
+    "#ifndef PROTO_H\n#define PROTO_H\n#include <stdint.h>\n"
+    "typedef struct {\n"
+    "  int32_t value;\n"
+    "} Sample_ts;\n"
+    "#endif\n"
+)
+DRIVER_C = (
+    "#include \"proto.h\"\n"
+    "static SampleTel_ts tel;\n"
+    "static Sample_ts sample;\n"
+    "void run(void) {\n"
+    "  tel.delta = 1;\n"
+    "  sample.value = tel.delta;\n"
+    "}\n"
+)
+OTHER_C = "int ready(void) { return 1; }\n"
+PROTO_H_FIXED = (
+    "#ifndef PROTO_H\n#define PROTO_H\n#include <stdint.h>\n"
+    "typedef struct {\n"
+    "  int32_t value;\n"
+    "} Sample_ts;\n"
+    "typedef struct {\n"
+    "  int32_t delta;\n"
+    "} SampleTel_ts;\n"
+    "#endif\n"
+)
+
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    gen = tmp / "gen"
+    code = tmp / "code"
+    gen.mkdir()
+    code.mkdir()
+    (gen / "proto.h").write_text(PROTO_H_PRE)
+    (gen / "driver.c").write_text(DRIVER_C)
+    (gen / "other.c").write_text(OTHER_C)
+    (code / "proto.h").write_text(PROTO_H_PRE)
+    (code / "driver.c").write_text("int run(void){return 0;}\n")
+    err = _structured_compile_errors(
+        "driver.c:2:8: error: unknown type name 'SampleTel_ts'\n"
+        "driver.c:5:6: error: 'Sample_ts' has no member named 'extra'\n"
+    )
+    picked = _collect_fix_headers(DRIVER_C, err, gen, code, None)
+    picked_names = [p.name for p in picked]
+    check("fix headers include the included project header",
+          picked_names == ["proto.h"], f"got {picked_names}")
+    # A header that is not included still qualifies when it is the
+    # one that already mentions the failing type.
+    (gen / "elsewhere.h").write_text(
+        "#ifndef ELSEWHERE_H\n#define ELSEWHERE_H\n"
+        "typedef struct { int extra; } Sample_ts;\n#endif\n"
+    )
+    picked = _collect_fix_headers(DRIVER_C, err, gen, code, None)
+    check("fix headers also include the header that mentions the type",
+          {p.name for p in picked} == {"proto.h", "elsewhere.h"},
+          f"got {[p.name for p in picked]}")
+    (gen / "elsewhere.h").unlink()
+
+    sniffed = _guess_filename_for_block(
+        PROTO_H_FIXED, c_name="driver.c", h_name=None,
+        header_names=["proto.h"],
+    )
+    check("include-guard sniff maps a different-stem header",
+          sniffed == "proto.h", f"got {sniffed!r}")
+
+    prompts = []
+
+    def _stub_29(system_prompt, user_prompt, **kw):
+        prompts.append(user_prompt)
+        return f"### proto.h\n```c\n{PROTO_H_FIXED}```\n"
+
+    saved = app._call_llm_complete
+    app._call_llm_complete = _stub_29
+    try:
+        sess, gen2, code2, repo = setup_session_dir(tmp / "sess")
+        (gen2 / "proto.h").write_text(PROTO_H_PRE)
+        (gen2 / "driver.c").write_text(DRIVER_C)
+        (gen2 / "other.c").write_text(OTHER_C)
+        (code2 / "proto.h").write_text(PROTO_H_PRE)
+        (code2 / "driver.c").write_text("int run(void){return 0;}\n")
+        events = drain(run_per_file_compile(
+            session_dir=sess, gen_dir=gen2, code_dir=code2, repo_dir=repo,
+            has_repo=False, change_spec="(adds SampleTel_ts)",
+            repo_knowledge="",
+            is_resume=False, completed_stages=set(),
+            max_fix_attempts=3, compile_timeout=30,
+            cc_override=NATIVE_CC,
+        ))
+    finally:
+        app._call_llm_complete = saved
+
+    summary = next((e for e in events if e["type"] == "compile_summary"), None)
+    check("different-stem header: both .c files compile",
+          summary and summary.get("ok") == 2 and summary.get("failed") == 0,
+          f"summary={summary}")
+    check("different-stem header: prompt names proto.h and allows header-only",
+          prompts and "proto.h" in prompts[0] and "header-only reply is valid" in prompts[0],
+          f"prompt snippet: {(prompts[0][:500] if prompts else '')!r}")
+    check("different-stem header: proto.h gained SampleTel_ts",
+          "SampleTel_ts" in (gen2 / "proto.h").read_text())
+    check("different-stem header: driver.c was not rewritten",
+          (gen2 / "driver.c").read_text() == DRIVER_C)
+
+_ro = _structured_compile_errors(
+    "foo.c:3:5: error: assignment of member 'scale' in read-only object\n"
+)
+check("read-only assignment is a punch-list item",
+      _ro["readonly_assigns"] == ["scale"])
+_src = "static int value;\nvoid f(void) { value = 1; }\n"
+_diff = (
+    "--- a/foo.c\n+++ b/foo.c\n@@ -1,2 +1,2 @@\n"
+    " static int value;\n"
+    "-void f(void) { value = 1; }\n"
+    "+void f(void) { value = 2; }\n"
+)
+check("unified diff is recognized", _looks_like_unified_diff(_diff))
+_patched = _apply_unified_diff(_src, _diff)
+check("unified diff applies",
+      _patched is not None and "value = 2" in _patched, _patched)
 
 # ---------------------------------------------------------------
 print(f"\n{'='*60}")
