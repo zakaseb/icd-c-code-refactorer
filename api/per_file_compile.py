@@ -1138,6 +1138,507 @@ def _collect_fix_headers(
     return chosen
 
 
+def _brace_span(text: str, open_at: int) -> Optional[tuple[int, int]]:
+    """Return ``(open, close)`` indexes for the brace at ``open_at``."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return open_at, i
+    return None
+
+
+def _typedef_struct_spans(text: str) -> list[tuple[str, int, int]]:
+    """``(name, body_start, close_brace)`` for ``typedef struct { } Name;``."""
+    found: list[tuple[str, int, int]] = []
+    for match in re.finditer(r"typedef\s+struct\b[^{;]*\{", text):
+        span = _brace_span(text, match.end() - 1)
+        if span is None:
+            continue
+        after = text[span[1] + 1:span[1] + 120]
+        name = re.match(r"\s*(\w+)\s*;", after)
+        if name:
+            found.append((name.group(1), span[0] + 1, span[1]))
+    return found
+
+
+def _split_params(param_str: str) -> list[str]:
+    if not param_str or param_str.strip() in ("", "void"):
+        return []
+    parts: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in param_str:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _type_of_param(param: str) -> str:
+    """Drop the parameter name from ``IMUD_Timing * pTiming``."""
+    cleaned = re.sub(r"/\*.*?\*/", "", param).strip()
+    cleaned = cleaned.replace("*", " * ")
+    tokens = cleaned.split()
+    if not tokens:
+        return "int"
+    if len(tokens) >= 2 and re.match(r"[A-Za-z_]\w*$", tokens[-1]):
+        tokens = tokens[:-1]
+    return " ".join(tokens).strip() or "int"
+
+
+def _pointee(type_name: str) -> str:
+    stripped = type_name.strip()
+    if stripped.endswith("*"):
+        return stripped[:-1].strip() or "int"
+    return stripped
+
+
+_SKIP_CALLS = {"if", "for", "while", "switch", "return", "sizeof"}
+
+
+def _iter_calls(text: str):
+    """Yield ``(function_name, [arg, ...])`` for C calls in ``text``."""
+    i = 0
+    n = len(text)
+    while i < n:
+        match = re.search(r"\b([A-Za-z_]\w*)\s*\(", text[i:])
+        if not match:
+            return
+        name = match.group(1)
+        paren = i + match.end() - 1
+        if name in _SKIP_CALLS:
+            i = paren + 1
+            continue
+        depth = 0
+        j = paren
+        while j < n:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    yield name, _split_params(text[paren + 1:j])
+                    i = j + 1
+                    break
+            j += 1
+        else:
+            return
+
+
+# A declaration has a return type before the name. A call, and a
+# ``sizeof(...)`` that has no semicolon of its own, do not. Nested
+# parentheses are excluded so one declarator cannot swallow the next.
+_PROTO_RE = re.compile(
+    r"(?:^|[;{}])\s*(?:[A-Za-z_]\w*\s+)+([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*;",
+    re.M,
+)
+
+
+def _looks_like_type(type_name: str) -> bool:
+    return bool(re.fullmatch(
+        r"[A-Za-z_][\w\s\*]*(\[\s*\d+\s*\])?",
+        (type_name or "").strip(),
+    ))
+
+
+def _index_prototypes(include_dirs: list[Path], extra_texts: list[str]) -> dict[str, list[str]]:
+    """Map a function name to the type of each parameter."""
+    protos: dict[str, list[str]] = {}
+
+    def absorb(text: str) -> None:
+        for match in _PROTO_RE.finditer(_without_comments(text)):
+            name = match.group(1)
+            if name in _SKIP_CALLS or name in protos:
+                continue
+            protos[name] = [
+                _type_of_param(part) for part in _split_params(match.group(2))
+            ]
+
+    for directory in include_dirs or []:
+        if directory is None or not Path(directory).is_dir():
+            continue
+        for header in Path(directory).iterdir():
+            if not header.is_file() or header.suffix.lower() not in _HEADER_EXTS:
+                continue
+            try:
+                absorb(header.read_text(errors="replace"))
+            except OSError:
+                continue
+    for text in extra_texts:
+        absorb(text)
+    return protos
+
+
+def _member_passed_as(arg: str, member: str) -> Optional[bool]:
+    """True when ``arg`` is ``&....member``, False when it is ``....member``.
+
+    None when this argument is not a use of ``member``.
+    """
+    cleaned = re.sub(r"^\s*\([^)]*\)\s*", "", arg.strip())
+    addressed = cleaned.startswith("&")
+    if addressed:
+        cleaned = cleaned[1:].strip()
+    if re.search(rf"(?:\.|->)\s*{re.escape(member)}\s*$", cleaned):
+        return addressed
+    return None
+
+
+def _rhs_type(rhs: str, style: str, known: dict[str, str]) -> str:
+    """A C type for an assignment's right-hand side."""
+    if re.search(r"\b\d+\.\d+f\b", rhs):
+        base = "float"
+    elif re.search(r"\b\d+\.\d+\b", rhs):
+        base = "double"
+    elif re.fullmatch(r"-?\d+[uUlL]*", rhs.strip()):
+        base = "int"
+    else:
+        base = "int"
+        for ident in re.findall(r"\b[A-Za-z_]\w*\b", rhs):
+            existing = known.get(ident)
+            if existing and re.search(r"float|double", existing, re.I):
+                base = existing
+                break
+    if base == "float" and "float32_t" in style:
+        return "float32_t"
+    return base
+
+
+def _without_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", text)
+
+
+def _infer_member_type(
+    c_text: str,
+    member: str,
+    style: str,
+    protos: dict[str, list[str]],
+    known: dict[str, str],
+    owners: Optional[list[str]] = None,
+) -> str:
+    """Choose a type for ``member`` from how the ``.c`` uses it.
+
+    ``owners`` limits the search to variables of the struct being fixed,
+    so a field named ``status`` on two different structs does not inherit
+    the other struct's type.
+    """
+    owner_alt = "|".join(re.escape(name) for name in (owners or []))
+    if owner_alt:
+        access = rf"\b(?:{owner_alt})\s*(?:\.|->)\s*{re.escape(member)}"
+    else:
+        access = rf"\b{re.escape(member)}"
+    indexes = [
+        int(n) for n in re.findall(rf"{access}\s*\[\s*(\d+)\s*\]", c_text)
+    ]
+    assigned = re.search(
+        rf"{access}\s*(?:\[\s*\d+\s*\])?\s*=\s*([^;]+)",
+        c_text,
+    )
+    element = _rhs_type(assigned.group(1), style, known) if assigned else "int"
+    if indexes:
+        return f"{element}[{max(indexes) + 1}]"
+    for func, args in _iter_calls(c_text):
+        params = protos.get(func)
+        if not params:
+            continue
+        for index, arg in enumerate(args):
+            if index >= len(params):
+                break
+            if owners and not any(
+                re.search(rf"\b{re.escape(owner)}\b", arg) for owner in owners
+            ):
+                continue
+            addressed = _member_passed_as(arg, member)
+            if addressed is None:
+                continue
+            param_type = params[index]
+            chosen = _pointee(param_type) if addressed else param_type
+            if _looks_like_type(chosen):
+                return chosen
+    if assigned:
+        return element
+    return "int"
+
+
+def _vars_of_type(text: str, type_name: str) -> list[str]:
+    return re.findall(
+        rf"\b{re.escape(type_name)}\s*\*?\s*(\w+)", text,
+    )
+
+
+def _members_used_on(text: str, var: str) -> list[str]:
+    found = re.findall(
+        rf"\b{re.escape(var)}\s*(?:\.|->)\s*(\w+)", text,
+    )
+    seen: list[str] = []
+    for name in found:
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _insert_member(text: str, struct_name: str, member: str, type_name: str) -> tuple[str, bool]:
+    """Add ``member`` inside the existing ``typedef struct`` named ``struct_name``."""
+    for name, body_start, close_at in _typedef_struct_spans(text):
+        if name != struct_name:
+            continue
+        body = text[body_start:close_at]
+        if re.search(rf"\b{re.escape(member)}\b", _without_comments(body)):
+            return text, False
+        # ``float[3] name`` is not valid; the array bound belongs on the name.
+        if type_name.endswith("]") and "[" in type_name:
+            element, bound = type_name.split("[", 1)
+            decl = f"    {element.strip()} {member}[{bound}"
+            if not decl.endswith(";"):
+                decl = decl if decl.endswith("]") else decl
+            if not decl.rstrip().endswith(";"):
+                decl = decl + ";"
+        else:
+            decl = f"    {type_name} {member};"
+        if not decl.endswith("\n"):
+            decl += "\n"
+        return text[:close_at] + decl + text[close_at:], True
+    return text, False
+
+
+def _append_typedef(text: str, block: str) -> str:
+    last = None
+    for last in re.finditer(r"^[ \t]*#\s*endif\b.*$", text, re.M):
+        pass
+    insertion = block if block.endswith("\n") else block + "\n"
+    if last is not None:
+        return text[:last.start()] + insertion + text[last.start():]
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + insertion
+
+
+def _drop_retypedefs(text: str) -> str:
+    """Remove a later ``typedef Other Name;`` when ``Name`` is already a struct."""
+    defined = {name for name, _start, _close in _typedef_struct_spans(text)}
+    if not defined:
+        return text
+
+    def repl(match: re.Match) -> str:
+        return "" if match.group(1) in defined else match.group(0)
+
+    return re.sub(
+        r"^[ \t]*typedef\s+(?!struct\b).+\s+(\w+)\s*;[ \t]*\n?",
+        repl,
+        text,
+        flags=re.M,
+    )
+
+
+def _drop_const_on(text: str, object_name: str) -> tuple[str, bool]:
+    lines = text.splitlines(keepends=True)
+    pattern = re.compile(rf"\b{re.escape(object_name)}\b")
+    for index, line in enumerate(lines):
+        if "const" not in line or not pattern.search(line):
+            continue
+        if "=" not in line and ";" not in line:
+            continue
+        lines[index] = re.sub(r"\bconst\b\s*", "", line, count=1)
+        return "".join(lines), True
+    return text, False
+
+
+_READONLY_AT_RE = re.compile(
+    rf":(\d+):\d+:\s*(?:error|warning):\s*assignment of member\s+{_QUOTED}\s+in read-only object",
+)
+_SUGGEST_RE = re.compile(
+    rf"{_QUOTED}\s+undeclared\b[^\n]*\bdid you mean\s+{_QUOTED}",
+    re.IGNORECASE,
+)
+
+
+def _known_field_types(texts: list[str]) -> dict[str, str]:
+    known: dict[str, str] = {}
+    for text in texts:
+        for _name, body_start, close_at in _typedef_struct_spans(text):
+            body = text[body_start:close_at]
+            for decl in re.findall(r"([^;{}]+);", body):
+                cleaned = re.sub(r"/\*.*?\*/", "", decl).strip()
+                if not cleaned or cleaned.startswith("#"):
+                    continue
+                first, *rest = [part.strip() for part in cleaned.split(",")]
+                tokens = first.replace("*", " * ").split()
+                if len(tokens) >= 2 and re.match(r"[A-Za-z_]\w*$", tokens[-1]):
+                    type_name = " ".join(tokens[:-1])
+                    fields = [tokens[-1]]
+                else:
+                    continue
+                for extra in rest:
+                    field = extra.replace("*", " ").split()
+                    if field:
+                        fields.append(field[-1])
+                for field in fields:
+                    field = field.split("[", 1)[0]
+                    if field:
+                        known.setdefault(field, type_name)
+    return known
+
+
+def realize_compiler_fixes(
+    *,
+    c_path: Path,
+    headers: list[Path],
+    err_struct: dict,
+    compiler_output: str,
+    include_dirs: list[Path],
+) -> list[str]:
+    """Finish a header edit the compile-fix agent left short of the compiler.
+
+    The agent is asked to add a missing member to the struct the compiler
+    named. When it instead declares a new struct, or leaves a const object
+    and an unknown type untouched, this puts the member on the existing
+    struct, typedefs an unknown type from how the ``.c`` uses it, aliases
+    an undeclared name to the compiler's own suggestion, and drops ``const``
+    from the object the assignment is writing.
+    """
+    notes: list[str] = []
+    if not c_path.is_file():
+        return notes
+    c_text = c_path.read_text(errors="replace")
+    header_texts = {
+        path: path.read_text(errors="replace")
+        for path in headers
+        if path.is_file()
+    }
+    texts = [c_text, *header_texts.values()]
+    known = _known_field_types(texts)
+    protos = _index_prototypes(include_dirs, texts)
+    style = "\n".join(texts)
+
+    def host_for(struct_name: str) -> Optional[Path]:
+        if struct_name in {n for n, _s, _c in _typedef_struct_spans(c_text)}:
+            return c_path
+        for path, text in header_texts.items():
+            if struct_name in {n for n, _s, _c in _typedef_struct_spans(text)}:
+                return path
+        return None
+
+    def write_back(path: Path, text: str) -> None:
+        nonlocal c_text
+        if path == c_path:
+            c_text = text
+            c_path.write_text(text)
+        elif path in header_texts:
+            header_texts[path] = text
+            path.write_text(text)
+
+    # Const removal uses the compiler's line numbers, so it has to happen
+    # before any insertion shifts the file.
+    c_lines = c_text.splitlines()
+    objects: set[str] = set()
+    for match in _READONLY_AT_RE.finditer(compiler_output or ""):
+        line_no = int(match.group(1))
+        member = match.group(2)
+        if 1 <= line_no <= len(c_lines):
+            found = re.search(
+                rf"\b(\w+)\s*(?:\.|->)\s*{re.escape(member)}\b",
+                c_lines[line_no - 1],
+            )
+            if found:
+                objects.add(found.group(1))
+    for obj in sorted(objects):
+        updated, changed = _drop_const_on(c_text, obj)
+        if changed:
+            write_back(c_path, updated)
+            notes.append(f"removed const from `{obj}`")
+
+    for struct_name, member in err_struct.get("missing_members") or []:
+        path = host_for(struct_name)
+        if path is None:
+            continue
+        current = c_text if path == c_path else header_texts[path]
+        owners = _vars_of_type(c_text, struct_name)
+        type_name = _infer_member_type(
+            c_text, member, style, protos, known, owners,
+        )
+        # Keep the array bound on the declarator. _infer returns ``double[3]``.
+        updated, changed = _insert_member(current, struct_name, member, type_name)
+        if changed:
+            updated = _drop_retypedefs(updated)
+            write_back(path, updated)
+            notes.append(
+                f"added `{member}` to existing struct `{struct_name}` in {path.name}"
+            )
+
+    dest = next(iter(header_texts), None)
+    for type_name in err_struct.get("unknown_types") or []:
+        if any(type_name in {n for n, _s, _c in _typedef_struct_spans(t)} for t in texts):
+            continue
+        owners = _vars_of_type(c_text, type_name)
+        members = []
+        for var in owners:
+            for member in _members_used_on(c_text, var):
+                if member not in members:
+                    members.append(member)
+        fields = []
+        for member in members:
+            field_type = _infer_member_type(
+                c_text, member, style, protos, known, owners,
+            )
+            if field_type.endswith("]") and "[" in field_type:
+                element, bound = field_type.split("[", 1)
+                fields.append(f"    {element.strip()} {member}[{bound};")
+            else:
+                fields.append(f"    {field_type} {member};")
+        if not fields:
+            fields.append("    unsigned char _unused;")
+        block = (
+            f"typedef struct {{\n"
+            + "\n".join(fields)
+            + f"\n}} {type_name};\n"
+        )
+        target = dest if dest is not None else c_path
+        current = header_texts[target] if target in header_texts else c_text
+        write_back(target, _append_typedef(current, block))
+        texts.append(block)
+        notes.append(f"typedef'd unknown type `{type_name}` in {target.name}")
+
+    suggested = {
+        match.group(1): match.group(2)
+        for match in _SUGGEST_RE.finditer(compiler_output or "")
+    }
+    macros: list[str] = []
+    for name in err_struct.get("undeclared") or []:
+        if not re.match(r"[A-Za-z_]\w*$", name):
+            continue
+        if name in suggested and re.match(r"[A-Za-z_]\w*$", suggested[name]):
+            macros.append(f"#define {name} {suggested[name]}")
+        elif name.isupper() or "_" in name and name.upper() == name:
+            macros.append(f"#define {name} 0")
+    if macros:
+        target = dest if dest is not None else c_path
+        current = header_texts[target] if target in header_texts else c_text
+        fresh = [
+            line for line in macros
+            if not re.search(rf"^\s*#\s*define\s+{re.escape(line.split()[1])}\b", current, re.M)
+        ]
+        if fresh:
+            write_back(target, _append_typedef(current, "\n".join(fresh) + "\n"))
+            notes.append(
+                "declared " + ", ".join(line.split()[1] for line in fresh)
+            )
+
+    return notes
+
+
 def run_per_file_compile(
     *,
     session_dir: Path,
@@ -2345,6 +2846,32 @@ def run_per_file_compile(
                 or err_struct["conflicting_types"]
             )
             touched_h = any(t.endswith(".h") for t in applied)
+            if touched_h and (
+                err_struct.get("missing_members")
+                or err_struct.get("unknown_types")
+                or err_struct.get("undeclared")
+                or err_struct.get("readonly_assigns")
+            ):
+                repair_notes = realize_compiler_fixes(
+                    c_path=cs,
+                    headers=fix_headers,
+                    err_struct=err_struct,
+                    compiler_output=output,
+                    include_dirs=include_dirs,
+                )
+                if repair_notes:
+                    for repaired in [cs, *fix_headers]:
+                        if repaired.is_file():
+                            snapshots[repaired.name] = _read_text_safe(repaired)
+                    yield _sse({
+                        "type": "info",
+                        "stage": "compile",
+                        "file": fname,
+                        "message": (
+                            "Placed compiler-named fields on the existing "
+                            "declarations — " + "; ".join(repair_notes)
+                        ),
+                    })
             if had_header_side_errors and not touched_h:
                 prev_missed_h_side = True
                 prev_missed_details = []

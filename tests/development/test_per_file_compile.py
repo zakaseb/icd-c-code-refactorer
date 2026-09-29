@@ -2139,6 +2139,85 @@ check("unified diff applies",
       _patched is not None and "value = 2" in _patched, _patched)
 
 # ---------------------------------------------------------------
+print("\n=== Test 30: a header edit that misses the named struct is completed ===")
+# The compile-fix agent is allowed to edit proto.h, but it appends a
+# new struct instead of adding `extra` to Sample_ts. The gate must put
+# `extra` on Sample_ts so the next compile succeeds.
+PROTO_H_WRONG = (
+    "#ifndef PROTO_H\n#define PROTO_H\n"
+    "typedef struct {\n"
+    "  int value;\n"
+    "} Sample_ts;\n"
+    "typedef struct {\n"
+    "  int extra;\n"
+    "} Sample_extra_ts;\n"
+    "void take(double *p);\n"
+    "#endif\n"
+)
+DRIVER_NEEDS_EXTRA = (
+    "#include \"proto.h\"\n"
+    "static Sample_ts sample;\n"
+    "static SampleTel_ts tel;\n"
+    "void run(void) {\n"
+    "  sample.extra = 1;\n"
+    "  tel.delta[0] = 1.5;\n"
+    "  tel.delta[1] = 1.5;\n"
+    "  take(&sample.scale);\n"
+    "}\n"
+)
+
+def _stub_30(system_prompt, user_prompt, **kw):
+    return f"### proto.h\n```c\n{PROTO_H_WRONG}```\n"
+
+with tempfile.TemporaryDirectory() as tmpd:
+    tmp = Path(tmpd)
+    sess, gen, code, repo = setup_session_dir(tmp)
+    (gen / "proto.h").write_text(
+        "#ifndef PROTO_H\n#define PROTO_H\n"
+        "typedef struct { int value; } Sample_ts;\n"
+        "#endif\n"
+    )
+    (gen / "driver.c").write_text(DRIVER_NEEDS_EXTRA)
+    (code / "proto.h").write_text((gen / "proto.h").read_text())
+    (code / "driver.c").write_text("void run(void){}\n")
+    saved = app._call_llm_complete
+    app._call_llm_complete = _stub_30
+    try:
+        events = drain(run_per_file_compile(
+            session_dir=sess, gen_dir=gen, code_dir=code, repo_dir=repo,
+            has_repo=False, change_spec="(adds extra)",
+            repo_knowledge="",
+            is_resume=False, completed_stages=set(),
+            max_fix_attempts=3, compile_timeout=30,
+            cc_override=NATIVE_CC,
+        ))
+    finally:
+        app._call_llm_complete = saved
+    summary = next((e for e in events if e["type"] == "compile_summary"), None)
+    fixed_h = (gen / "proto.h").read_text()
+    check("named struct gained the missing member",
+          "extra" in fixed_h.split("Sample_ts;")[0],
+          fixed_h)
+    check("unknown type was typedef'd with the used array field",
+          "SampleTel_ts" in fixed_h and "delta[2]" in fixed_h, fixed_h)
+    check("address-of argument used the prototype's pointee type",
+          "double scale" in fixed_h, fixed_h)
+    check("header miss is completed and the .c compiles",
+          summary and summary.get("ok") == 1 and summary.get("failed") == 0,
+          f"summary={summary}\nheader:\n{fixed_h}")
+
+_sizeof_protos = per_file_compile._index_prototypes([], [
+    "readStatus(dev, &msg.status);\n"
+    "#define MSG_SIZE sizeof(Message)\n"
+    "L1_Status readStatus(Device * self, Status * pStatus);\n",
+])
+check(
+    "sizeof does not swallow the following prototype",
+    _sizeof_protos.get("readStatus") == ["Device *", "Status *"],
+    _sizeof_protos,
+)
+
+# ---------------------------------------------------------------
 print(f"\n{'='*60}")
 print(f"Results: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")
 if FAIL > 0:

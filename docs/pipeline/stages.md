@@ -41,6 +41,7 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 - A line that is only a markdown code fence is removed before the first compile and again on anything the fix agent writes. If that fence split a statement, the truncated copy of the line is removed too. GCC otherwise reports a stray backtick.
 - The compile-fix reply is allowed a larger completion than a normal chat turn, so a complete header is not cut off mid-comment. A cut-off reply that is continued tends to reopen a code fence inside the file, and that rewrite is discarded.
 - A long `.c` may come back as a unified diff of the lines the compiler named. The header is still a complete file. A missing member is added to the struct that already has that name; a second typedef of the same name is not a fix. An assignment to a const object is reported to the fixer as its own item so it can drop `const` in that diff.
+- If that agent edits the header but leaves the missing member off the struct the compiler named, the compile gate adds the member there. The type comes from how the `.c` uses the field: the parameter of the function's declaration when the field is passed in, an array index, or the value being assigned. A call is not treated as that declaration, and words that appear only in a comment are not treated as members that already exist. An unknown type used as a struct is typedef'd the same way. An undeclared name is aliased to the identifier the compiler suggested. `const` is removed from an object the compiler says is read-only.
 
 ## Sandbox build
 
