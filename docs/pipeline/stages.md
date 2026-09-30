@@ -6,7 +6,7 @@ tags: [pipeline, stages]
 
 # Pipeline Stages
 
-Upload endpoints run **before** the SSE process stream. Processing is driven by `GET /api/process/{session_id}` → `event_stream()` in `api/app.py`.
+Upload endpoints run **before** the SSE process stream. Processing is driven by `GET /api/process/{session_id}` → `event_stream()` in `api/app.py`. The stages, agents, and retry loops are drawn in [architecture/pipeline.md](../architecture/pipeline.md).
 
 ## Stage table
 

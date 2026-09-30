@@ -25,6 +25,7 @@ Open **http://localhost:8081**. First start downloads the GGUF model into `model
 |-------|------|
 | Architecture & session layout | [architecture/overview.md](architecture/overview.md) |
 | Runtime diagram (Archify) | [architecture/runtime.md](architecture/runtime.md) |
+| Pipeline stages and agents | [architecture/pipeline.md](architecture/pipeline.md) |
 | End-to-end pipeline stages | [pipeline/stages.md](pipeline/stages.md) |
 | HTTP / SSE API surface | [api/surface.md](api/surface.md) |
 | Web UI ↔ backend | [webui/integration.md](webui/integration.md) |

@@ -21,6 +21,8 @@ This is the runtime map of a processing session. It was drawn with [Archify](htt
 
 The dashed **Docker container** box is the entrypoint's process group. **Host bind mounts** are the session directory and the SDK, which stay on the host and are mounted in.
 
+The stages inside FastAPI, and the agents that retry them, are drawn in [pipeline.md](pipeline.md).
+
 ## How a request moves
 
 1. The browser opens the Web UI.

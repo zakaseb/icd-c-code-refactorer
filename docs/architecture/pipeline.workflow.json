@@ -1,0 +1,517 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "ICD pipeline stages and agents",
+    "locale": "en",
+    "output": ".archify/workflow-pipeline-20260930-114000/pipeline.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/zakaseb/icd-c-code-refactorer.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "edf648e129576c99da2f9b930cd816398d2ae297"
+    }
+  },
+  "lanes": [
+    {
+      "id": "intake",
+      "label": "Before the stream"
+    },
+    {
+      "id": "stream",
+      "label": "Process stream"
+    },
+    {
+      "id": "retry",
+      "label": "Agents and retries",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "generate",
+      "label": "Generate",
+      "fromCol": 0,
+      "toCol": 2
+    },
+    {
+      "id": "check",
+      "label": "Check",
+      "fromCol": 3,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "build",
+      "label": "Build",
+      "fromCol": 5,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "groups": [
+    {
+      "id": "gen_retries",
+      "label": "Generation retries",
+      "lane": "retry",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "gate_retries",
+      "label": "Gate retries",
+      "lane": "retry",
+      "fromCol": 3,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "sandbox_backends",
+      "label": "Sandbox backends",
+      "lane": "retry",
+      "fromCol": 5,
+      "toCol": 5,
+      "variant": "security"
+    }
+  ],
+  "mainPath": [
+    "analysis",
+    "transform",
+    "header",
+    "verify",
+    "compile",
+    "sandbox"
+  ],
+  "nodes": [
+    {
+      "id": "upload",
+      "lane": "intake",
+      "col": 0,
+      "type": "frontend",
+      "label": "Upload",
+      "sublabel": "code + ICDs",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 4610,
+          "end_line": 4611,
+          "label": "upload code"
+        }
+      ]
+    },
+    {
+      "id": "analysis",
+      "lane": "stream",
+      "col": 0,
+      "type": "backend",
+      "label": "Analysis",
+      "sublabel": "change spec",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 4916,
+          "end_line": 4920,
+          "label": "process stream"
+        },
+        {
+          "path": "api/app.py",
+          "line": 5212,
+          "end_line": 5212,
+          "label": "analysis passes"
+        }
+      ]
+    },
+    {
+      "id": "transform",
+      "lane": "stream",
+      "col": 1,
+      "type": "backend",
+      "label": "Transform",
+      "sublabel": "per file",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 5527,
+          "end_line": 5533,
+          "label": "transform stage"
+        },
+        {
+          "path": "api/app.py",
+          "line": 5790,
+          "end_line": 5799,
+          "label": "three passes"
+        }
+      ]
+    },
+    {
+      "id": "header",
+      "lane": "stream",
+      "col": 2,
+      "type": "backend",
+      "label": "Header doc",
+      "sublabel": "ICD comments",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 6105,
+          "end_line": 6112,
+          "label": "header doc stage"
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "lane": "stream",
+      "col": 3,
+      "type": "security",
+      "label": "Verify",
+      "sublabel": "structural",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 6202,
+          "end_line": 6227,
+          "label": "structural checks"
+        },
+        {
+          "path": "api/app.py",
+          "line": 6412,
+          "end_line": 6427,
+          "label": "targeted fix"
+        }
+      ]
+    },
+    {
+      "id": "compile",
+      "lane": "stream",
+      "col": 4,
+      "type": "backend",
+      "label": "Compile",
+      "sublabel": "gcc to .o",
+      "sources": [
+        {
+          "path": "api/per_file_compile.py",
+          "line": 2308,
+          "end_line": 2313,
+          "label": "compile attempts"
+        },
+        {
+          "path": "api/app.py",
+          "line": 6565,
+          "end_line": 6566,
+          "label": "compile stage"
+        }
+      ]
+    },
+    {
+      "id": "sandbox",
+      "lane": "stream",
+      "col": 5,
+      "type": "backend",
+      "label": "Sandbox",
+      "sublabel": "full build",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 2755,
+          "end_line": 2768,
+          "label": "sandbox iterate"
+        },
+        {
+          "path": "api/app.py",
+          "line": 6608,
+          "end_line": 6616,
+          "label": "local or remote"
+        }
+      ]
+    },
+    {
+      "id": "chunks",
+      "lane": "retry",
+      "col": 0,
+      "type": "backend",
+      "label": "Chunk pass",
+      "sublabel": "map-reduce",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 5212,
+          "end_line": 5212,
+          "label": "analysis passes"
+        }
+      ]
+    },
+    {
+      "id": "cont",
+      "lane": "retry",
+      "col": 1,
+      "type": "backend",
+      "label": "Continue",
+      "sublabel": "max 3 passes",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 5790,
+          "end_line": 5806,
+          "label": "continuation"
+        }
+      ]
+    },
+    {
+      "id": "vfix",
+      "lane": "retry",
+      "col": 3,
+      "type": "security",
+      "label": "Targeted fix",
+      "sublabel": "one rewrite",
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 6412,
+          "end_line": 6427,
+          "label": "targeted fix"
+        }
+      ]
+    },
+    {
+      "id": "cfix",
+      "lane": "retry",
+      "col": 4,
+      "type": "backend",
+      "label": "Compile-fix",
+      "sublabel": "max 4 tries",
+      "sources": [
+        {
+          "path": "api/per_file_compile.py",
+          "line": 1653,
+          "end_line": 1653,
+          "label": "attempt cap"
+        },
+        {
+          "path": "api/per_file_compile.py",
+          "line": 2359,
+          "end_line": 2368,
+          "label": "give up"
+        }
+      ]
+    },
+    {
+      "id": "agentic",
+      "lane": "retry",
+      "col": 5,
+      "type": "backend",
+      "label": "Agentic",
+      "sublabel": "hypotheses",
+      "yOffset": -90,
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 226,
+          "end_line": 228,
+          "label": "default on"
+        },
+        {
+          "path": "api/agentic_debug.py",
+          "line": 1515,
+          "end_line": 1524,
+          "label": "phases"
+        }
+      ]
+    },
+    {
+      "id": "orch",
+      "lane": "retry",
+      "col": 5,
+      "type": "messagebus",
+      "label": "Orchestrator",
+      "sublabel": "ReAct loop",
+      "yOffset": 0,
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 3397,
+          "end_line": 3397,
+          "label": "orchestrator gate"
+        },
+        {
+          "path": "api/orchestrator.py",
+          "line": 712,
+          "end_line": 712,
+          "label": "ReAct entry"
+        }
+      ]
+    },
+    {
+      "id": "legacy",
+      "lane": "retry",
+      "col": 5,
+      "type": "external",
+      "label": "Legacy",
+      "sublabel": "rewrite loop",
+      "yOffset": 90,
+      "sources": [
+        {
+          "path": "api/app.py",
+          "line": 3740,
+          "end_line": 3744,
+          "label": "legacy loop"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "start",
+      "from": "upload",
+      "to": "analysis",
+      "label": "process",
+      "variant": "emphasis"
+    },
+    {
+      "id": "spec",
+      "from": "analysis",
+      "to": "transform",
+      "label": "change spec",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "files",
+      "from": "transform",
+      "to": "header",
+      "label": "sources",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "docs",
+      "from": "header",
+      "to": "verify",
+      "label": "headers",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "checked",
+      "from": "verify",
+      "to": "compile",
+      "label": "checked",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "objects",
+      "from": "compile",
+      "to": "sandbox",
+      "label": "objects",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "chunk-out",
+      "from": "analysis",
+      "to": "chunks",
+      "label": "repeat chunks",
+      "role": "branch"
+    },
+    {
+      "id": "trim-out",
+      "from": "transform",
+      "to": "cont",
+      "label": "truncated",
+      "role": "branch"
+    },
+    {
+      "id": "verify-out",
+      "from": "verify",
+      "to": "vfix",
+      "label": "one fix pass",
+      "variant": "security",
+      "role": "branch"
+    },
+    {
+      "id": "compile-out",
+      "from": "compile",
+      "to": "cfix",
+      "label": "gcc fail",
+      "role": "error"
+    },
+    {
+      "id": "use-agentic",
+      "from": "sandbox",
+      "to": "agentic",
+      "label": "default",
+      "variant": "emphasis",
+      "role": "branch"
+    },
+    {
+      "id": "trim-back",
+      "from": "cont",
+      "to": "transform",
+      "label": "continue",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "compile-back",
+      "from": "cfix",
+      "to": "compile",
+      "label": "retry",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "agentic-rebuild",
+      "from": "agentic",
+      "to": "sandbox",
+      "label": "rebuild",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "else-orch",
+      "from": "agentic",
+      "to": "orch",
+      "label": "if off",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "else-legacy",
+      "from": "orch",
+      "to": "legacy",
+      "label": "if off",
+      "variant": "dashed",
+      "role": "branch"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Generation",
+      "items": [
+        "Analysis can walk a large ICD in chunks, then distill the change spec.",
+        "Transform continues up to three times when a file is cut off.",
+        "Header documentation is one pass. It does not loop."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Gates",
+      "items": [
+        "Verify runs structural checks, one model pass, then one targeted rewrite.",
+        "Compile retries a compile-fix agent up to four times, then fills missing members from how the source uses them."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Sandbox",
+      "items": [
+        "Agentic debug is the default. It rebuilds: build, triage, root cause, plan, patch, verify, decide.",
+        "The if-off links are the fallback order, not extra steps after a successful agentic build. Orchestrator, then legacy.",
+        "REMOTE_BUILD_ENABLED replaces this local loop with a remote build."
+      ]
+    }
+  ]
+}
