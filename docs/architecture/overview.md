@@ -8,9 +8,11 @@ tags: [architecture, overview]
 
 ## Purpose
 
-`icd-c-code-refactorer` automates updating embedded C code when an Interface Control Document changes. Inference stays on-box: browser → FastAPI → LiteLLM → llama-server (GGUF).
+`icd-c-code-refactorer` automates updating embedded C code when an Interface Control Document changes. Inference stays on-box: the browser talks to FastAPI, and FastAPI posts chat completions straight to llama-server (GGUF). The container also starts LiteLLM on port 4000; the process stream does not call that URL.
 
 ## Component diagram
+
+The same runtime is drawn in [runtime.md](runtime.md) (Markdown plus the Archify JPEG).
 
 ```text
 ┌─────────────┐     SSE/REST      ┌──────────────────┐

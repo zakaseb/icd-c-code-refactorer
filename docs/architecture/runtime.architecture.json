@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "ICD C Code Refactorer runtime",
+    "locale": "en",
+    "output": ".archify/architecture-runtime-20260930-112600/runtime.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/zakaseb/icd-c-code-refactorer.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "77b31155321ab826228949a4bbbb49597deb56c3"
+    }
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "Browser",
+      "sublabel": "engineer",
+      "pos": [40, 48],
+      "size": [168, 72],
+      "sources": [
+        { "path": "api/static/index.html", "line": 10, "end_line": 13, "label": "page the browser opens" }
+      ]
+    },
+    {
+      "id": "webui",
+      "type": "frontend",
+      "label": "Web UI",
+      "sublabel": "api/static",
+      "pos": [300, 48],
+      "size": [188, 72],
+      "sources": [
+        { "path": "api/app.py", "line": 7661, "end_line": 7663, "label": "static mount" },
+        { "path": "api/static/index.html", "line": 1, "end_line": 8, "label": "SPA document" }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI",
+      "sublabel": "uvicorn :8081",
+      "pos": [590, 48],
+      "size": [200, 72],
+      "sources": [
+        { "path": "api/app.py", "line": 4780, "end_line": 4782, "label": "process stream" },
+        { "path": "api/app.py", "line": 110, "end_line": 110, "label": "llama-server base URL" },
+        { "path": "deployments/docker/entrypoint.sh", "line": 43, "end_line": 43, "label": "uvicorn pane" }
+      ]
+    },
+    {
+      "id": "llama",
+      "type": "backend",
+      "label": "llama-server",
+      "sublabel": "GGUF :24000",
+      "pos": [960, 48],
+      "size": [200, 72],
+      "sources": [
+        { "path": "api/app.py", "line": 1255, "end_line": 1255, "label": "chat completions" },
+        { "path": "deployments/docker/entrypoint.sh", "line": 37, "end_line": 39, "label": "llama-server pane" }
+      ]
+    },
+    {
+      "id": "sessions",
+      "type": "database",
+      "label": "Session store",
+      "sublabel": "workspace/sessions",
+      "pos": [425, 270],
+      "size": [210, 72],
+      "sources": [
+        { "path": "api/app.py", "line": 101, "end_line": 104, "label": "session directory" },
+        { "path": "api/app.py", "line": 4588, "end_line": 4591, "label": "create session" }
+      ]
+    },
+    {
+      "id": "hexsdk",
+      "type": "external",
+      "label": "HEX SDK",
+      "sublabel": "host mount",
+      "pos": [745, 270],
+      "size": [210, 72],
+      "sources": [
+        { "path": "api/hex_sdk.py", "line": 897, "end_line": 908, "label": "SDK discovery" },
+        { "path": "api/per_file_compile.py", "line": 1803, "end_line": 1810, "label": "compile-gate includes" }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Docker container",
+      "wraps": ["webui", "api", "llama"]
+    },
+    {
+      "kind": "region",
+      "label": "Host bind mounts",
+      "wraps": ["sessions", "hexsdk"]
+    }
+  ],
+  "connections": [
+    { "id": "open-ui", "from": "browser", "to": "webui", "label": "opens", "variant": "emphasis" },
+    { "id": "sse", "from": "webui", "to": "api", "label": "REST / SSE", "variant": "emphasis" },
+    { "id": "inference", "from": "api", "to": "llama", "label": "chat completions", "variant": "emphasis" },
+    { "id": "persist", "from": "api", "to": "sessions", "label": "session files" },
+    { "id": "sdk", "from": "api", "to": "hexsdk", "label": "SDK headers", "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Request path",
+      "items": [
+        "The browser loads the SPA, then follows the /api/process SSE stream.",
+        "Analysis, transform, verify, compile, and sandbox run inside FastAPI."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Inference",
+      "items": [
+        "Chat completions are posted to llama-server on port 24000.",
+        "The entrypoint also starts LiteLLM on port 4000. The process stream does not call that URL."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Build inputs",
+      "items": [
+        "Uploads and generated sources are written under workspace/sessions.",
+        "The compile gate adds HEX SDK include roots when a host SDK is mounted."
+      ]
+    }
+  ]
+}
