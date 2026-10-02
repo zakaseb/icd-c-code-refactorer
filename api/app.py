@@ -46,7 +46,15 @@ from per_file_compile import (
     preserve_original_script_names,
     repair_stray_closing_braces,
 )
+from transform_edits import (
+    EDIT_FORMAT_INSTRUCTIONS,
+    NO_MORE_EDITS,
+    apply_edit_blocks,
+    is_noop_transform,
+    parse_edit_blocks,
+)
 from codegraph import (
+    HEADER_EXTS,
     CodeGraph,
     Symbol,
     extract_symbols,
@@ -195,6 +203,42 @@ COMPILE_FIX_MAX_INPUT_TOKENS = int(os.environ.get(
 COMPILE_INCLUDE_SWEEP_REPO = os.environ.get(
     "COMPILE_INCLUDE_SWEEP_REPO", "1"
 ).strip().lower() not in ("0", "false", "no", "")
+
+# ---------------------------------------------------------------------------
+# Simplified pipeline: analysis -> transform (.h first, then .c) -> header
+# doc -> verification -> per-file compile. The compile stage is the last one.
+# ---------------------------------------------------------------------------
+# The sandbox "Build" stage (full-repo build with an agentic debug loop) was
+# the bulk of a run's wall-clock time. Off by default; 1 restores it.
+PIPELINE_SANDBOX_BUILD = os.environ.get(
+    "PIPELINE_SANDBOX_BUILD", "0"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
+# Compile + fix attempts per .c in the per-file compile stage.
+COMPILE_FIX_MAX_ATTEMPTS = int(os.environ.get("COMPILE_FIX_MAX_ATTEMPTS", "10"))
+
+# Characters of the Target ICD itself (its most relevant sections) handed to
+# each HEADER transform. Without it a header only sees the distilled change
+# spec and falls back on the Source-ICD layout it is given in full.
+TARGET_ICD_HEADER_CHARS = int(os.environ.get("TARGET_ICD_HEADER_CHARS", "30000"))
+
+# A file whose full rewrite would need more output than this many tokens is
+# transformed with SEARCH/REPLACE edit rounds: prompt + full rewrite of a
+# ~40 kB .c does not fit the context window, so the rewrite is always cut off.
+TRANSFORM_FULL_REWRITE_MAX_TOKENS = int(
+    os.environ.get("TRANSFORM_FULL_REWRITE_MAX_TOKENS", "8000")
+)
+TRANSFORM_EDIT_ROUNDS = int(os.environ.get("TRANSFORM_EDIT_ROUNDS", "6"))
+TRANSFORM_EDIT_OUTPUT_TOKENS = int(
+    os.environ.get("TRANSFORM_EDIT_OUTPUT_TOKENS", "8192")
+)
+
+# Per-variant header generation (one LLM call per peripheral variant, each
+# section with its own banner). Off by default: a header targets the variant
+# the Target ICD describes, in one pass. 1 restores the old behaviour.
+TRANSFORM_SPLIT_VARIANTS = os.environ.get(
+    "TRANSFORM_SPLIT_VARIANTS", "0"
+).strip().lower() not in ("0", "false", "no", "off", "")
 
 # Safety valve: a huge vendor SDK can produce thousands of -I flags and blow
 # past the shell ARG_MAX. 0 disables the cap.
@@ -437,6 +481,29 @@ PERIPHERAL_VARIATION_CODEGEN_GUIDANCE = (
     "under the original filename), exactly as before."
 )
 
+# Used instead of PERIPHERAL_VARIATION_CODEGEN_GUIDANCE unless
+# TRANSFORM_SPLIT_VARIANTS is on.
+TARGET_VARIANT_CODEGEN_GUIDANCE = (
+    "\n\nTARGET PERIPHERAL VARIANT:\n"
+    "The output targets the ONE peripheral variant the Target ICD describes.\n"
+    "- Do NOT split a file into per-variant sections and do NOT repeat the "
+    "file banner comment. A header has one banner comment at the top and one "
+    "include guard around its whole body.\n"
+    "- The output keeps the original filename, and every `#include` keeps the "
+    "exact path spelling from the original file.\n"
+    "- Existing identifiers keep their spelling: do not insert the new "
+    "peripheral number into `EV_*` / `FIFO_*` / `HUB_*` / function names. The "
+    "new ICD name belongs in comments and field documentation."
+)
+
+
+def _variant_guidance() -> str:
+    return (
+        PERIPHERAL_VARIATION_CODEGEN_GUIDANCE if TRANSFORM_SPLIT_VARIANTS
+        else TARGET_VARIANT_CODEGEN_GUIDANCE
+    )
+
+
 # Appended to the transform system prompt. This is the enforceable half of
 # what rules 10-12 above only gesture at: those say "maintain compatibility
 # with dependent modules" without ever telling the model WHICH symbols have
@@ -447,19 +514,26 @@ CHANGE_LOCALITY_GUIDANCE = (
     "The `## Change Impact` section lists the symbols this file defines and "
     "how many places outside it depend on each one. Those other files are NOT "
     "being regenerated — whatever you break in them stays broken.\n"
-    "- Symbols marked `FROZEN` are referenced by files you cannot see and are "
-    "not editing. Keep their exact spelling, and for functions their exact "
-    "parameter list and return type.\n"
-    "- Change a FROZEN symbol ONLY when the Target ICD makes keeping it "
-    "impossible. Adding a struct field, widening a field, or adding an "
-    "enumerator almost never requires renaming anything.\n"
-    "- Symbols marked `local` are yours to rename freely.\n"
-    "- Prefer additive change. Do NOT reorder, re-spell, or re-case existing "
-    "members for tidiness, consistency, or style — that is not a "
-    "transformation, it is breakage.\n"
-    "- A renamed identifier is not an improvement the ICD asked for. If the "
-    "ICD renames a *field on the wire*, that does not oblige you to rename "
-    "the C identifier that carries it.\n"
+    "- Symbols marked `FROZEN` are referenced by modules you cannot see and "
+    "are not editing. REUSE them for the Target ICD: keep their NAME (type "
+    "name, struct tag, macro / enumerator name, function name and parameter "
+    "list) so those modules still compile, but make their CONTENT follow the "
+    "Target ICD, not the Source ICD.\n"
+    "- For a reused struct, its members, types, widths, order and array sizes "
+    "are those of the Target ICD message it now represents. Where a Target "
+    "ICD field is the same quantity as an existing member, keep the member "
+    "name and give it the Target ICD type and size. Add the members the "
+    "Target ICD adds. Remove members the Target ICD no longer has and list "
+    "each in the manifest's `fields_removed`.\n"
+    "- For a reused macro or enumerator, its VALUE follows the Target ICD "
+    "(message IDs, lengths, sync words, scale factors, rates, limits).\n"
+    "- Never keep a Source-ICD-only field, value or message because its name "
+    "is FROZEN. A file that still describes the Source ICD is wrong even if "
+    "it compiles.\n"
+    "- Symbols marked `shared` or `local` follow the Target ICD fully, names "
+    "included.\n"
+    "- Do NOT reorder, re-spell, or re-case anything the Target ICD does not "
+    "require — that is breakage, not a transformation.\n"
     "\nIMPACT MANIFEST (REQUIRED):\n"
     "After the closing ``` of your code, on its own line, output "
     "`IMPACT-MANIFEST:` followed by a single JSON object recording every "
@@ -471,8 +545,8 @@ CHANGE_LOCALITY_GUIDANCE = (
     '\"to\": \"<new>\", \"reason\": \"...\"}], '
     '\"fields_removed\": [{\"struct\": \"S\", \"field\": \"f\", '
     '\"reason\": \"...\"}]}\n'
-    "Write `IMPACT-MANIFEST: {}` when you changed no FROZEN symbol — which "
-    "should be the common case. An empty manifest alongside a renamed FROZEN "
+    "Write `IMPACT-MANIFEST: {}` when you changed no FROZEN symbol. An "
+    "empty manifest alongside a renamed FROZEN "
     "symbol will be rejected. The manifest is NOT a `###` heading and must "
     "not be written as one."
 )
@@ -2180,6 +2254,209 @@ def _audit_transform_impact(
             report["unauthorized"].append(break_info)
 
     return report
+
+
+_INCLUDE_NAME_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
+
+
+def _header_first_order(files: list[Path]) -> list[Path]:
+    """Headers first — each after the uploaded headers it includes — then the
+    other files, all in name order. An include cycle falls back to name order.
+
+    A .c is then transformed against headers that already follow the Target
+    ICD, instead of before them (plain name order puts foo.c before foo.h).
+    """
+    headers = sorted((p for p in files if p.suffix.lower() in HEADER_EXTS), key=lambda p: p.name)
+    others = sorted((p for p in files if p.suffix.lower() not in HEADER_EXTS), key=lambda p: p.name)
+    by_lower = {p.name.lower(): p for p in headers}
+    deps: dict[Path, set[Path]] = {}
+    for h in headers:
+        deps[h] = {
+            by_lower[Path(inc).name.lower()]
+            for inc in _INCLUDE_NAME_RE.findall(_read_text_safe(h))
+            if Path(inc).name.lower() in by_lower and by_lower[Path(inc).name.lower()] != h
+        }
+    ordered: list[Path] = []
+    remaining = list(headers)
+    while remaining:
+        ready = [h for h in remaining if deps[h] <= set(ordered)]
+        if not ready:
+            ordered.extend(remaining)
+            break
+        ordered.append(ready[0])
+        remaining.remove(ready[0])
+    return ordered + others
+
+
+def _overlay_generated_reader(gen_dir: Path, header_names: Iterable[str]):
+    """File reader returning the transformed copy of an uploaded header.
+
+    Matched by basename, so a repository copy of the same header (the old
+    version the compile gate's -I order replaces) reads as the new one too.
+    Given to ``CodeGraph.build`` it keeps every path — and so the FROZEN /
+    batch bookkeeping — while the declarations a .c is shown come from the
+    transformed header.
+    """
+    by_lower = {name.lower(): name for name in header_names}
+
+    def read(path: Path) -> str:
+        name = by_lower.get(path.name.lower())
+        if name is not None and (gen_dir / name).is_file():
+            return _read_text_safe(gen_dir / name)
+        return _read_text_safe(path)
+
+    return read
+
+
+def _transformed_headers_section(
+    source_text: str, gen_dir: Path, header_names: set[str], max_chars: int = 30_000,
+) -> str:
+    """The transformed uploaded headers *source_text* includes (directly or
+    through each other), in full, as the authority the .c is rewritten to."""
+    by_lower = {n.lower(): n for n in header_names if (gen_dir / n).is_file()}
+    todo = [Path(i).name.lower() for i in _INCLUDE_NAME_RE.findall(source_text or "")]
+    picked: list[str] = []
+    while todo:
+        key = todo.pop(0)
+        name = by_lower.get(key)
+        if name is None or name in picked:
+            continue
+        picked.append(name)
+        todo.extend(
+            Path(i).name.lower()
+            for i in _INCLUDE_NAME_RE.findall(_read_text_safe(gen_dir / name))
+        )
+    if not picked:
+        return ""
+    parts = [
+        "## Transformed Headers (Target ICD — authoritative)\n"
+        "These headers were already transformed to the Target ICD. Rewrite this "
+        "file against them: use exactly the types, struct members, macros and "
+        "function signatures they declare. Where they differ from this file, "
+        "the headers win. Do not re-declare, alias or bring back anything they "
+        "dropped.\n"
+    ]
+    budget = max_chars
+    for name in picked:
+        body = _read_text_safe(gen_dir / name)
+        if len(body) > budget:
+            continue
+        budget -= len(body)
+        parts.append(f"\n### {name} (transformed)\n```c\n{body}\n```\n")
+    return "".join(parts)
+
+
+def _select_icd_excerpt(icd_text: str, anchor_text: str, max_chars: int) -> str:
+    """The parts of an ICD most relevant to *anchor_text*, in document order.
+
+    The ICD is cut into ~ICD_CHUNK_CHARS chunks on paragraph boundaries and
+    each chunk scores by the distinctive tokens it shares with the anchor
+    (the header being transformed plus the change spec), so the message
+    layout tables for that header win over boilerplate.
+    """
+    if not icd_text or max_chars <= 0:
+        return ""
+    if len(icd_text) <= max_chars:
+        return icd_text
+    chunks: list[str] = []
+    buf = ""
+    for para in re.split(r"\n\s*\n", icd_text):
+        if buf and len(buf) + len(para) > ICD_CHUNK_CHARS:
+            chunks.append(buf)
+            buf = ""
+        buf = f"{buf}\n\n{para}" if buf else para
+        while len(buf) > ICD_CHUNK_CHARS * 2:
+            chunks.append(buf[:ICD_CHUNK_CHARS])
+            buf = buf[ICD_CHUNK_CHARS:]
+    if buf:
+        chunks.append(buf)
+    anchor = {t.lower() for t in _extract_fact_tokens(anchor_text)}
+    scored = sorted(
+        ((len({t.lower() for t in _extract_fact_tokens(c)} & anchor), i)
+         for i, c in enumerate(chunks)),
+        key=lambda x: (-x[0], x[1]),
+    )
+    picked: set[int] = set()
+    used = 0
+    for score, idx in scored:
+        if score == 0:
+            break
+        if used + len(chunks[idx]) + 8 > max_chars:
+            continue
+        picked.add(idx)
+        used += len(chunks[idx]) + 8
+    return "\n\n[...]\n\n".join(chunks[i] for i in sorted(picked))
+
+
+def _needs_edit_mode(text: str) -> bool:
+    return int(_estimate_tokens(text) * 1.15) > TRANSFORM_FULL_REWRITE_MAX_TOKENS
+
+
+def _edit_rounds(
+    system_prompt: str,
+    context_prompt: str,
+    text: str,
+    fname: str,
+    *,
+    stage: str = "transform",
+    max_rounds: int | None = None,
+):
+    """Transform *text* with SEARCH/REPLACE rounds. A generator: yields SSE
+    events and returns ``(text, raw_replies, applied)``.
+
+    Each round sends the CURRENT file (input is cheap; output is not) and asks
+    only for the edits still needed. Stops on `NO MORE EDITS`, on a round that
+    applies nothing, or after *max_rounds*.
+    """
+    raws: list[str] = []
+    applied_total = 0
+    last_failed: list[str] = []
+    for rnd in range(1, (max_rounds or TRANSFORM_EDIT_ROUNDS) + 1):
+        follow_up = ""
+        if rnd > 1:
+            follow_up = (
+                "\nThe edits from earlier rounds are ALREADY applied to the file "
+                "above. Emit only the edits that are still needed.\n"
+                + (
+                    "These SEARCH texts did not match last round — copy the lines "
+                    "exactly as they appear now:\n"
+                    + "\n".join(f"  - {f}" for f in last_failed[:10]) + "\n"
+                    if last_failed else ""
+                )
+            )
+        prompt = (
+            f"{context_prompt}\n\n## Current file: {fname}\n```c\n{text}\n```\n\n"
+            f"{EDIT_FORMAT_INSTRUCTIONS}{follow_up}"
+        )
+        parts: list[str] = []
+        try:
+            for batch in _batched_stream_text(
+                _call_llm_stream(system_prompt, prompt, max_tokens=TRANSFORM_EDIT_OUTPUT_TOKENS)
+            ):
+                parts.append(batch)
+                yield _sse({"type": "token", "stage": stage, "file": fname, "token": batch})
+        except Exception as e:                              # noqa: BLE001
+            log.warning("Edit round %d for %s failed: %s", rnd, fname, e)
+            break
+        raw = "".join(parts)
+        raws.append(raw)
+        blocks = parse_edit_blocks(raw)
+        result = apply_edit_blocks(text, blocks)
+        text = result.text
+        applied_total += result.applied
+        last_failed = result.failed
+        yield _sse({
+            "type": "info",
+            "stage": stage,
+            "file": fname,
+            "message": (
+                f"{fname}: edit round {rnd} — {result.applied} edit(s) applied"
+                + (f", {len(result.failed)} did not match" if result.failed else "")
+            ),
+        })
+        if NO_MORE_EDITS in raw or not blocks or result.applied == 0:
+            break
+    return text, raws, applied_total
 
 
 def _format_impact_breaks(breaks: list[dict]) -> str:
@@ -4759,6 +5036,31 @@ async def pause_session(session_id: str):
     }
 
 
+def _is_compile_terminate_requested(session_dir: Path) -> bool:
+    return bool(_read_status(session_dir).get("compile_terminate_requested"))
+
+
+@app.post("/api/compile/terminate/{session_id}")
+async def terminate_compile(session_id: str):
+    """Stop the per-file compile loop and finish with the results so far.
+
+    The compile stage checks this flag before every compile: no further fix
+    pass runs, files not reached yet get one plain compile, compile_report.txt
+    is written, and the run completes.
+    """
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    status = _read_status(session_dir)
+    status["compile_terminate_requested"] = True
+    status["compile_terminate_requested_at"] = datetime.now(timezone.utc).isoformat()
+    _write_status(session_dir, status)
+    return {
+        "ok": True,
+        "message": "Stop requested; the compile stage finishes with the results so far.",
+    }
+
+
 @app.post("/api/resume/{session_id}")
 async def resume_session(session_id: str):
     """Clear pause state; the frontend then reconnects to /api/process."""
@@ -4808,6 +5110,8 @@ async def process(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # A stop request belongs to the run it was pressed in.
+    status["compile_terminate_requested"] = False
     # Persist so resume / regenerate can reuse the user's choice.
     if sandbox_max_retries is _SANDBOX_RETRIES_UNSET:
         status["sandbox_retries_mode"] = "env"
@@ -4889,6 +5193,14 @@ async def process(
     # Files being regenerated this run. A symbol used only by these is not
     # "frozen": its consumers get rewritten too.
     transform_batch: set[Path] = set(code_files)
+    # The repository ZIP usually also holds the OLD copy of each uploaded
+    # script. The generated file replaces it, so its references must not make
+    # symbols FROZEN — only genuinely other modules should.
+    if code_graph is not None:
+        _uploaded_lower = {p.name.lower() for p in code_files}
+        transform_batch |= {
+            f for f in code_graph.files if f.name.lower() in _uploaded_lower
+        }
 
     log.info(
         "Process %s: %d code files, source_icd=%d chars, target_icd=%d chars, "
@@ -5503,7 +5815,19 @@ async def process(
         # never ran.
         impact_reports: list[dict] = []
         impact_audited: list[dict] = []
-        for i, code_file in enumerate(code_files):
+        # Headers first, so every .c is rewritten against headers that already
+        # follow the Target ICD. `prompt_graph` is the CodeGraph re-indexed
+        # with the transformed headers overlaid (the .c's dependency slices
+        # come from it); `code_graph` stays the pre-transform index, which is
+        # what FROZEN is about: who uses the OLD names today.
+        transform_files = _header_first_order(code_files)
+        uploaded_headers = {
+            p.name for p in code_files if p.suffix.lower() in HEADER_EXTS
+        }
+        prompt_graph = code_graph
+        graph_overlay: frozenset[str] = frozenset()
+        failed_files: set[str] = set()
+        for i, code_file in enumerate(transform_files):
             fname = code_file.name
             if (
                 is_resume
@@ -5534,6 +5858,24 @@ async def process(
             })
 
             original = _read_text_safe(code_file)
+
+            # Headers already transformed in this run (earlier in the order).
+            done_headers = frozenset(
+                p.name for p in transform_files[:i]
+                if p.name in uploaded_headers and p.name not in failed_files
+                and (gen_dir / p.name).exists()
+            )
+            if done_headers and done_headers != graph_overlay and code_graph is not None:
+                try:
+                    prompt_graph = CodeGraph.build(
+                        code_dir,
+                        repo_dir if has_repo else None,
+                        read_text=_overlay_generated_reader(gen_dir, done_headers),
+                    )
+                    graph_overlay = done_headers
+                except Exception as e:                      # noqa: BLE001
+                    log.exception("CodeGraph overlay rebuild failed: %s", e)
+            sec_headers = _transformed_headers_section(original, gen_dir, set(done_headers))
 
             transform_system = (
                 "You are an expert C programmer specializing in embedded systems "
@@ -5569,7 +5911,7 @@ async def process(
                 "11. Ensure #include directives reference correct repository headers\n"
                 "12. Maintain compatibility with all dependent modules in the repository"
                 f"{CHANGE_LOCALITY_GUIDANCE}"
-                f"{PERIPHERAL_VARIATION_CODEGEN_GUIDANCE}"
+                f"{_variant_guidance()}"
             )
 
             sec_change = (
@@ -5578,6 +5920,21 @@ async def process(
             sec_target = (
                 f"## Target ICD Consolidated Summary\n\n{target_summary}"
             )
+            # A header carries the message layouts, so it gets the Target ICD
+            # itself (its most relevant sections), not only the distilled spec.
+            sec_icd = ""
+            if fname.lower().endswith(".h") and TARGET_ICD_HEADER_CHARS > 0:
+                _excerpt = _select_icd_excerpt(
+                    target_icd, f"{original}\n{change_spec}", TARGET_ICD_HEADER_CHARS,
+                )
+                if _excerpt:
+                    sec_icd = (
+                        "## Target ICD — authoritative for this header\n"
+                        "Struct members, field types and widths, array sizes, "
+                        "message IDs, lengths and constant values in this header "
+                        "must match these definitions. Reused (FROZEN) names stay; "
+                        "what they declare follows this text.\n\n" + _excerpt
+                    )
 
             # Codebase-informed context. The three sections below replace the
             # old repo-dependency / repo-knowledge dumps, which were assembled
@@ -5603,11 +5960,11 @@ async def process(
                     if i.frozen
                 ]
                 sec_deps = render_dependency_slices(
-                    code_graph, code_file, original,
+                    prompt_graph, code_file, original,
                     max_chars=MAX_REPO_CONTEXT_CHARS,
                 )
                 sec_targets = render_spec_targets(
-                    code_graph, code_file,
+                    prompt_graph, code_file,
                     _extract_fact_tokens(change_spec), transform_batch,
                 )
                 log.info(
@@ -5617,6 +5974,8 @@ async def process(
                 )
 
             base_sections = [
+                ("transformed_headers", sec_headers, 1),
+                ("target_icd", sec_icd, 1),
                 ("change_impact", sec_impact, 1),
                 ("change_spec", sec_change, 1),
                 ("dependency_decls", sec_deps, 2),
@@ -5631,7 +5990,7 @@ async def process(
             # peripheral, generate each variant with a focused call, then
             # write them into the ORIGINAL filename. A new peripheral name
             # must not create plImu15Msg.h beside plImu20Msg.h.
-            if is_header:
+            if is_header and TRANSFORM_SPLIT_VARIANTS:
                 variant_names = _detect_peripheral_variants(
                     original, fname, change_spec, target_summary,
                 )
@@ -5720,7 +6079,19 @@ async def process(
                         ),
                     })
 
-            if is_header:
+            if not TRANSFORM_SPLIT_VARIANTS:
+                variation_instr = (
+                    f"Keep this file's name exactly ({fname}) and keep every "
+                    "`#include` path spelled exactly as in the original file. "
+                    "Target only the peripheral variant the Target ICD describes"
+                    + (": one banner comment, one include guard around the "
+                       "whole header, no per-variant sections. " if is_header
+                       else ". ")
+                    + "Do not emit `### <filename>` markers, and do not rename "
+                    "existing EV_ / FIFO_ / HUB_ identifiers to the new "
+                    "peripheral name. "
+                )
+            elif is_header:
                 variation_instr = (
                     f"Keep this file's name exactly ({fname}). Do not invent a "
                     "new script named after the ICD peripheral or a variation. "
@@ -5751,9 +6122,17 @@ async def process(
                 "Ensure the generated code is FULLY COMPATIBLE with the repository "
                 "codebase — use the exact type names, function signatures, and "
                 "#include paths from the declarations above. "
-                "Keep the change as LOCAL as possible: honour the FROZEN markings "
-                "in the change-impact table, and end your reply with the "
-                "`IMPACT-MANIFEST:` line. "
+                + (
+                    "This is the SOURCE-ICD version: the Target ICD changes MUST "
+                    "appear in your output — returning it unchanged is wrong. "
+                    if is_header else
+                    "Build it against the Transformed Headers above: where they "
+                    "differ from this file, the headers win. "
+                    if sec_headers else ""
+                )
+                + "Reuse every FROZEN name from the change-impact table, but "
+                "make what it declares match the Target ICD; end your reply with "
+                "the `IMPACT-MANIFEST:` line. "
                 f"{variation_instr}"
                 "Output the complete file — do not omit any sections. "
                 "Do not summarize. Do not truncate. Include the full ending of the file."
@@ -5764,18 +6143,32 @@ async def process(
                 _render_hex_sdk_llm_context(hex_sdk, max_chars=5000)
                 if hex_sdk is not None else ""
             )
+            edit_mode = _needs_edit_mode(original)
             prompt_sections = [
                 ("file_to_transform", sec_file, 0),
+                ("transformed_headers", sec_headers, 1),
+                ("target_icd", sec_icd, 1),
                 ("change_impact", sec_impact, 1),
                 ("change_spec", sec_change, 1),
                 ("hex_sdk", sec_hex_sdk, 1),
                 ("dependency_decls", sec_deps, 2),
                 ("spec_targets", sec_targets, 2),
-                ("target_summary", sec_target, 3),
+                ("target_summary", sec_target, 1 if is_header else 3),
             ]
+            # Leave room for the reply. Filling the window with prompt made
+            # the context clamp cut max_tokens, so a full rewrite of a large
+            # file could never finish.
+            full_out_tokens = max(MAX_OUTPUT_TOKENS, int(_estimate_tokens(original) * 1.15))
+            reply_reserve = (
+                TRANSFORM_EDIT_OUTPUT_TOKENS + _estimate_tokens(original) + 600
+                if edit_mode else full_out_tokens
+            )
             transform_prompt = _assemble_prompt(
                 prompt_sections,
-                max_input_tokens=MAX_INPUT_TOKENS - system_tokens,
+                max_input_tokens=max(
+                    2000,
+                    CTX_SIZE_TOKENS - LLM_PROMPT_SAFETY_TOKENS - system_tokens - reply_reserve,
+                ),
             )
             log.info(
                 "Transform prompt for %s: %d chars (%d est. tokens) — "
@@ -5787,11 +6180,63 @@ async def process(
             clean = ""
             last_chunk = ""
             last_raw = ""
-            max_attempts = 3
-            for attempt in range(1, max_attempts + 1):
+            max_attempts = 0 if edit_mode else 3
+            if edit_mode:
+                yield _sse({
+                    "type": "info",
+                    "stage": "transform",
+                    "file": fname,
+                    "message": (
+                        f"{fname} is too large to re-emit in one reply "
+                        f"(~{_estimate_tokens(original)} tokens) — transforming it "
+                        "with SEARCH/REPLACE edit rounds."
+                    ),
+                })
+                edit_context = _assemble_prompt(
+                    [sec for sec in prompt_sections if sec[0] != "file_to_transform"]
+                    + [("task", (
+                        f"## Task\nTransform {fname} (the current file below) so it "
+                        "fully conforms to the Target ICD, following every rule "
+                        "above. Keep its file name and #include paths. Put the "
+                        "`IMPACT-MANIFEST:` line after your last edit block."
+                    ), 0)],
+                    max_input_tokens=max(
+                        2000,
+                        CTX_SIZE_TOKENS - LLM_PROMPT_SAFETY_TOKENS - system_tokens
+                        - reply_reserve,
+                    ),
+                )
+                clean, edit_raws, edit_applied = yield from _edit_rounds(
+                    transform_system, edit_context, original, fname,
+                )
+                last_raw = "\n".join(edit_raws)
+                if edit_applied == 0:
+                    yield _sse({
+                        "type": "info",
+                        "stage": "transform",
+                        "file": fname,
+                        "message": (
+                            f"⚠ WARNING — {fname}: no edit could be applied; the "
+                            "file is unchanged from the Source ICD."
+                        ),
+                    })
+            echo_retry_used = False
+            attempt = 0
+            while attempt < max_attempts:
+                attempt += 1
                 file_parts: list[str] = []
                 attempt_prompt = transform_prompt
-                if attempt > 1:
+                if attempt > 1 and clean == "" and echo_retry_used:
+                    # Retry after an unchanged header: start from scratch with
+                    # the warning, not as a continuation.
+                    attempt_prompt = (
+                        f"{transform_prompt}\n\n## Your previous answer was rejected\n"
+                        "You returned the Source-ICD file unchanged. The Target "
+                        "ICD changes struct members, types, sizes and values in "
+                        "this file — apply them now. Keep the FROZEN names; change "
+                        "what they declare."
+                    )
+                elif attempt > 1:
                     yield _sse({
                         "type": "info",
                         "stage": "transform",
@@ -5807,7 +6252,7 @@ async def process(
                     )
                 meta: dict = {}
                 try:
-                    max_tokens=max(MAX_OUTPUT_TOKENS, int(_estimate_tokens(original) * 1.15))
+                    max_tokens = full_out_tokens
                     for batch in _batched_stream_text(
                         _call_llm_stream(
                             transform_system, attempt_prompt,
@@ -5861,6 +6306,22 @@ async def process(
                     )
 
                 if _looks_complete_c_file(clean, original, fname):
+                    # A header returned unchanged is not a transform: one retry
+                    # with an explicit rejection.
+                    if is_header and not echo_retry_used and is_noop_transform(original, clean):
+                        echo_retry_used = True
+                        clean = ""
+                        yield _sse({
+                            "type": "info",
+                            "stage": "transform",
+                            "file": fname,
+                            "message": (
+                                f"{fname}: the model returned the Source-ICD header "
+                                "unchanged — retrying with the rejection."
+                            ),
+                        })
+                        max_attempts = max(max_attempts, attempt + 1)
+                        continue
                     break
 
                 # finish_reason "stop" means the model ended deliberately -- there
@@ -5878,7 +6339,10 @@ async def process(
             # header file per variation (### <name>.h + fenced block).
             # Write each such file separately; otherwise fall through to the
             # normal single-file path below.
-            variation_headers = _split_variation_header_files(last_raw, fname)
+            variation_headers = (
+                _split_variation_header_files(last_raw, fname)
+                if TRANSFORM_SPLIT_VARIANTS else {}
+            )
             if variation_headers:
                 incomplete = [
                     n for n, c in variation_headers.items()
@@ -5916,6 +6380,7 @@ async def process(
                 )
 
             if not _looks_complete_c_file(clean, original, fname):
+                failed_files.add(fname)
                 yield _sse({
                     "type": "error",
                     "message": (
@@ -5925,6 +6390,16 @@ async def process(
                     "file": fname,
                 })
                 continue
+            if is_noop_transform(original, clean):
+                yield _sse({
+                    "type": "info",
+                    "stage": "transform",
+                    "file": fname,
+                    "message": (
+                        f"⚠ WARNING — {fname}: the output is still identical to "
+                        "the Source-ICD file (only comments/whitespace differ)."
+                    ),
+                })
 
             clean = preserve_original_script_names(original, clean)
 
@@ -5973,8 +6448,8 @@ async def process(
                     "them:\n\n"
                     f"{_format_impact_breaks(breaks)}\n\n"
                     "Emit the file again, restoring each symbol above to its "
-                    "ORIGINAL spelling and signature, while KEEPING every "
-                    "genuine ICD change you made. If the Target ICD truly makes "
+                    "ORIGINAL name and signature, while KEEPING every "
+                    "Target ICD change to what it declares. If the Target ICD truly makes "
                     "one of them impossible to keep, leave that one changed and "
                     "justify it in the manifest by citing the ICD clause. "
                     "Change nothing else. Output the complete file in ```c "
@@ -5984,26 +6459,44 @@ async def process(
                 repair_max_tokens = max(
                     MAX_OUTPUT_TOKENS, int(_estimate_tokens(clean) * 1.15),
                 )
-                try:
-                    for batch_text in _batched_stream_text(
-                        _call_llm_stream(
-                            transform_system, repair_prompt,
-                            max_tokens=repair_max_tokens,
-                        )
-                    ):
-                        repair_parts.append(batch_text)
-                        yield _sse({
-                            "type": "token",
-                            "stage": "transform",
-                            "file": fname,
-                            "token": batch_text,
-                        })
-                except Exception as e:                      # noqa: BLE001
-                    log.warning("Impact repair for %s failed: %s", fname, e)
-                    repair_parts = []
+                repaired_by_edits = None
+                if _needs_edit_mode(clean):
+                    edited, repair_parts, n_applied = yield from _edit_rounds(
+                        transform_system,
+                        f"{sec_impact}\n\n## Undeclared Breaking Changes\n"
+                        f"{_format_impact_breaks(breaks)}\n\n"
+                        "Restore each symbol above to its ORIGINAL name and "
+                        "signature while keeping every Target ICD change to what "
+                        "it declares, unless the Target ICD makes that impossible "
+                        "(then justify it in an `IMPACT-MANIFEST:` line). Change "
+                        "nothing else.",
+                        clean, fname, max_rounds=3,
+                    )
+                    repaired_by_edits = edited if n_applied else ""
+                else:
+                    try:
+                        for batch_text in _batched_stream_text(
+                            _call_llm_stream(
+                                transform_system, repair_prompt,
+                                max_tokens=repair_max_tokens,
+                            )
+                        ):
+                            repair_parts.append(batch_text)
+                            yield _sse({
+                                "type": "token",
+                                "stage": "transform",
+                                "file": fname,
+                                "token": batch_text,
+                            })
+                    except Exception as e:                      # noqa: BLE001
+                        log.warning("Impact repair for %s failed: %s", fname, e)
+                        repair_parts = []
 
                 repair_raw = "".join(repair_parts)
-                repaired = _extract_fenced(repair_raw, "c").strip()
+                repaired = (
+                    repaired_by_edits if repaired_by_edits is not None
+                    else _extract_fenced(repair_raw, "c").strip()
+                )
                 if repaired and _looks_complete_c_file(repaired, original, fname):
                     clean = repaired
                     report = _audit_transform_impact(
@@ -6555,12 +7048,11 @@ async def process(
             report_path.write_text("\n".join(report_lines) + "\n")
             yield _sse({"type": "stage_complete", "stage": "verification"})
 
-        # ---- Step 3.5: Per-file compile gate (.c -> .o) ----------------
-        # Compile each revised .c on its own with the project's toolchain
-        # so the .c/.h/.o triples and the per-file compile_report are
-        # downloadable BEFORE the long-running sandbox build kicks in.
-        # The same agentic LLM-fix loop used by the sandbox build is
-        # applied here, scoped to one .c (+ its companion .h) at a time.
+        # ---- Step 3.5: Per-file compile gate (.c -> .o) — the last stage --
+        # Compile each revised .c on its own with the project's toolchain,
+        # with an LLM fix loop scoped to one .c (+ its headers) at a time.
+        # The "Stop compiling" button (POST /api/compile/terminate/{id}) ends
+        # the loop and finishes the run with the results so far.
         completed_now = set(_pipeline_state(_read_status(session_dir)).get("completed_stages", []))
         for evt in run_per_file_compile(
             session_dir=session_dir,
@@ -6572,12 +7064,14 @@ async def process(
             repo_knowledge=repo_knowledge,
             is_resume=is_resume,
             completed_stages=completed_now,
+            max_fix_attempts=COMPILE_FIX_MAX_ATTEMPTS,
+            should_stop=lambda: _is_compile_terminate_requested(session_dir),
         ):
             yield evt
 
-        # ---- Step 4: Sandbox build ------------------------------------
+        # ---- Step 4: Sandbox build (off unless PIPELINE_SANDBOX_BUILD=1) --
         sandbox_build_success = None
-        if has_repo or REMOTE_BUILD_ENABLED:
+        if (has_repo or REMOTE_BUILD_ENABLED) and PIPELINE_SANDBOX_BUILD:
             sandbox_done = (
                 is_resume
                 and "sandbox_build" in set(
@@ -6962,6 +7456,9 @@ async def regenerate(
         shutil.copytree(gen_dir, prev_dir)
 
     conversation_ctx = _build_conversation_context(conversation)
+    # A stop request belongs to the run it was pressed in.
+    status["compile_terminate_requested"] = False
+    _write_status(session_dir, status)
 
     log.info(
         "Regenerate %s: round %d, %d code files, %d conversation messages",
@@ -6992,16 +7489,25 @@ async def regenerate(
             "message": f"Incorporating {len(conversation)} feedback message(s) into re-generation\u2026",
         })
 
-        all_code_ctx = ""
-        for cf in code_files:
-            all_code_ctx += f"\n### File: {cf.name}\n```c\n{_read_text_safe(cf)}\n```\n"
-        all_code_ctx = _truncate_text(all_code_ctx, MAX_CODE_CONTEXT_CHARS, "all_code_ctx")
-
         regen_diffs: dict[str, str] = {}
+        # Headers first; each .c then sees this round's headers.
+        regenerated: set[str] = set()
 
-        for i, code_file in enumerate(code_files):
+        for i, code_file in enumerate(_header_first_order(code_files)):
             fname = code_file.name
             original = _read_text_safe(code_file)
+
+            all_code_ctx = ""
+            for cf in code_files:
+                regen_now = cf.name in regenerated and (gen_dir / cf.name).exists()
+                body = _read_text_safe(gen_dir / cf.name) if regen_now else _read_text_safe(cf)
+                label = " (regenerated this round)" if regen_now else ""
+                all_code_ctx += f"\n### File: {cf.name}{label}\n```c\n{body}\n```\n"
+            all_code_ctx = _truncate_text(all_code_ctx, MAX_CODE_CONTEXT_CHARS, "all_code_ctx")
+            sec_regen_headers = _transformed_headers_section(
+                original, gen_dir,
+                {n for n in regenerated if n.lower().endswith(tuple(HEADER_EXTS))},
+            )
 
             prev_gen_path = prev_dir / fname
             prev_generated = _read_text_safe(prev_gen_path) if prev_gen_path.exists() else ""
@@ -7055,7 +7561,7 @@ async def regenerate(
                 "11. Maintain compatibility with all dependent modules in the repository\n"
                 "12. Cross-check every fix against the change spec and repo headers "
                 "to prevent error loops"
-                f"{PERIPHERAL_VARIATION_CODEGEN_GUIDANCE}"
+                f"{_variant_guidance()}"
             )
 
             file_repo_ctx = ""
@@ -7145,6 +7651,7 @@ async def regenerate(
                     ("repo_knowledge", sec_knowledge, 2),
                     ("target_summary", sec_target_v, 3),
                     ("cross_file_ctx", sec_code, 4),
+                    ("transformed_headers", sec_regen_headers, 1),
                 ],
                 max_input_tokens=MAX_INPUT_TOKENS - system_tokens,
             )
@@ -7154,6 +7661,35 @@ async def regenerate(
             clean = ""
             last_raw = ""
             max_attempts = 3
+            regen_base = prev_generated or original
+            if _needs_edit_mode(regen_base):
+                # Too large to re-emit: apply the feedback to the previous
+                # round's output with edit blocks.
+                max_attempts = 0
+                regen_context = _assemble_prompt(
+                    [
+                        ("user_feedback", sec_conv, 0),
+                        ("transformed_headers", sec_regen_headers, 1),
+                        ("change_spec", sec_change, 1),
+                        ("repo_dependencies", sec_repo, 2),
+                        ("target_summary", sec_target_v, 3),
+                        ("task", (
+                            f"## Task\nRevise {fname} (the current file below) so "
+                            "it fixes every issue in the user feedback and "
+                            "conforms to the Target ICD. Keep its file name and "
+                            "#include paths."
+                        ), 0),
+                    ],
+                    max_input_tokens=max(
+                        2000,
+                        CTX_SIZE_TOKENS - LLM_PROMPT_SAFETY_TOKENS - system_tokens
+                        - TRANSFORM_EDIT_OUTPUT_TOKENS - _estimate_tokens(regen_base) - 600,
+                    ),
+                )
+                clean, _raws, _n = yield from _edit_rounds(
+                    transform_system, regen_context, regen_base, fname,
+                )
+                last_raw = "\n".join(_raws)
             for attempt in range(1, max_attempts + 1):
                 file_parts: list[str] = []
                 attempt_prompt = transform_prompt
@@ -7206,7 +7742,10 @@ async def regenerate(
 
             # Multiple peripheral variations -> one self-contained .h file
             # per variation (### <name>.h + fenced block).
-            variation_headers = _split_variation_header_files(last_raw, fname)
+            variation_headers = (
+                _split_variation_header_files(last_raw, fname)
+                if TRANSFORM_SPLIT_VARIANTS else {}
+            )
             if variation_headers:
                 incomplete = [
                     n for n, c in variation_headers.items()
@@ -7256,6 +7795,7 @@ async def regenerate(
 
             clean = preserve_original_script_names(original, clean)
             (gen_dir / fname).write_text(clean)
+            regenerated.add(fname)
 
             if prev_generated:
                 regen_diffs[fname] = _generate_diff(
@@ -7581,9 +8121,25 @@ async def regenerate(
             )
             yield _sse({"type": "stage_complete", "stage": "verification"})
 
-        # ---- Sandbox build (re-generation) ----
+        # ---- Per-file compile (re-generation) — the last stage ----
+        for evt in run_per_file_compile(
+            session_dir=session_dir,
+            gen_dir=gen_dir,
+            code_dir=code_dir,
+            repo_dir=repo_dir,
+            has_repo=has_repo,
+            change_spec=change_spec,
+            repo_knowledge=repo_knowledge,
+            is_resume=False,
+            completed_stages=set(),
+            max_fix_attempts=COMPILE_FIX_MAX_ATTEMPTS,
+            should_stop=lambda: _is_compile_terminate_requested(session_dir),
+        ):
+            yield evt
+
+        # ---- Sandbox build (off unless PIPELINE_SANDBOX_BUILD=1) ----
         sandbox_build_success = None
-        if has_repo or REMOTE_BUILD_ENABLED:
+        if (has_repo or REMOTE_BUILD_ENABLED) and PIPELINE_SANDBOX_BUILD:
             yield _sse({
                 "type": "stage",
                 "stage": "sandbox_build",

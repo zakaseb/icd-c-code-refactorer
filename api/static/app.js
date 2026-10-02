@@ -35,6 +35,7 @@
   const downloadRepoBtn = document.getElementById('download-repo-btn');
   const pauseBtn       = document.getElementById('pause-btn');
   const resumeBtn      = document.getElementById('resume-btn');
+  const terminateCompileBtn = document.getElementById('terminate-compile-btn');
   const convSection    = document.getElementById('conversation-section');
   const convMessages   = document.getElementById('conversation-messages');
   const convInput      = document.getElementById('conversation-input');
@@ -346,6 +347,7 @@
             pipelineSteps.appendChild(compileStep);
             setStepStatus(compileStep, 'running');
             compileStep.querySelector('.step-output').classList.add('visible');
+            showStopCompile(true);
           } else if (msg.stage === 'sandbox_build' && !sandboxStep) {
             sandboxStep = createStep('sandbox-build',
               'Building generated code in sandbox environment\u2026');
@@ -407,6 +409,7 @@
             setStepStatus(verificationStep, 'complete');
             verificationStep.querySelector('.step-label').textContent = 'Verification complete';
           } else if (msg.stage === 'compile' && compileStep) {
+            showStopCompile(false);
             setStepStatus(compileStep, 'complete');
             const label = compileStep.querySelector('.step-label').textContent;
             if (label === 'Compiling generated .c files to .o objects\u2026') {
@@ -473,6 +476,7 @@
         case 'error': {
           es.close();
           activeEventSource = null;
+          showStopCompile(false);
           if (msg.file && fileSteps[msg.file]) {
             setStepStatus(fileSteps[msg.file], 'error');
             fileSteps[msg.file].querySelector('.step-label').textContent = msg.file + ' failed';
@@ -493,6 +497,7 @@
         case 'paused': {
           es.close();
           activeEventSource = null;
+          showStopCompile(false);
           if (pauseBtn) pauseBtn.style.display = 'none';
           if (resumeBtn) resumeBtn.style.display = '';
           processBtn.disabled = true;
@@ -510,6 +515,7 @@
         case 'complete':
           es.close();
           activeEventSource = null;
+          showStopCompile(false);
           if (pauseBtn) pauseBtn.style.display = 'none';
           if (resumeBtn) resumeBtn.style.display = 'none';
           generatedFiles = msg.files || [];
@@ -556,6 +562,27 @@
         if (resumeBtn) resumeBtn.disabled = false;
       }
     };
+  }
+
+  function showStopCompile(visible) {
+    if (!terminateCompileBtn) return;
+    terminateCompileBtn.style.display = visible ? '' : 'none';
+    terminateCompileBtn.disabled = false;
+    terminateCompileBtn.textContent = 'Stop compiling';
+  }
+
+  async function stopCompiling() {
+    if (!sessionId || !terminateCompileBtn) return;
+    terminateCompileBtn.disabled = true;
+    terminateCompileBtn.textContent = 'Stopping\u2026';
+    try {
+      // The stream continues until the compile stage writes its report;
+      // `stage_complete` / `complete` then hide the button and show results.
+      await fetch('/api/compile/terminate/' + sessionId, { method: 'POST' });
+    } catch (err) {
+      console.error('Failed to stop compiling:', err);
+      showStopCompile(true);
+    }
   }
 
   async function pauseProcessing() {
@@ -664,6 +691,7 @@
       resumeBtn.style.display = 'none';
       resumeBtn.disabled = false;
     }
+    showStopCompile(false);
     if (activeEventSource) {
       activeEventSource.close();
       activeEventSource = null;
@@ -744,6 +772,7 @@
     var verificationStep = null;
     var regenInfoDone = false;
     var sandboxStep = null;
+    var compileStepR = null;
     var hasSandboxBuild = false;
 
     var es = new EventSource(processStreamUrl('/api/regenerate/' + sessionId));
@@ -757,6 +786,7 @@
           if (msg.stage === 'regeneration') step = regenStep;
           else if (msg.stage === 'verification') step = verificationStep;
           else if (msg.stage === 'sandbox_build') step = sandboxStep;
+          else if (msg.stage === 'compile') step = compileStepR;
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
             var o = step.querySelector('.step-output');
@@ -783,6 +813,13 @@
             pipelineSteps.appendChild(verificationStep);
             setStepStatus(verificationStep, 'running');
             verificationStep.querySelector('.step-output').classList.add('visible');
+          } else if (msg.stage === 'compile' && !compileStepR) {
+            compileStepR = createStep('compile',
+              'Compiling re-generated .c files to .o objects\u2026');
+            pipelineSteps.appendChild(compileStepR);
+            setStepStatus(compileStepR, 'running');
+            compileStepR.querySelector('.step-output').classList.add('visible');
+            showStopCompile(true);
           } else if (msg.stage === 'sandbox_build' && !sandboxStep) {
             sandboxStep = createStep('sandbox-build',
               'Building re-generated code in sandbox environment\u2026');
@@ -796,6 +833,9 @@
           if (msg.stage === 'verification' && verificationStep) {
             setStepStatus(verificationStep, 'complete');
             verificationStep.querySelector('.step-label').textContent = 'Verification complete';
+          } else if (msg.stage === 'compile' && compileStepR) {
+            showStopCompile(false);
+            setStepStatus(compileStepR, 'complete');
           } else if (msg.stage === 'sandbox_build' && sandboxStep) {
             setStepStatus(sandboxStep, 'complete');
             sandboxStep.querySelector('.step-label').textContent = 'Sandbox build complete';
@@ -807,6 +847,24 @@
             setStepStatus(fileSteps[msg.file], 'complete');
             fileSteps[msg.file].querySelector('.step-label').textContent =
               msg.file + ' re-generated (' + fmtSize(msg.size) + ')';
+          }
+          break;
+
+        case 'compile_file_result':
+          if (compileStepR) {
+            var cOut = compileStepR.querySelector('.step-output');
+            cOut.textContent += '\n[' + (msg.success ? 'OK' : 'FAIL') + '] ' + msg.file +
+              (msg.object ? ' \u2192 ' + msg.object : '') +
+              ' (attempt ' + (msg.attempt || 1) + ')\n';
+            cOut.scrollTop = cOut.scrollHeight;
+          }
+          break;
+
+        case 'compile_summary':
+          if (compileStepR) {
+            compileStepR.querySelector('.step-label').textContent =
+              'Per-file compile: ' + msg.ok + '/' + msg.total + ' compiled' +
+              (msg.failed ? ', ' + msg.failed + ' still failing' : '');
           }
           break;
 
@@ -824,6 +882,7 @@
           if (msg.stage === 'regeneration') target = regenStep;
           else if (msg.stage === 'verification' && verificationStep) target = verificationStep;
           else if (msg.stage === 'sandbox_build' && sandboxStep) target = sandboxStep;
+          else if (msg.stage === 'compile' && compileStepR) target = compileStepR;
           else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) target = fileSteps[msg.file];
           if (target) {
             var out = target.querySelector('.step-output');
@@ -835,6 +894,7 @@
 
         case 'error':
           es.close();
+          showStopCompile(false);
           if (msg.file && fileSteps[msg.file]) {
             setStepStatus(fileSteps[msg.file], 'error');
             fileSteps[msg.file].querySelector('.step-label').textContent = msg.file + ' failed';
@@ -854,6 +914,7 @@
 
         case 'complete':
           es.close();
+          showStopCompile(false);
           generatedFiles = msg.files || [];
           if (msg.sandbox_build !== undefined) hasSandboxBuild = true;
           showResults(generatedFiles, hasSandboxBuild);
@@ -921,6 +982,7 @@
   processBtn.addEventListener('click', runProcess);
   resetBtn.addEventListener('click', resetAll);
   if (pauseBtn) pauseBtn.addEventListener('click', pauseProcessing);
+  if (terminateCompileBtn) terminateCompileBtn.addEventListener('click', stopCompiling);
   if (resumeBtn) resumeBtn.addEventListener('click', resumeProcessing);
   downloadBtn.addEventListener('click', () => {
     if (sessionId) window.location.href = '/api/download/' + sessionId;

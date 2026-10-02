@@ -139,7 +139,8 @@
     <!-- ACTION BUTTONS                                                -->
     <!-- ============================================================ -->
     <section class="action-section">
-      <div class="sandbox-retries-control" id="sandbox-retries-control">
+      <!-- Hidden: the sandbox Build stage is off (PIPELINE_SANDBOX_BUILD=0). -->
+      <div class="sandbox-retries-control" id="sandbox-retries-control" hidden>
         <label class="sandbox-retries-label" for="sandbox-retries-input">
           Sandbox build retries
         </label>
@@ -176,6 +177,7 @@
         </button>
         <button type="button" id="reset-btn" class="btn-secondary" style="display:none">Reset</button>
         <button type="button" id="pause-btn" class="btn-secondary" style="display:none">Pause</button>
+        <button type="button" id="terminate-compile-btn" class="btn-secondary" style="display:none" title="Stop the compile-fix loop and view the results so far">Stop compiling</button>
         <button type="button" id="resume-btn" class="btn-primary" style="display:none">Resume</button>
       </div>
     </section>

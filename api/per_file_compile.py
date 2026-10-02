@@ -586,9 +586,14 @@ def _attribute_block_to_original_script(
         return name
     stem = Path(name).stem.casefold()
     suffix = Path(name).suffix.lower()
+    # A header block is never the .c of the same stem (and vice versa): a
+    # `### prxyImu.h` reply to a missing prxyImu.h used to land on prxyImu.c,
+    # where it replaced the source or was rejected as a truncated .c.
+    is_header = suffix in _HEADER_EXTS
     same_stem = [
         candidate for candidate in allowed
         if Path(candidate).stem.casefold() == stem
+        and (Path(candidate).suffix.lower() in _HEADER_EXTS) == is_header
     ]
     if len(same_stem) == 1:
         return same_stem[0]
@@ -1650,9 +1655,10 @@ def run_per_file_compile(
     repo_knowledge: str,
     is_resume: bool,
     completed_stages: set[str],
-    max_fix_attempts: int = 4,
+    max_fix_attempts: int = 10,
     compile_timeout: int = 60,
     cc_override: Optional[str] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Generator[str, None, None]:
     """Run the per-file compile gate, yielding SSE strings.
 
@@ -1660,6 +1666,10 @@ def run_per_file_compile(
     writes ``gen_dir / "compile_report.txt"``.  On *partial* failure (some
     files still won't compile after the fix budget is spent), the report
     explicitly records the failures and the pipeline is allowed to proceed.
+
+    ``should_stop`` is polled before every compile. Once it returns True no
+    further fix pass runs: the file being fixed keeps its current state, the
+    files not reached yet get one plain compile, and the report is written.
 
     Resume semantics: if ``is_resume`` and ``"compile"`` is already in
     ``completed_stages`` and the report file exists, the stage emits a
@@ -1682,6 +1692,7 @@ def run_per_file_compile(
         _build_repo_context,
         _extract_fenced,
         _looks_complete_c_file,
+        _looks_complete_header,
         _structural_verify,
         _truncate_text,
         _estimate_tokens,
@@ -2164,6 +2175,7 @@ def run_per_file_compile(
 
     # ---- 5. Per-file compile + agentic fix loop ----------------------------
     uploaded_names = {p.name for p in code_dir.iterdir() if p.is_file()} if code_dir.exists() else set()
+    terminated = False
     per_file_results: dict[str, dict] = {}
     per_file_attempts: dict[str, list[dict]] = {}
 
@@ -2172,7 +2184,7 @@ def run_per_file_compile(
         "per-file compilation (one .c → .o pass with the project's "
         "toolchain).\n\n"
         "You will receive:\n"
-        "- The ORIGINAL working code (if available — compiled before ICD changes)\n"
+
         "- The CURRENT transformed code that failed to compile\n"
         "- The project headers the .c includes or that declare a type "
         "named in the errors (they may not share the .c file's name)\n"
@@ -2220,7 +2232,10 @@ def run_per_file_compile(
         "FIX RULES:\n"
         "A. Fix EVERY compiler error visible in the build output.\n"
         "B. Preserve all naming conventions and `#include` paths that "
-        "already work — only add or rename what the errors demand.\n"
+        "already work — only add or rename what the errors demand. The "
+        "project headers were transformed to the Target ICD first: keep their "
+        "Target-ICD layouts and values. Never fix an error by bringing back a "
+        "Source-ICD field, value or message.\n"
         "C. NEVER silently delete or roll back ICD-mandated changes "
         "from the .c to make the compile pass. If the error says a "
         "struct/union member is missing, ADD that member to the struct "
@@ -2305,7 +2320,20 @@ def run_per_file_compile(
             "message": f"Compiling {fname}…",
         })
 
+        # Project headers gcc cannot find anywhere, which the fixer may create.
+        creatable_headers: set[str] = set()
+
         for attempt in range(1, max_fix_attempts + 1):
+            if not terminated and should_stop is not None and should_stop():
+                terminated = True
+                yield _sse({
+                    "type": "info",
+                    "stage": "compile",
+                    "message": (
+                        "Stop requested — no further fix passes; remaining "
+                        "files get one compile and the report is written."
+                    ),
+                })
             ok, cmd, output = _run_compile(
                 sandbox_cc, cs, obj_path, include_dirs, compile_timeout,
                 cwd=gen_dir,
@@ -2356,7 +2384,7 @@ def run_per_file_compile(
                 stall = 0
             prev_sig = sig
 
-            if attempt == max_fix_attempts:
+            if attempt == max_fix_attempts or terminated:
                 yield _sse({
                     "type": "compile_file_result",
                     "stage": "compile",
@@ -2364,6 +2392,8 @@ def run_per_file_compile(
                     "success": False,
                     "attempt": attempt,
                     "message": (
+                        f"{fname} still fails to compile — stopped by the user."
+                        if terminated else
                         f"{fname} still fails to compile after "
                         f"{max_fix_attempts} agentic fix attempts."
                     ),
@@ -2373,6 +2403,8 @@ def run_per_file_compile(
                     "attempts": attempt,
                     "last_output": output[-2000:],
                 }
+                if terminated:
+                    result["reason"] = "stopped by the user"
                 break
 
             # Stall reset: rewind to the pre-gate snapshot before re-prompting,
@@ -2432,6 +2464,16 @@ def run_per_file_compile(
             fix_headers = _collect_fix_headers(
                 pre_fix_c, err_struct, gen_dir, code_dir, companion_h,
             )
+            # A project header gcc cannot find on ANY -I path (not libc) can
+            # only be fixed by writing it.
+            for missing in err_struct.get("missing_headers") or []:
+                base = Path(missing.strip()).name
+                if (
+                    Path(base).suffix.lower() in _HEADER_EXTS
+                    and base.lower() not in _LIBC_ANGLE_SKIP
+                    and not (gen_dir / base).exists()
+                ):
+                    creatable_headers.add(base)
             for header_path in fix_headers:
                 editable_header_names.add(header_path.name)
                 if header_path.name not in snapshots:
@@ -2480,12 +2522,10 @@ def run_per_file_compile(
                     "until the compile is green.\n"
                 )
 
-            sec_original = (
-                f"## Original Working Code ({fname})\n"
-                f"This code compiled cleanly before ICD changes:\n"
-                f"```c\n{original_code}\n```"
-                if original_code else ""
-            )
+            # The pre-ICD code is deliberately NOT shown: it is exactly what a
+            # fixer copies back in to get a clean compile, which puts Source-ICD
+            # fields and names back into the Target-ICD deliverable.
+            sec_original = ""
             sec_current = (
                 f"## Current Transformed Code ({fname})\n"
                 f"This version failed the per-file compile:\n"
@@ -2504,6 +2544,20 @@ def run_per_file_compile(
                     f"```c\n{body}\n```"
                 )
             sec_header = "\n\n".join(header_chunks)
+            pending_create = sorted(
+                h for h in creatable_headers if not (gen_dir / h).exists()
+            )
+            if pending_create:
+                sec_header = (
+                    "## Missing project header(s) you may CREATE\n"
+                    "The compiler cannot find these anywhere on the include "
+                    "path. Write each as a new COMPLETE header, preceded by its "
+                    "`### <filename>` marker, with an include guard and only "
+                    f"the declarations `{fname}` needs from it. Keep the "
+                    "`#include` in the .c as it is.\n"
+                    + "\n".join(f"  - ### {h}" for h in pending_create)
+                    + ("\n\n" + sec_header if sec_header else "")
+                )
             if declaration_errors and header_names:
                 listed = "\n".join(f"  - ### {name}" for name in header_names)
                 sec_header = (
@@ -2706,6 +2760,7 @@ def run_per_file_compile(
             # (3) Final fallback: single fenced block -> fname.
             allowed = {fname}
             allowed.update(editable_header_names)
+            allowed.update(creatable_headers)
 
             parsed = _extract_per_file_blocks(fix_output)
             attributed: dict[str, str] = {}
@@ -2779,6 +2834,10 @@ def run_per_file_compile(
                 # Sanity-check completeness with the same heuristic the
                 # transform step uses.
                 ref = snapshots.get(target_name, "") or original_code
+                creating = (
+                    target_name in creatable_headers
+                    and not (gen_dir / target_name).exists()
+                )
                 name_anchor = ""
                 if code_dir is not None:
                     anchor_path = code_dir / target_name
@@ -2806,8 +2865,15 @@ def run_per_file_compile(
                 new_code, _brace_notes = repair_stray_closing_braces(
                     new_code, _defines_from_flags(hex_extra_flags),
                 )
-                if not _looks_complete_c_file(new_code, ref, target_name):
-                    detail = _incomplete_file_reason(new_code, ref, target_name)
+                complete = (
+                    _looks_complete_header(new_code) if creating
+                    else _looks_complete_c_file(new_code, ref, target_name)
+                )
+                if not complete:
+                    detail = (
+                        "new header is not a complete header file" if creating
+                        else _incomplete_file_reason(new_code, ref, target_name)
+                    )
                     log.info(
                         "per_file_compile: %s LLM output rejected: %s",
                         target_name, detail,
@@ -2821,6 +2887,8 @@ def run_per_file_compile(
                 target_path = gen_dir / target_name
                 prev_text = _read_text_safe(target_path) if target_path.exists() else ""
                 target_path.write_text(new_code)
+                if creating:
+                    editable_header_names.add(target_name)
                 diff = _generate_diff(
                     prev_text, new_code,
                     f"{target_name} (attempt {attempt})",
@@ -2985,6 +3053,8 @@ def run_per_file_compile(
         f"Compiled cleanly:   {n_ok}",
         f"Still failing:      {n_fail}",
         f"Max fix attempts:   {max_fix_attempts}",
+        *(["Stopped:            yes — compile loop stopped by the user"]
+          if terminated else []),
         f"Quote-includes:     {len(quote_needs)} parsed, "
         f"{n_found} resolved, {n_missing} unresolved"
         if quote_needs else "Quote-includes:     none",
@@ -3047,7 +3117,8 @@ def run_per_file_compile(
             "-" * 65,
             f"FILE: {fname}",
             "-" * 65,
-            f"Status:   {result.get('status', 'unknown').upper()}",
+            f"Status:   {result.get('status', 'unknown').upper()}"
+            + (f" ({result['reason']})" if result.get("reason") else ""),
             f"Attempts: {result.get('attempts', len(attempts))}",
         ])
         if result.get("status") == "ok":
