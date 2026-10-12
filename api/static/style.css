@@ -736,3 +736,46 @@ footer {
 .step-output::-webkit-scrollbar-thumb,
 .code-preview::-webkit-scrollbar-thumb,
 .msg-content::-webkit-scrollbar-thumb { background: #5a5a5a; }
+
+/* ---- Peripheral variant choice (after analysis) ---------------- */
+
+.variant-choice {
+  margin: 1rem 0 0;
+  padding: 1rem 1.1rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+.variant-choice h3 {
+  font-size: 1rem;
+  margin-bottom: .35rem;
+}
+.variant-choice p {
+  color: var(--text-secondary);
+  margin-bottom: .75rem;
+}
+.variant-choice fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: .6rem .8rem .7rem;
+  margin: 0 0 .75rem;
+}
+.variant-choice legend {
+  padding: 0 .35rem;
+  font-weight: 600;
+}
+.variant-option {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  margin: .25rem 0;
+  cursor: pointer;
+}
+.variant-choice-error {
+  color: var(--error);
+  margin: 0 0 .6rem;
+}
+.variant-choice .btn-primary {
+  margin-top: .2rem;
+}

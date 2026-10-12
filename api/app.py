@@ -119,10 +119,13 @@ LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:24000")
 LLM_BASE_URL_LITELLM = os.environ.get("LITELLM_BASE_URL", "http://127.0.0.1:4000")
 LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "sk-1234-miaw")
 HF_MODEL = os.environ.get(
-    "HF_MODEL", "Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
+    "HF_MODEL", "Qwen3.8-27B-UD-Q4_K_XL.gguf"
 )
 MODEL_NAME = HF_MODEL.replace(".gguf", "") if HF_MODEL.endswith(".gguf") else HF_MODEL
 MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
+# Qwen3.8's chat template reasons by default. This pipeline expects the
+# answer in the message content, so thinking stays off.
+LLM_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
 
@@ -1083,6 +1086,238 @@ def _detect_peripheral_variants(
     return uniq if len(uniq) >= 2 else []
 
 
+VARIANT_GROUPS_FILE = "peripheral_variants.json"
+VARIANT_SELECTION_FILE = "selected_peripheral_variants.json"
+VARIANT_CHOICE_MARKER = "SELECTED PERIPHERAL VARIANT"
+
+_TARGET_VARIANT_DETECT_SYSTEM = (
+    "You detect whether one Target ICD specifies two or more variants of the "
+    "SAME peripheral. A variant is a distinct mode, rate, part number, or "
+    "configuration of one device family. Different peripherals are not "
+    "variants of each other. A document revision is not a variant. "
+    "Reply with JSON only, no markdown."
+)
+
+
+def _normalize_variant_groups(data: dict | None) -> list[dict]:
+    """Keep only peripherals that really have two or more distinct variants."""
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("groups")
+    if not isinstance(raw, list):
+        return []
+    groups: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        peripheral = str(item.get("peripheral") or "").strip()
+        variants_raw = item.get("variants") or []
+        if not peripheral or not isinstance(variants_raw, list):
+            continue
+        seen: list[str] = []
+        for name in variants_raw:
+            text = str(name or "").strip()
+            if text and text not in seen:
+                seen.append(text)
+        if len(seen) >= 2:
+            groups.append({"peripheral": peripheral, "variants": seen[:12]})
+    return groups[:8]
+
+
+def _read_json_object(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_variant_groups(session_dir: Path) -> list[dict] | None:
+    """Return detected groups, or None when detection has not run yet."""
+    path = session_dir / VARIANT_GROUPS_FILE
+    if not path.is_file():
+        return None
+    return _normalize_variant_groups(_read_json_object(path))
+
+
+def _load_variant_selection(session_dir: Path) -> dict[str, str]:
+    data = _read_json_object(session_dir / VARIANT_SELECTION_FILE) or {}
+    raw = data.get("selections")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key).strip()
+        chosen = str(value).strip()
+        if name and chosen:
+            out[name] = chosen
+    return out
+
+
+def _selection_matches_groups(groups: list[dict], selection: dict[str, str]) -> bool:
+    if not groups:
+        return True
+    for group in groups:
+        if selection.get(group["peripheral"]) not in group["variants"]:
+            return False
+    return True
+
+
+def _variant_choice_note(groups: list[dict], selection: dict[str, str]) -> str:
+    lines = [
+        VARIANT_CHOICE_MARKER,
+        "The user chose one variant for each peripheral that the Target ICD",
+        "describes more than once. Apply ONLY these variants. Do not implement",
+        "the other variants of the same peripheral.",
+        "Keep the original source filenames, #include paths, and event, FIFO,",
+        "and hub identifiers.",
+    ]
+    for group in groups:
+        chosen = selection[group["peripheral"]]
+        others = [name for name in group["variants"] if name != chosen]
+        line = f"- Peripheral {group['peripheral']}: use {chosen}."
+        if others:
+            line += f" Do not use {', '.join(others)}."
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def _annotate_change_spec(change_spec: str, note: str) -> str:
+    text = change_spec or ""
+    marker_at = text.find(VARIANT_CHOICE_MARKER)
+    if marker_at >= 0:
+        text = text[:marker_at].rstrip()
+    text = text.rstrip()
+    if not text:
+        return note
+    return text + "\n\n" + note
+
+
+def _detect_target_variant_groups(
+    target_icd: str,
+    change_spec: str,
+    target_summary: str,
+) -> list[dict]:
+    """Ask the local model which same-peripheral variants the Target ICD names."""
+    icd = target_icd or ""
+    if len(icd) > 60000:
+        icd = icd[:60000] + "\n[... target ICD truncated ...]\n"
+    summary = target_summary or ""
+    if len(summary) > 20000:
+        summary = summary[:20000] + "\n[... target summary truncated ...]\n"
+    spec = change_spec or ""
+    marker_at = spec.find(VARIANT_CHOICE_MARKER)
+    if marker_at >= 0:
+        spec = spec[:marker_at]
+    if len(spec) > 20000:
+        spec = spec[:20000] + "\n[... change spec truncated ...]\n"
+    prompt = (
+        "Read the Target ICD. Group only a peripheral that has two or more "
+        "named variants of that same peripheral. Use the names the ICD uses.\n"
+        'Return {"groups":[{"peripheral":"family","variants":["name","name"]}]}.\n'
+        'If no peripheral has two or more variants, return {"groups":[]}.\n\n'
+        f"TARGET ICD:\n{icd}\n\n"
+        f"TARGET SUMMARY:\n{summary}\n\n"
+        f"CHANGE SPEC:\n{spec}\n"
+    )
+    try:
+        out = _call_llm_complete(
+            _TARGET_VARIANT_DETECT_SYSTEM, prompt, max_tokens=1024, max_passes=1,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Target ICD variant detection failed: %s", e)
+        return []
+    groups = _normalize_variant_groups(_extract_json_object(out))
+    if groups:
+        log.info(
+            "Target ICD variant groups: %s",
+            ", ".join(
+                f"{g['peripheral']} ({len(g['variants'])})" for g in groups
+            ),
+        )
+    return groups
+
+
+def _is_pipeline_resume(status: dict) -> bool:
+    return status.get("state") in ("resuming", "awaiting_variant_choice")
+
+
+def _resolve_variant_choice(
+    session_dir: Path,
+    target_icd: str,
+    change_spec: str,
+    target_summary: str,
+    detect_groups=None,
+) -> tuple[str, dict | None]:
+    """Pause after analysis when the Target ICD has same-peripheral variants.
+
+    Returns ``(change_spec, event)``. ``event`` is the SSE payload the UI
+    must show; ``None`` means the pipeline should continue. A saved choice
+    is written into the change spec so later stages apply only that variant.
+    """
+    groups = _load_variant_groups(session_dir)
+    if groups is None:
+        detector = detect_groups or _detect_target_variant_groups
+        groups = detector(target_icd, change_spec, target_summary)
+        (session_dir / VARIANT_GROUPS_FILE).write_text(
+            json.dumps({"groups": groups}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    selection = _load_variant_selection(session_dir)
+    if groups and _selection_matches_groups(groups, selection):
+        note = _variant_choice_note(groups, selection)
+        change_spec = _annotate_change_spec(change_spec, note)
+        (session_dir / "change_spec.txt").write_text(change_spec, encoding="utf-8")
+        return change_spec, None
+    if not groups:
+        return change_spec, None
+    status = _read_status(session_dir)
+    status["state"] = "awaiting_variant_choice"
+    status["awaiting_variant_choice"] = True
+    _write_status(session_dir, status)
+    return change_spec, {
+        "type": "variant_choice_required",
+        "stage": "analysis",
+        "message": (
+            "The Target ICD describes more than one variant of the same "
+            "peripheral. Choose which variant to apply, then continue."
+        ),
+        "groups": groups,
+    }
+
+
+def _save_variant_selection(session_dir: Path, selections: dict) -> dict[str, str]:
+    """Validate and store the user's variant choice. Raises ValueError if invalid."""
+    groups = _load_variant_groups(session_dir)
+    if not groups:
+        raise ValueError("This session has no peripheral variants to choose from.")
+    if not isinstance(selections, dict):
+        raise ValueError("selections must be an object of peripheral to variant.")
+    cleaned: dict[str, str] = {}
+    for key, value in selections.items():
+        name = str(key).strip()
+        chosen = str(value).strip()
+        if name and chosen:
+            cleaned[name] = chosen
+    if not _selection_matches_groups(groups, cleaned):
+        raise ValueError(
+            "Choose one of the listed variants for each peripheral."
+        )
+    note = _variant_choice_note(groups, cleaned)
+    spec_path = session_dir / "change_spec.txt"
+    spec = spec_path.read_text(encoding="utf-8") if spec_path.is_file() else ""
+    spec_path.write_text(_annotate_change_spec(spec, note), encoding="utf-8")
+    (session_dir / VARIANT_SELECTION_FILE).write_text(
+        json.dumps({"selections": cleaned}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return cleaned
+
+
+def _selected_variant_names(session_dir: Path) -> set[str]:
+    return set(_load_variant_selection(session_dir).values())
+
+
 def _generate_variant_header(
     *,
     base_sections: list[tuple[str, str, int]],
@@ -1356,6 +1591,7 @@ def _call_llm_stream(
             "max_tokens": eff_max_tokens,
             "temperature": 0.2,
             "stream": True,
+            "chat_template_kwargs": dict(LLM_CHAT_TEMPLATE_KWARGS),
         }
         try:
             with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:
@@ -1577,6 +1813,10 @@ def _build_conversation_context(messages: list[dict]) -> str:
 
 class ChatMessage(BaseModel):
     message: str
+
+
+class VariantChoiceRequest(BaseModel):
+    selections: dict[str, str]
 
 
 def _build_header_documentation_prompt(
@@ -5079,6 +5319,25 @@ async def resume_session(session_id: str):
     }
 
 
+@app.post("/api/variant-choice/{session_id}")
+async def choose_variant(session_id: str, body: VariantChoiceRequest):
+    """Store the variant the user picked so the pipeline can continue."""
+    session_dir = SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        cleaned = _save_variant_selection(session_dir, body.selections)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    status = _read_status(session_dir)
+    status["pause_requested"] = False
+    status["awaiting_variant_choice"] = False
+    status["state"] = "resuming"
+    status["resumed_at"] = datetime.now(timezone.utc).isoformat()
+    _write_status(session_dir, status)
+    return {"ok": True, "selections": cleaned, "state": status["state"]}
+
+
 @app.get("/api/process/{session_id}")
 async def process(
     session_id: str,
@@ -5211,7 +5470,7 @@ async def process(
         if code_graph else "unavailable",
     )
 
-    is_resume = status.get("state") == "resuming"
+    is_resume = _is_pipeline_resume(status)
     if not is_resume:
         status["pause_requested"] = False
         status["state"] = "processing"
@@ -5223,6 +5482,10 @@ async def process(
         events_path = session_dir / PIPELINE_EVENTS_FILE
         if events_path.exists():
             events_path.unlink()
+        for stale_name in (VARIANT_GROUPS_FILE, VARIANT_SELECTION_FILE):
+            stale = session_dir / stale_name
+            if stale.exists():
+                stale.unlink()
         _write_status(session_dir, status)
 
     def event_stream():
@@ -5807,6 +6070,22 @@ async def process(
             (gen_dir / "icd_analysis.txt").write_text(full_analysis)
             yield _sse({"type": "stage_complete", "stage": "analysis"})
 
+        if not (session_dir / VARIANT_GROUPS_FILE).is_file():
+            yield _sse({
+                "type": "info",
+                "stage": "analysis",
+                "message": (
+                    "Checking whether the Target ICD defines more than one "
+                    "variant of the same peripheral\u2026"
+                ),
+            })
+        change_spec, variant_choice = _resolve_variant_choice(
+            session_dir, target_icd, change_spec, target_summary,
+        )
+        if variant_choice:
+            yield _sse(variant_choice)
+            return
+
         # ---- Step 2: Transform each file ------------------------------
         # Per-file change-impact findings, merged into impact_manifest.json /
         # impact_report.txt once the loop finishes. `impact_audited` records
@@ -5994,6 +6273,11 @@ async def process(
                 variant_names = _detect_peripheral_variants(
                     original, fname, change_spec, target_summary,
                 )
+                chosen_names = _selected_variant_names(session_dir)
+                if chosen_names:
+                    variant_names = [
+                        name for name in variant_names if name in chosen_names
+                    ]
                 if len(variant_names) >= 2:
                     yield _sse({
                         "type": "info",

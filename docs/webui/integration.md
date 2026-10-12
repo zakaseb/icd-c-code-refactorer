@@ -23,7 +23,8 @@ Location: `api/static/`.
    - number input (default **25**), or
    - **Indefinite** toggle → `indefinite`.
 4. UI handles SSE stages: `analysis`, `transform`, `header_doc`, `verification`, `compile`, `sandbox_build` (and `regeneration` on re-run). A `gitnexus` stage label may appear in the UI even though that report is not currently invoked from the live `process` stream.
-5. User can pause/resume, preview files, download artefacts, send conversation feedback, then regenerate.
+5. If analysis emits `variant_choice_required`, the stream closes and `#variant-choice` lists one radio group per peripheral. **Continue with this variant** posts `/api/variant-choice/{session_id}` and opens the process stream again. A Target ICD with one variant skips this step.
+6. User can pause/resume, preview files, download artefacts, send conversation feedback, then regenerate.
 
 ## Sandbox retries control
 

@@ -13,7 +13,7 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 | Order | SSE `stage` | What happens | Key artefacts |
 |------:|-------------|--------------|---------------|
 | 0 | *(upload)* | `upload_code`, `upload_source_icd`, `upload_target_icd`, optional `upload_repo_zip`; PDFs → text via `extract_pdf_text` | `original_code/`, `source_icd.txt`, `target_icd.txt`, `repo_contents/` |
-| 1 | `analysis` | Compare Source vs Target ICD (direct or map-reduce `_call_llm_stream`); build repo/source-script context (`_build_repo_knowledge`, `_build_source_scripts_context`); distill `change_spec` from `change_spec_raw` | `change_spec.txt`, `change_spec_raw.txt`, `target_summary.txt`, `icd_analysis.txt`, optional `repo_knowledge.txt` |
+| 1 | `analysis` | Compare Source vs Target ICD (direct or map-reduce `_call_llm_stream`); build repo/source-script context (`_build_repo_knowledge`, `_build_source_scripts_context`); distill `change_spec` from `change_spec_raw`. If the Target ICD names two or more variants of the same peripheral, the stream stops for `POST /api/variant-choice/{id}` | `change_spec.txt`, `change_spec_raw.txt`, `target_summary.txt`, `icd_analysis.txt`, `peripheral_variants.json`, optional `selected_peripheral_variants.json`, optional `repo_knowledge.txt` |
 | 2 | `transform` | Per-file LLM codegen; peripheral variant detection (`_detect_peripheral_variants`, `_generate_variant_header`); completeness checks (`_looks_complete_c_file`) | `generated_code/*.c|.h` |
 | 2b | `header_doc` | ICD-grounded documentation pass for headers (`_build_header_documentation_prompt`) | Updated `.h` comments in `generated_code/` |
 | 3 | `verification` | Structural checks (`_structural_verify`) + LLM verify/fix; variable inventory (`_extract_c_variables`) | `verification_report.txt`, in-place fixes |
@@ -25,12 +25,13 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 - ICD text is chunked when large (`ICD_CHUNK_CHARS`, map-reduce path).
 - Uploaded source scripts are preferred context over sweeping the whole repo directory.
 - Distillation keeps factual tokens from the raw analysis so `change_spec` is shorter but not empty of requirements.
-- Multiple peripheral variations in one Target ICD stay inside the original script. A new peripheral name does not rename the file or its `#include` paths.
+- Multiple variants of the same peripheral in the Target ICD are detected after this stage (`_detect_target_variant_groups`). The UI asks the user to pick one before transform. A single variant does not stop the stream.
+- The chosen variant is appended to `change_spec.txt` under `SELECTED PERIPHERAL VARIANT`. Later stages apply that variant only. A new peripheral name does not rename the file or its `#include` paths.
 
 ## Transform & variants
 
-- Each uploaded `.c`/`.h` is transformed against the change spec and available repo knowledge.
-- When variants are detected, each variation is generated separately and then written into the original header filename. The pipeline does not emit a new script named after the ICD peripheral.
+- Each uploaded `.c`/`.h` is transformed against the change spec and available repo knowledge, including the variant the user selected.
+- `TRANSFORM_SPLIT_VARIANTS` still defaults off. When it is on and the user has not narrowed the Target ICD to one variant, each variation is generated and then written into the original header filename. The pipeline does not emit a new script named after the ICD peripheral.
 
 ## Verification & compile gate
 

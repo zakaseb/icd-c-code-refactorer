@@ -17,7 +17,7 @@ mkdir -p models workspace
 ./scripts/serve_web.sh
 ```
 
-Open **http://localhost:8081**. First start downloads the GGUF model into `models/` (~49 GB).
+Open **http://localhost:8081**. First start downloads the Qwen3.8-27B GGUF into `models/` (~18 GB).
 
 ## Documentation map
 

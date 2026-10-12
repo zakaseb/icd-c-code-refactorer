@@ -247,6 +247,78 @@
 
   /* ----- Main process flow --------------------------------------- */
 
+  function renderVariantChooser(groups, onContinue) {
+    const existing = document.getElementById('variant-choice');
+    if (existing) existing.remove();
+    const panel = document.createElement('div');
+    panel.id = 'variant-choice';
+    panel.className = 'variant-choice';
+    const title = document.createElement('h3');
+    title.textContent = 'Choose a peripheral variant';
+    const lead = document.createElement('p');
+    lead.textContent = (
+      'The Target ICD describes more than one variant of the same peripheral. ' +
+      'Pick the one to apply. The rest of the pipeline uses that variant and ' +
+      'keeps the original filenames and identifiers.'
+    );
+    panel.appendChild(title);
+    panel.appendChild(lead);
+    (groups || []).forEach(function (group, i) {
+      const field = document.createElement('fieldset');
+      const legend = document.createElement('legend');
+      legend.textContent = group.peripheral;
+      field.appendChild(legend);
+      (group.variants || []).forEach(function (name, j) {
+        const id = 'variant-' + i + '-' + j;
+        const label = document.createElement('label');
+        label.className = 'variant-option';
+        label.setAttribute('for', id);
+        const input = document.createElement('input');
+        input.type = 'radio';
+        input.name = 'variant-group-' + i;
+        input.id = id;
+        input.value = name;
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(' ' + name));
+        field.appendChild(label);
+      });
+      panel.appendChild(field);
+    });
+    const err = document.createElement('p');
+    err.className = 'variant-choice-error';
+    err.hidden = true;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn-primary';
+    button.textContent = 'Continue with this variant';
+    button.addEventListener('click', function () {
+      const selections = {};
+      let missing = false;
+      (groups || []).forEach(function (group, i) {
+        const picked = panel.querySelector(
+          'input[name="variant-group-' + i + '"]:checked'
+        );
+        if (!picked) missing = true;
+        else selections[group.peripheral] = picked.value;
+      });
+      if (missing) {
+        err.hidden = false;
+        err.textContent = 'Choose one variant for each peripheral.';
+        return;
+      }
+      err.hidden = true;
+      button.disabled = true;
+      onContinue(selections, function (message) {
+        button.disabled = false;
+        err.hidden = false;
+        err.textContent = message;
+      });
+    });
+    panel.appendChild(err);
+    panel.appendChild(button);
+    pipelineSteps.appendChild(panel);
+  }
+
   async function runProcess() {
     processBtn.disabled = true;
     resetBtn.style.display = '';
@@ -300,8 +372,20 @@
 
     let es = new EventSource(processStreamUrl('/api/process/' + sessionId));
     activeEventSource = es;
+    let awaitingVariantChoice = false;
 
-    es.onmessage = function (event) {
+    function reopenProcessStream() {
+      es = new EventSource(processStreamUrl('/api/process/' + sessionId));
+      activeEventSource = es;
+      es.onmessage = onProcessMessage;
+      es.onerror = onProcessError;
+      if (pauseBtn) {
+        pauseBtn.style.display = '';
+        pauseBtn.disabled = false;
+      }
+    }
+
+    const onProcessMessage = function (event) {
       const msg = JSON.parse(event.data);
 
       switch (msg.type) {
@@ -395,6 +479,38 @@
           if (generatedFiles.length) {
             showResults(generatedFiles, hasSandboxBuild, true);
           }
+          break;
+
+        case 'variant_choice_required':
+          awaitingVariantChoice = true;
+          setStepStatus(analysisStep, 'complete');
+          analysisStep.querySelector('.step-label').textContent =
+            'ICD analysis complete \u2014 choose a variant';
+          if (pauseBtn) pauseBtn.style.display = 'none';
+          renderVariantChooser(msg.groups || [], function (selections, reportError) {
+            fetch('/api/variant-choice/' + sessionId, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ selections: selections }),
+            }).then(function (r) {
+              if (!r.ok) {
+                return r.json().then(function (d) {
+                  const detail = d && (d.detail || d.message);
+                  throw new Error(detail || 'Could not save the variant choice');
+                }, function () {
+                  throw new Error('Could not save the variant choice');
+                });
+              }
+              awaitingVariantChoice = false;
+              const panel = document.getElementById('variant-choice');
+              if (panel) panel.remove();
+              reopenProcessStream();
+            }).catch(function (err) {
+              reportError(err.message || 'Could not save the variant choice');
+            });
+          });
+          es.close();
+          activeEventSource = null;
           break;
 
         case 'stage_complete':
@@ -525,9 +641,10 @@
       }
     };
 
-    es.onerror = function () {
+    const onProcessError = function () {
       es.close();
       activeEventSource = null;
+      if (awaitingVariantChoice) return;
       if (generatedFiles.length) {
         showResults(generatedFiles, hasSandboxBuild);
         return;
@@ -540,6 +657,9 @@
       out.classList.add('visible');
       processBtn.disabled = false;
     };
+
+    es.onmessage = onProcessMessage;
+    es.onerror = onProcessError;
 
     resumeCurrentProcess = async function () {
       if (!sessionId || !es) return;

@@ -28,6 +28,7 @@ Primary implementation: `api/app.py`.
 | `GET` | `/api/regenerate/{session_id}` | **SSE** conversational regen |
 | `POST` | `/api/pause/{session_id}` | Pause processing |
 | `POST` | `/api/resume/{session_id}` | Resume processing |
+| `POST` | `/api/variant-choice/{session_id}` | Body `{"selections": {"peripheral": "variant"}}`. Required after analysis when the Target ICD has multiple variants of one peripheral. Sets the session back to `resuming`. |
 
 ### Query: `sandbox_retries`
 
@@ -68,6 +69,7 @@ Finite budgets hard-stop the orchestrator when exhausted (no endless patch loop 
 Events emitted during process/regenerate include (non-exhaustive):
 
 - `stage` / `stage_complete` — stage transitions
+- `variant_choice_required` — analysis finished and the Target ICD has two or more variants of the same peripheral. `groups` is a list of `{peripheral, variants}`. The stream ends until `POST /api/variant-choice/{session_id}`. A reconnect before that choice sends the same event again.
 - `token` / batched tokens — streamed LLM output for UI
 - `file_complete` — per-file transform progress
 - `sandbox_build_result` / build log chunks — sandbox outcome

@@ -60,15 +60,15 @@ On first boot, `entrypoint.sh` runs `/opt/venv/bin/python hf_download.py` (copy 
 
 | Env | Role |
 |-----|------|
-| `HF_REPO_ID` | Hugging Face repo (default `unsloth/Qwen3-Coder-Next-GGUF`) |
-| `HF_MODEL` | Exact GGUF filename under that repo |
+| `HF_REPO_ID` | Hugging Face repo (default `unsloth/Qwen3.8-27B-GGUF`) |
+| `HF_MODEL` | Exact GGUF filename (default `Qwen3.8-27B-UD-Q4_K_XL.gguf`, about 17.6 GB) |
 | `HOME` | Cache root → `$HOME/models/$HF_REPO_ID/` |
 
 `serve_web.sh` mounts host `models/` → `/home/developer/models`, so downloads persist across restarts. The script skips the network call when the file already exists (exact path or recursive glob), fails fast if `huggingface_hub` is missing (wrong Python / broken image), and errors if the download finishes without the expected filename.
 
 ## Hardware expectations
 
-- **Recommended:** NVIDIA GPU with ~48 GB+ VRAM for full offload of the bundled quant.
+- **Recommended:** NVIDIA GPU with ~24 GB VRAM for the bundled Qwen3.8-27B quant (~17.6 GB of weights). The Dockerfile context also needs KV-cache memory; `LLAMA_ARG_N_GPU_LAYERS=auto` spills layers when VRAM is tight.
 - Smaller GPUs work with partial offload (`LLAMA_ARG_N_GPU_LAYERS`); CPU-only is possible but slow.
 - Context size and sampling are controlled via `LLAMA_ARG_*` / `LLAMA_SAMPLING_*` (serve scripts often use a smaller ctx than the Dockerfile maximum).
 
