@@ -1092,10 +1092,25 @@ VARIANT_CHOICE_MARKER = "SELECTED PERIPHERAL VARIANT"
 
 _TARGET_VARIANT_DETECT_SYSTEM = (
     "You detect whether one Target ICD specifies two or more variants of the "
-    "SAME peripheral. A variant is a distinct mode, rate, part number, or "
-    "configuration of one device family. Different peripherals are not "
-    "variants of each other. A document revision is not a variant. "
-    "Reply with JSON only, no markdown."
+    "SAME peripheral. A variant is a distinct part number, protocol, mode, "
+    "or housing configuration of one device family. A shared electrical "
+    "message does not make two named configurations one variant. Different "
+    "peripherals are not variants of each other. A document revision is not "
+    "a variant. Reply with JSON only, no markdown."
+)
+
+_VARIANT_ENUM_RE = re.compile(
+    r"(?i)\b(?:two|three|four|2|3|4)\s+"
+    r"(?:[\w-]+\s+){0,6}"
+    r"(?:configurations?|variants?|versions?|models?|modes?|options?|products?)"
+    r"\s*:\s*"
+    r"([^\n.]{3,240})"
+)
+_VARIANT_BULLET_HEAD_RE = re.compile(
+    r"(?im)^[^\n]{0,240}\b(?:"
+    r"variants?|models?|configurations?|products?|part numbers?"
+    r"|following(?:\s+[\w().-]+){0,12}\s+units?"
+    r")[^\n]{0,80}:\s*$"
 )
 
 
@@ -1121,7 +1136,102 @@ def _normalize_variant_groups(data: dict | None) -> list[dict]:
                 seen.append(text)
         if len(seen) >= 2:
             groups.append({"peripheral": peripheral, "variants": seen[:12]})
+    if not groups:
+        names = _clean_variant_names(data.get("variants"))
+        if len(names) >= 2:
+            family = str(data.get("peripheral") or "Peripheral").strip() or "Peripheral"
+            groups.append({"peripheral": family, "variants": names[:12]})
     return groups[:8]
+
+
+def _clean_variant_names(raw) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    seen: list[str] = []
+    for name in raw:
+        text = re.sub(r"\s+", " ", str(name or "")).strip(" \t.;")
+        if text and len(text) <= 80 and text not in seen:
+            seen.append(text)
+    return seen
+
+
+def _split_variant_phrase(phrase: str) -> list[str]:
+    parts = re.split(r"\s*,\s*|\s+\band\b\s+", phrase or "", flags=re.IGNORECASE)
+    return _clean_variant_names(parts)
+
+
+def _peripheral_before(text: str, index: int) -> str:
+    window = text[max(0, index - 600):index]
+    titled = re.search(
+        r"(?i)interface control document for\s+([A-Za-z0-9][\w./+-]{1,40})",
+        window,
+    )
+    if titled:
+        return titled.group(1).strip()
+    tokens = re.findall(r"\b([A-Z]{2,}[A-Za-z0-9]*\d[A-Za-z0-9-]*)\b", window)
+    if tokens:
+        return tokens[-1]
+    return "Peripheral"
+
+
+def _extract_variant_groups_from_text(text: str) -> list[dict]:
+    """Name variants the Target ICD states outright, without asking the model."""
+    if not text:
+        return []
+    groups: list[dict] = []
+    for match in _VARIANT_ENUM_RE.finditer(text):
+        names = _split_variant_phrase(match.group(1))
+        if len(names) >= 2:
+            groups.append({
+                "peripheral": _peripheral_before(text, match.start()),
+                "variants": names[:12],
+            })
+    for head in _VARIANT_BULLET_HEAD_RE.finditer(text):
+        bullets: list[str] = []
+        for line in text[head.end():].splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if bullets:
+                    break
+                continue
+            bullet = re.match(r"^[•\-\*]\s+(.+)$", stripped)
+            if not bullet:
+                if bullets:
+                    break
+                continue
+            label = bullet.group(1).strip().rstrip(".")
+            if ":" in label or label.startswith("**"):
+                continue
+            if 1 <= len(label.split()) <= 8:
+                bullets.append(label)
+        names = _clean_variant_names(bullets)
+        if len(names) >= 2:
+            groups.append({
+                "peripheral": _peripheral_before(text, head.start()),
+                "variants": names[:12],
+            })
+    return _merge_variant_groups(groups)
+
+
+def _merge_variant_groups(*sources: list[dict]) -> list[dict]:
+    order: list[str] = []
+    by_key: dict[str, dict] = {}
+    for source in sources:
+        for group in source or []:
+            if not isinstance(group, dict):
+                continue
+            peripheral = str(group.get("peripheral") or "").strip()
+            names = _clean_variant_names(group.get("variants"))
+            if not peripheral or len(names) < 2:
+                continue
+            key = peripheral.casefold()
+            if key not in by_key:
+                by_key[key] = {"peripheral": peripheral, "variants": []}
+                order.append(key)
+            for name in names:
+                if name not in by_key[key]["variants"]:
+                    by_key[key]["variants"].append(name)
+    return [by_key[key] for key in order][:8]
 
 
 def _read_json_object(path: Path) -> dict | None:
@@ -1198,27 +1308,26 @@ def _detect_target_variant_groups(
     change_spec: str,
     target_summary: str,
 ) -> list[dict]:
-    """Ask the local model which same-peripheral variants the Target ICD names."""
+    """Ask the local model which same-peripheral variants the Target ICD names.
+
+    The change spec is not sent. A distilled spec that says "one variation"
+    must not hide configurations the Target ICD itself names.
+    """
     icd = target_icd or ""
     if len(icd) > 60000:
         icd = icd[:60000] + "\n[... target ICD truncated ...]\n"
     summary = target_summary or ""
     if len(summary) > 20000:
         summary = summary[:20000] + "\n[... target summary truncated ...]\n"
-    spec = change_spec or ""
-    marker_at = spec.find(VARIANT_CHOICE_MARKER)
-    if marker_at >= 0:
-        spec = spec[:marker_at]
-    if len(spec) > 20000:
-        spec = spec[:20000] + "\n[... change spec truncated ...]\n"
     prompt = (
-        "Read the Target ICD. Group only a peripheral that has two or more "
-        "named variants of that same peripheral. Use the names the ICD uses.\n"
+        "Read the Target ICD and its summary. List each peripheral that has "
+        "two or more named variants: part numbers, protocols, modes, or "
+        "housing configurations. Use the names the ICD uses. Do not drop a "
+        "named configuration because it shares a message layout with another.\n"
         'Return {"groups":[{"peripheral":"family","variants":["name","name"]}]}.\n'
-        'If no peripheral has two or more variants, return {"groups":[]}.\n\n'
-        f"TARGET ICD:\n{icd}\n\n"
+        'If the Target ICD names only one variant, return {"groups":[]}.\n\n'
         f"TARGET SUMMARY:\n{summary}\n\n"
-        f"CHANGE SPEC:\n{spec}\n"
+        f"TARGET ICD:\n{icd}\n"
     )
     try:
         out = _call_llm_complete(
@@ -1258,7 +1367,13 @@ def _resolve_variant_choice(
     groups = _load_variant_groups(session_dir)
     if groups is None:
         detector = detect_groups or _detect_target_variant_groups
-        groups = detector(target_icd, change_spec, target_summary)
+        detected = detector(target_icd, change_spec, target_summary)
+        # Named configurations in the Target ICD are a choice even when the
+        # model, or the change spec, calls them one interface.
+        stated = _extract_variant_groups_from_text(
+            f"{target_summary or ''}\n{target_icd or ''}"
+        )
+        groups = _merge_variant_groups(stated, detected)
         (session_dir / VARIANT_GROUPS_FILE).write_text(
             json.dumps({"groups": groups}, indent=2) + "\n",
             encoding="utf-8",

@@ -114,6 +114,67 @@ def test_choice_pauses_then_continues_with_the_selected_variant():
     )
 
 
+def test_named_configurations_pause_even_if_the_model_says_none():
+    """The IMU15 summary names two housings. A change spec that calls that
+    one interface must not hide the choice."""
+    session = Path(tempfile.mkdtemp(prefix="icd_variant_housings_"))
+    summary = (
+        "# Technical Summary: Interface Control Document for IMU15\n"
+        "The IMU15 is a digital inertial measurement unit. "
+        "It is available in two housing configurations: "
+        "Standard Pod and Anti-Vibration (AV) Mounted Housing.\n"
+        "Byte Format: 1 start bit, 8 data bits, 2 stop bits.\n"
+    )
+    spec = (
+        "*   **Target (IMU15):** Single logical variation. "
+        "Mechanical housing differences (Standard/AV) do not affect "
+        "electrical/data interface.\n"
+    )
+
+    def detect(_icd, _change, _summary):
+        return []
+
+    groups = appmod._extract_variant_groups_from_text(summary)
+    _check(
+        "summary_names_housings",
+        groups and groups[0]["peripheral"] == "IMU15"
+        and groups[0]["variants"] == [
+            "Standard Pod",
+            "Anti-Vibration (AV) Mounted Housing",
+        ],
+        repr(groups),
+    )
+    _check(
+        "stop_bits_are_not_variants",
+        "2 stop bits" not in json.dumps(groups),
+        repr(groups),
+    )
+    bullets = (
+        "Interface Control Document for IMU-FI\n"
+        "requirements for the following Inertial Measurement Unit (IMU):\n"
+        "• IMU-FI-200C\n"
+        "• IMU-FI-200T.\n"
+    )
+    bullet_groups = appmod._extract_variant_groups_from_text(bullets)
+    _check(
+        "bullet_part_numbers",
+        bullet_groups and bullet_groups[0]["variants"] == ["IMU-FI-200C", "IMU-FI-200T"],
+        repr(bullet_groups),
+    )
+    _, event = appmod._resolve_variant_choice(
+        session, "target body without a list", spec, summary, detect_groups=detect,
+    )
+    _check("choice_event", event is not None and event["type"] == "variant_choice_required")
+    _check(
+        "choice_is_the_housings",
+        event and event["groups"][0]["variants"] == [
+            "Standard Pod",
+            "Anti-Vibration (AV) Mounted Housing",
+        ],
+        repr(event),
+    )
+
+
 def test_single_variant_does_not_pause():
     session = Path(tempfile.mkdtemp(prefix="icd_variant_single_"))
 
@@ -319,6 +380,7 @@ def main() -> int:
     print("Running test_variant_choice")
     test_normalize_keeps_only_multi_variant_peripherals()
     test_choice_pauses_then_continues_with_the_selected_variant()
+    test_named_configurations_pause_even_if_the_model_says_none()
     test_single_variant_does_not_pause()
     test_variant_choice_endpoint()
     test_process_stream_stops_before_transform()
