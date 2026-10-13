@@ -1,4 +1,8 @@
-FROM ghcr.io/ggml-org/llama.cpp:server-cuda
+# Qwen3.8 GGUFs ship an MTP block at layer 64. llama.cpp b9102 treats that
+# block as an SSM layer and exits with "missing tensor blk.64.ssm_conv1d.weight".
+# b11580 (4413a192) skips those tensors unless --spec-type draft-mtp is set.
+# This service does not enable MTP, so generation stays a normal single pass.
+FROM ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:c4348afb91499b10fad12f92626c7a8ca8b69d6475d10c793b810cb61237ce00
 
 ARG USER_ID=1000
 ARG GROUP_ID=1000

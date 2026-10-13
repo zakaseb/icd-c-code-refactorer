@@ -14,7 +14,7 @@ tags: [docker, deployment, llm]
 # → http://localhost:8081
 ```
 
-Image tag: `icd-c-code-refactorer:llama.cpp` (FROM `ghcr.io/ggml-org/llama.cpp:server-cuda`).
+Image tag: `icd-c-code-refactorer:llama.cpp`. The base is pinned to llama.cpp **b11580** (`ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:c4348afb91499b10fad12f92626c7a8ca8b69d6475d10c793b810cb61237ce00`). Qwen3.8's GGUF includes an MTP block at layer 64. Older llama.cpp (the previous image was b9102) looks for `blk.64.ssm_conv1d.weight` and exits before the server is ready. b11580 ignores that block unless speculative MTP is turned on. This service does not turn it on.
 
 ## Image build notes (PEP 668 + host UID)
 
