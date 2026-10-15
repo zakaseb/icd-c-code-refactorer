@@ -175,6 +175,44 @@ def test_named_configurations_pause_even_if_the_model_says_none():
     )
 
 
+def test_same_variant_list_is_one_question():
+    """IMU-FI-200C/T stated in the Target ICD must not be asked again under
+    a second heading the model invents for the same two part numbers."""
+    session = Path(tempfile.mkdtemp(prefix="icd_variant_once_"))
+    target = (
+        "requirements for the following Inertial Measurement Unit (IMU):\n"
+        "• IMU-FI-200C\n"
+        "• IMU-FI-200T.\n"
+    )
+
+    def detect(_icd, _spec, _summary):
+        return [{
+            "peripheral": "IMU-FI",
+            "variants": ["IMU-FI-200T", "IMU-FI-200C"],
+        }]
+
+    _, event = appmod._resolve_variant_choice(
+        session, target, "change spec", "", detect_groups=detect,
+    )
+    groups = event["groups"] if event else []
+    _check("one_question", len(groups) == 1, repr(groups))
+    _check(
+        "keeps_the_text_heading",
+        groups and groups[0]["peripheral"] == "Peripheral"
+        and groups[0]["variants"] == ["IMU-FI-200C", "IMU-FI-200T"],
+        repr(groups),
+    )
+    distinct = appmod._merge_variant_groups(
+        [{"peripheral": "IMU15", "variants": ["Standard Pod", "AV Mount"]}],
+        [{"peripheral": "GPS", "variants": ["GPS-1", "GPS-2"]}],
+    )
+    _check(
+        "different_lists_stay_separate",
+        [g["peripheral"] for g in distinct] == ["IMU15", "GPS"],
+        repr(distinct),
+    )
+
+
 def test_single_variant_does_not_pause():
     session = Path(tempfile.mkdtemp(prefix="icd_variant_single_"))
 
@@ -381,6 +419,7 @@ def main() -> int:
     test_normalize_keeps_only_multi_variant_peripherals()
     test_choice_pauses_then_continues_with_the_selected_variant()
     test_named_configurations_pause_even_if_the_model_says_none()
+    test_same_variant_list_is_one_question()
     test_single_variant_does_not_pause()
     test_variant_choice_endpoint()
     test_process_stream_stops_before_transform()

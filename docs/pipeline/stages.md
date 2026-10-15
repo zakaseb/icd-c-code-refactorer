@@ -25,7 +25,7 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 - ICD text is chunked when large (`ICD_CHUNK_CHARS`, map-reduce path).
 - Uploaded source scripts are preferred context over sweeping the whole repo directory.
 - Distillation keeps factual tokens from the raw analysis so `change_spec` is shorter but not empty of requirements.
-- Multiple variants of the same peripheral in the Target ICD are detected after this stage (`_detect_target_variant_groups`, plus the names the Target ICD states itself). Part numbers, protocols, and housing configurations count. A change spec that calls them one interface does not hide the choice. The UI asks the user to pick one before transform. A single variant does not stop the stream.
+- Multiple variants of the same peripheral in the Target ICD are detected after this stage (`_detect_target_variant_groups`, plus the names the Target ICD states itself). Part numbers, protocols, and housing configurations count. A change spec that calls them one interface does not hide the choice. The same variant list is one question, even when the text and the model give it two peripheral headings. The UI asks the user to pick one before transform. A single variant does not stop the stream.
 - The chosen variant is appended to `change_spec.txt` under `SELECTED PERIPHERAL VARIANT`. Later stages apply that variant only. A new peripheral name does not rename the file or its `#include` paths.
 
 ## Transform & variants

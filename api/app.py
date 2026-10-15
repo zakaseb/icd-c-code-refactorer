@@ -1213,6 +1213,10 @@ def _extract_variant_groups_from_text(text: str) -> list[dict]:
     return _merge_variant_groups(groups)
 
 
+def _variant_name_key(names: list[str]) -> tuple[str, ...]:
+    return tuple(sorted(name.casefold() for name in names))
+
+
 def _merge_variant_groups(*sources: list[dict]) -> list[dict]:
     order: list[str] = []
     by_key: dict[str, dict] = {}
@@ -1231,7 +1235,19 @@ def _merge_variant_groups(*sources: list[dict]) -> list[dict]:
             for name in names:
                 if name not in by_key[key]["variants"]:
                     by_key[key]["variants"].append(name)
-    return [by_key[key] for key in order][:8]
+    # The Target ICD text and the model often name the same part-number
+    # list under different headings. Ask that choice once. The first
+    # heading wins, so a later label such as a family prefix is dropped.
+    unique: list[dict] = []
+    seen: set[tuple[str, ...]] = set()
+    for key in order:
+        group = by_key[key]
+        signature = _variant_name_key(group["variants"])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(group)
+    return unique[:8]
 
 
 def _read_json_object(path: Path) -> dict | None:
