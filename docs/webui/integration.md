@@ -22,7 +22,7 @@ Location: `api/static/`.
 3. **Transform Code** builds an EventSource URL via `processStreamUrl()`, appending `?sandbox_retries=` from:
    - number input (default **25**), or
    - **Indefinite** toggle → `indefinite`.
-4. UI handles SSE stages: `analysis`, `transform`, `header_doc`, `verification`, `compile`, `sandbox_build` (and `regeneration` on re-run). A `gitnexus` stage label may appear in the UI even though that report is not currently invoked from the live `process` stream.
+4. UI handles SSE stages: `analysis`, `transform`, `header_doc`, `verification`, `compile`, `sandbox_build` (and `regeneration` on re-run). After the last script is transformed, `header_doc` is its own step, then verification, compile, and sandbox. A `gitnexus` stage label may appear in the UI even though that report is not currently invoked from the live `process` stream.
 5. If analysis emits `variant_choice_required`, the stream closes and `#variant-choice` lists one radio group per peripheral. **Continue with this variant** posts `/api/variant-choice/{session_id}` and opens the process stream again. A Target ICD with one variant skips this step.
 6. User can pause/resume, preview files, download artefacts, send conversation feedback, then regenerate.
 
@@ -39,7 +39,7 @@ These map directly to the `sandbox_retries` query parameter documented in [api/s
 
 - Token batching and log helper batching keep overnight runs from freezing/crashing the tab.
 - Sandbox build log characters streamed to the browser are capped server-side.
-- Stage UI folds `header_doc` tokens into file/analysis presentation where appropriate.
+- `header_doc` tokens are shown on their own step after the transformed scripts. Verification tokens are streamed as the model writes them, so the process stream stays open through compile and sandbox.
 
 ## Conversation & regenerate
 

@@ -35,6 +35,7 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 
 ## Verification & compile gate
 
+- Header documentation runs after the scripts are written and is its own UI step. Verification then streams the model reply as it is generated, so the browser stays on the process stream through compile and sandbox instead of sitting on the last transformed script while that reply is buffered.
 - Structural verification catches brace imbalance, missing guards, unresolved includes, and missing expected symbols before the LLM pass. A raw `{`/`}` count is not enough when both sides of `#if`/`#else` contain a brace: verification and the compile gate drop a file-scope `}` that is only balanced by the inactive branch, which is the error GCC reports as `expected identifier or '(' before '}' token`.
 - The per-file compile gate scopes to `generated_code` / code dir — it must not compile the entire uploaded repo tree.
 - Failures produce actionable diagnostics that later sandbox agents can consume.

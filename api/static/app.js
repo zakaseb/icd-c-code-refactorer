@@ -363,6 +363,7 @@
     analysisOutput.textContent = 'Connecting to LLM... Large documents may take 5-10 minutes for the first response.';
 
     const fileSteps = {};
+    const headerDocSteps = {};
     let generatedFiles = [];
     let verificationStep = null;
     let compileStep = null;
@@ -396,6 +397,7 @@
           else if (msg.stage === 'verification') step = verificationStep;
           else if (msg.stage === 'compile') step = compileStep;
           else if (msg.stage === 'sandbox_build') step = sandboxStep;
+          else if (msg.stage === 'header_doc' && msg.file) step = ensureHeaderDocStep(msg.file);
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
             const o = step.querySelector('.step-output');
@@ -413,6 +415,8 @@
             setStepStatus(s, 'running');
             s.querySelector('.step-output').classList.add('visible');
             fileSteps[msg.file] = s;
+          } else if (msg.stage === 'header_doc' && msg.file) {
+            ensureHeaderDocStep(msg.file);
           } else if (msg.stage === 'gitnexus' && !gitnexusStep) {
             gitnexusStep = createStep('gitnexus',
               'GitNexus: extracting codebase understanding\u2026');
@@ -539,7 +543,11 @@
           break;
 
         case 'file_complete':
-          if (fileSteps[msg.file]) {
+          if (msg.stage === 'header_doc' && headerDocSteps[msg.file]) {
+            setStepStatus(headerDocSteps[msg.file], 'complete');
+            headerDocSteps[msg.file].querySelector('.step-label').textContent =
+              msg.file + ' documented (' + fmtSize(msg.size) + ')';
+          } else if (fileSteps[msg.file]) {
             setStepStatus(fileSteps[msg.file], 'complete');
             fileSteps[msg.file].querySelector('.step-label').textContent =
               msg.file + ' transformed (' + fmtSize(msg.size) + ')';
@@ -581,6 +589,16 @@
             const out = sandboxStep.querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
+          } else if (msg.stage === 'header_doc' && msg.file) {
+            const step = ensureHeaderDocStep(msg.file);
+            const out = step.querySelector('.step-output');
+            out.textContent += '\n' + msg.message + '\n';
+            out.scrollTop = out.scrollHeight;
+            if (/keeping/.test(msg.message)) {
+              setStepStatus(step, 'complete');
+              step.querySelector('.step-label').textContent =
+                msg.file + ' kept without new documentation';
+            }
           } else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) {
             const out = fileSteps[msg.file].querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
@@ -657,6 +675,20 @@
       out.classList.add('visible');
       processBtn.disabled = false;
     };
+
+    function ensureHeaderDocStep(file) {
+      if (!headerDocSteps[file]) {
+        const s = createStep(
+          'header-doc-' + file,
+          'Adding ICD documentation comments to ' + file + '\u2026'
+        );
+        pipelineSteps.appendChild(s);
+        setStepStatus(s, 'running');
+        s.querySelector('.step-output').classList.add('visible');
+        headerDocSteps[file] = s;
+      }
+      return headerDocSteps[file];
+    }
 
     es.onmessage = onProcessMessage;
     es.onerror = onProcessError;
@@ -888,12 +920,27 @@
     regenStep.querySelector('.step-output').textContent = 'Starting re-generation\u2026';
 
     var fileSteps = {};
+    var headerDocSteps = {};
     var generatedFiles = [];
     var verificationStep = null;
     var regenInfoDone = false;
     var sandboxStep = null;
     var compileStepR = null;
     var hasSandboxBuild = false;
+
+    function ensureHeaderDocStep(file) {
+      if (!headerDocSteps[file]) {
+        var s = createStep(
+          'header-doc-' + file,
+          'Adding ICD documentation comments to ' + file + '\u2026'
+        );
+        pipelineSteps.appendChild(s);
+        setStepStatus(s, 'running');
+        s.querySelector('.step-output').classList.add('visible');
+        headerDocSteps[file] = s;
+      }
+      return headerDocSteps[file];
+    }
 
     var es = new EventSource(processStreamUrl('/api/regenerate/' + sessionId));
 
@@ -907,6 +954,7 @@
           else if (msg.stage === 'verification') step = verificationStep;
           else if (msg.stage === 'sandbox_build') step = sandboxStep;
           else if (msg.stage === 'compile') step = compileStepR;
+          else if (msg.stage === 'header_doc' && msg.file) step = ensureHeaderDocStep(msg.file);
           else if (msg.stage === 'transform' && msg.file) step = fileSteps[msg.file];
           if (step) {
             var o = step.querySelector('.step-output');
@@ -928,6 +976,8 @@
             setStepStatus(s, 'running');
             s.querySelector('.step-output').classList.add('visible');
             fileSteps[msg.file] = s;
+          } else if (msg.stage === 'header_doc' && msg.file) {
+            ensureHeaderDocStep(msg.file);
           } else if (msg.stage === 'verification' && !verificationStep) {
             verificationStep = createStep('verification', 'Verifying re-generated code\u2026');
             pipelineSteps.appendChild(verificationStep);
@@ -963,7 +1013,11 @@
           break;
 
         case 'file_complete':
-          if (fileSteps[msg.file]) {
+          if (msg.stage === 'header_doc' && headerDocSteps[msg.file]) {
+            setStepStatus(headerDocSteps[msg.file], 'complete');
+            headerDocSteps[msg.file].querySelector('.step-label').textContent =
+              msg.file + ' documented (' + fmtSize(msg.size) + ')';
+          } else if (fileSteps[msg.file]) {
             setStepStatus(fileSteps[msg.file], 'complete');
             fileSteps[msg.file].querySelector('.step-label').textContent =
               msg.file + ' re-generated (' + fmtSize(msg.size) + ')';
@@ -1003,11 +1057,17 @@
           else if (msg.stage === 'verification' && verificationStep) target = verificationStep;
           else if (msg.stage === 'sandbox_build' && sandboxStep) target = sandboxStep;
           else if (msg.stage === 'compile' && compileStepR) target = compileStepR;
+          else if (msg.stage === 'header_doc' && msg.file) target = ensureHeaderDocStep(msg.file);
           else if (msg.stage === 'transform' && msg.file && fileSteps[msg.file]) target = fileSteps[msg.file];
           if (target) {
             var out = target.querySelector('.step-output');
             out.textContent += '\n' + msg.message + '\n';
             out.scrollTop = out.scrollHeight;
+            if (msg.stage === 'header_doc' && /keeping/.test(msg.message)) {
+              setStepStatus(target, 'complete');
+              target.querySelector('.step-label').textContent =
+                msg.file + ' kept without new documentation';
+            }
           }
           break;
         }

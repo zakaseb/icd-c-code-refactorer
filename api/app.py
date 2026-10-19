@@ -798,6 +798,73 @@ def _call_llm_complete(
     return result
 
 
+def _stream_llm_to_sse(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    stage: str,
+    filename: str,
+    max_tokens: int,
+    max_passes: int = 4,
+) -> Iterator[str]:
+    """Stream one continued completion to the process SSE client.
+
+    Yields ``data:`` frames as tokens arrive, then returns the full text.
+    Verification used to buffer the whole reply, so after the scripts were
+    written the browser sat idle until compile. A dropped stream there
+    cancelled the rest of the pipeline.
+    """
+    result = ""
+    for attempt in range(max_passes):
+        if attempt == 0:
+            prompt = user_prompt
+        else:
+            tail = result[-2000:] if len(result) > 2000 else result
+            prompt = (
+                "Your previous response was cut off due to length limits. "
+                "Here is the end of what you wrote:\n\n"
+                f"---\n{tail}\n---\n\n"
+                "Continue EXACTLY from where you left off. "
+                "Do not repeat already-written content."
+            )
+            yield _sse({
+                "type": "info",
+                "stage": stage,
+                "file": filename,
+                "message": (
+                    f"{filename}: output was truncated — continuing "
+                    f"(pass {attempt + 1}/{max_passes})…"
+                ),
+            })
+        meta: dict = {}
+        parts: list[str] = []
+
+        def _pieces(bound_prompt=prompt, bound_meta=meta, bound_parts=parts):
+            for piece in _call_llm_stream(
+                system_prompt, bound_prompt,
+                max_tokens=max_tokens, meta=bound_meta,
+            ):
+                bound_parts.append(piece)
+                yield piece
+
+        for batch in _batched_stream_text(_pieces()):
+            yield _sse({
+                "type": "token",
+                "stage": stage,
+                "file": filename,
+                "token": batch,
+            })
+        text = "".join(parts).strip()
+        result = (result + "\n" + text).strip() if result else text
+        if meta.get("finish_reason") != "length":
+            break
+        log.info(
+            "_stream_llm_to_sse: pass %d/%d truncated, continuing…",
+            attempt + 1, max_passes,
+        )
+    return result
+
+
 def _looks_complete_c_file(generated: str, original: str, filename: str) -> bool:
     text = generated.strip()
     if not text:
@@ -7232,7 +7299,6 @@ async def process(
                     )
 
                     try:
-                        verify_pieces = []
                         # Verification re-emits the GENERATED file, so the
                         # budget must scale with that, not with the flat
                         # MAX_OUTPUT_TOKENS. A transform-expanded header is
@@ -7242,20 +7308,14 @@ async def process(
                             MAX_OUTPUT_TOKENS,
                             int(_estimate_tokens(generated_code) * 1.15),
                         )
-                        verify_output = _call_llm_complete(
+                        verify_output = yield from _stream_llm_to_sse(
                             verify_system,
                             verify_prompt,
+                            stage="verification",
+                            filename=gfname,
                             max_tokens=verify_max_tokens,
                             max_passes=4,
-                            on_chunk=lambda c: verify_pieces.append(c),
                         )
-                        for batch in _batched_stream_text(verify_pieces):
-                            yield _sse({
-                                "type": "token",
-                                "stage": "verification",
-                                "file": gfname,
-                                "token": batch,
-                            })
                         verified_code = _extract_fenced(verify_output, "c").strip()
                         verified_code, _brace_notes = repair_stray_closing_braces(
                             verified_code,
@@ -7327,9 +7387,11 @@ async def process(
                                 + "Rewrite this file to fix the listed issues while preserving ICD-required behavior. "
                                   "Output only one complete ```c fenced file."
                             )
-                            fix_output = _call_llm_complete(
+                            fix_output = yield from _stream_llm_to_sse(
                                 verify_system,
                                 fix_prompt,
+                                stage="verification",
+                                filename=gfname,
                                 max_tokens=verify_max_tokens,
                                 max_passes=3,
                             )
@@ -8363,21 +8425,14 @@ async def regenerate(
                     )
 
                     try:
-                        verify_pieces: list[str] = []
-                        verify_output = _call_llm_complete(
+                        verify_output = yield from _stream_llm_to_sse(
                             verify_system,
                             verify_prompt,
+                            stage="verification",
+                            filename=gfname,
                             max_tokens=MAX_OUTPUT_TOKENS,
                             max_passes=4,
-                            on_chunk=lambda c: verify_pieces.append(c),
                         )
-                        for batch in _batched_stream_text(verify_pieces):
-                            yield _sse({
-                                "type": "token",
-                                "stage": "verification",
-                                "file": gfname,
-                                "token": batch,
-                            })
                         verified_code = _extract_fenced(verify_output, "c").strip()
                         verified_code, _brace_notes = repair_stray_closing_braces(
                             verified_code,
@@ -8411,9 +8466,13 @@ async def regenerate(
                                 + "Rewrite this file to fix the listed issues while preserving "
                                   "ICD-required behavior. Output only one complete ```c fenced file."
                             )
-                            fix_output = _call_llm_complete(
-                                verify_system, fix_prompt,
-                                max_tokens=MAX_OUTPUT_TOKENS, max_passes=3,
+                            fix_output = yield from _stream_llm_to_sse(
+                                verify_system,
+                                fix_prompt,
+                                stage="verification",
+                                filename=gfname,
+                                max_tokens=MAX_OUTPUT_TOKENS,
+                                max_passes=3,
                             )
                             fixed_code = _extract_fenced(fix_output, "c").strip()
                             fixed_code, _brace_notes = repair_stray_closing_braces(

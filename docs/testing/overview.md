@@ -15,6 +15,7 @@ Primary suite: `tests/development/`.
 | `test_per_file_compile.py` | Per-file compile gate scoping and diagnostics |
 | `test_llm_request_hardening.py` | Prompt clamp, overflow retry, error surfaces |
 | `test_variant_choice.py` | Target-ICD same-peripheral variant pause, choice endpoint, Qwen3.8 request |
+| `test_verification_stream.py` | Verification tokens are sent while the model is still writing, so the stream does not sit idle after script generation |
 | `test_codebase_context.py` | Source-script / repo context builders |
 | `test_agentic_xilinx_profile.py` | Agentic Xilinx/superloop profile behaviour |
 | `test_gitnexus.py` | GitNexus-style embedded context report |
