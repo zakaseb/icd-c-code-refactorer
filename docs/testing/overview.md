@@ -10,7 +10,7 @@ Primary suite: `tests/development/`.
 
 | Test module | Focus |
 |-------------|-------|
-| `test_sandbox_retry_ui.py` | Parsing/resolving `sandbox_retries`, UI/API wiring |
+| `test_sandbox_retry_ui.py` | Parsing/resolving `sandbox_retries`; the web page no longer shows the control |
 | `test_orchestrator_build_budget.py` | Finite budget hard-stop in orchestrator |
 | `test_per_file_compile.py` | Per-file compile gate scoping and diagnostics |
 | `test_llm_request_hardening.py` | Prompt clamp, overflow retry, error surfaces |

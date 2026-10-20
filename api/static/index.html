@@ -139,35 +139,6 @@
     <!-- ACTION BUTTONS                                                -->
     <!-- ============================================================ -->
     <section class="action-section">
-      <!-- Hidden: the sandbox Build stage is off (PIPELINE_SANDBOX_BUILD=0). -->
-      <div class="sandbox-retries-control" id="sandbox-retries-control" hidden>
-        <label class="sandbox-retries-label" for="sandbox-retries-input">
-          Sandbox build retries
-        </label>
-        <div class="sandbox-retries-row">
-          <input
-            type="number"
-            id="sandbox-retries-input"
-            class="sandbox-retries-input"
-            min="1"
-            step="1"
-            value="25"
-            title="Maximum sandbox build/fix reiterations before giving up"
-          />
-          <button
-            type="button"
-            id="sandbox-retries-indefinite"
-            class="btn-secondary sandbox-retries-indefinite"
-            aria-pressed="false"
-            title="Keep iterating until the project builds successfully"
-          >
-            Indefinite
-          </button>
-        </div>
-        <p class="sandbox-retries-hint" id="sandbox-retries-hint">
-          Stop after this many sandbox build reiterations, or keep going until the build succeeds.
-        </p>
-      </div>
       <div class="action-buttons">
         <button type="button" id="process-btn" class="btn-primary" disabled>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">

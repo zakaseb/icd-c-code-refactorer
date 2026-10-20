@@ -148,19 +148,16 @@ check("process accepts indefinite query", r2.status_code == 404)
 r3 = client.get("/api/regenerate/does-not-exist?sandbox_retries=3")
 check("regenerate accepts sandbox_retries query", r3.status_code == 404)
 
-print("\n=== Test 7: UI markup / JS helpers present ===")
+print("\n=== Test 7: the page no longer offers a sandbox retry control ===")
 html = (REPO / "api" / "static" / "index.html").read_text()
 js = (REPO / "api" / "static" / "app.js").read_text()
 css = (REPO / "api" / "static" / "style.css").read_text()
-check("index has sandbox-retries-input", 'id="sandbox-retries-input"' in html)
-check("index has indefinite button", 'id="sandbox-retries-indefinite"' in html)
-check("js has processStreamUrl", "function processStreamUrl" in js)
-check("js passes query on process EventSource",
-      "processStreamUrl('/api/process/'" in js)
-check("js passes query on regenerate EventSource",
-      "processStreamUrl('/api/regenerate/'" in js)
-check("js has indefinite toggle", "setSandboxRetriesIndefinite" in js)
-check("css styles the control", ".sandbox-retries-control" in css)
+check("index has no sandbox retries control", "sandbox-retries" not in html)
+check("index has no indefinite retry button", "sandbox-retries-indefinite" not in html)
+check("js does not send sandbox_retries", "sandbox_retries" not in js)
+check("js opens the process stream", "new EventSource('/api/process/'" in js)
+check("js opens the regenerate stream", "new EventSource('/api/regenerate/'" in js)
+check("css has no sandbox retries control", "sandbox-retries" not in css)
 
 print("\n=== Test 8: _sandbox_build_iterate emits budget info ===")
 # Drive just the early yield by giving an empty gen_dir (no .c/.h).

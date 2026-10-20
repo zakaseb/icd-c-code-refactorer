@@ -40,7 +40,7 @@ Chat requests send `chat_template_kwargs.enable_thinking=false`. Qwen3.8's templ
 | `SANDBOX_AGENTIC_OUTER_ROUNDS` | `2` | Agentic outer rounds |
 | `SANDBOX_SSE_MAX_BUILD_LOG_CHARS` | `200000` | Cap streamed build logs |
 
-UI `sandbox_retries` overrides the effective build/attempt budget for a run — see [api/surface.md](../api/surface.md).
+The web UI does not send a sandbox retry budget. A caller can still pass `sandbox_retries` on the process or regenerate request; when it is omitted, the env defaults above apply. See [api/surface.md](../api/surface.md).
 
 ## Remote build
 

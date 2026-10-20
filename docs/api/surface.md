@@ -32,7 +32,7 @@ Primary implementation: `api/app.py`.
 
 ### Query: `sandbox_retries`
 
-Accepted on both `/api/process/{session_id}` and `/api/regenerate/{session_id}`.
+Accepted on both `/api/process/{session_id}` and `/api/regenerate/{session_id}`. The web UI does not send this query.
 
 | Value | Behaviour |
 |-------|-----------|

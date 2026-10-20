@@ -47,11 +47,11 @@ Upload endpoints run **before** the SSE process stream. Processing is driven by 
 
 ## Sandbox build
 
-See [sandbox/debugging.md](../sandbox/debugging.md) for backend selection and retry budgets (`sandbox_retries`).
+See [sandbox/debugging.md](../sandbox/debugging.md) for backend selection. The web UI does not set `sandbox_retries`; omitting it keeps the env budgets.
 
 ## Regeneration path
 
-`GET /api/regenerate/{session_id}` re-runs generation using conversation feedback plus existing ICD/repo context. Typical SSE stages: regeneration/transform → verification → sandbox_build (full ICD analysis is not repeated). Same `sandbox_retries` query param as process.
+`GET /api/regenerate/{session_id}` re-runs generation using conversation feedback plus existing ICD/repo context. Typical SSE stages: regeneration/transform → verification → sandbox_build (full ICD analysis is not repeated). The optional `sandbox_retries` query is the same as on process; the web UI does not send it.
 
 ## Resume / pause
 

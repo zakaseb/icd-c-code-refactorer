@@ -42,8 +42,8 @@ UI: http://localhost:8081 — llama-server `:24000`, LiteLLM `:4000` inside the 
 
 ## Sandbox never finishes / ignores retry count
 
-- Confirm the UI is sending `?sandbox_retries=N` (network tab).
-- Session `status.json` should show `sandbox_retries_mode` / `sandbox_max_retries`.
+- The web UI does not send `sandbox_retries`. The sandbox stage runs only when `PIPELINE_SANDBOX_BUILD=1`.
+- A caller that passes `?sandbox_retries=N` stores `sandbox_retries_mode` / `sandbox_max_retries` on `status.json`. With the query omitted, the mode is `env`.
 - Finite mode must hard-stop after budget exhaustion (see `tests/development/test_orchestrator_build_budget.py`).
 - Agentic debug is the default (`SANDBOX_USE_AGENTIC=1`); agentic caps apply. Set `SANDBOX_USE_AGENTIC=0` for the ReAct orchestrator.
 

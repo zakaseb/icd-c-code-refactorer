@@ -30,10 +30,10 @@ Caps:
 | Knob | Meaning |
 |------|---------|
 | `max_steps` | Thought/action iterations (`SANDBOX_ORCH_MAX_STEPS`; `0` = unlimited steps) |
-| `max_builds` | Build/attempt budget from UI or `SANDBOX_ORCH_MAX_BUILDS` |
+| `max_builds` | Build/attempt budget from `sandbox_retries` or `SANDBOX_ORCH_MAX_BUILDS` |
 | Outer rounds | `SANDBOX_ORCH_OUTER_ROUNDS` when using env mode |
 
-When a **finite** UI budget is set, exhausting it **hard-stops** the orchestrator (further `build` calls are blocked and the loop ends) so patching cannot continue indefinitely after the Nth failed build.
+When a caller sets a finite `sandbox_retries` budget, exhausting it **hard-stops** the orchestrator (further `build` calls are blocked and the loop ends) so patching cannot continue indefinitely after the Nth failed build. The web UI does not set that budget.
 
 Yielded event kinds: `step`, `thought`, `action`, `observation`, `build`, `done`, `raw_token`, `warning`.
 

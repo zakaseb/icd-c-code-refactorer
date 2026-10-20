@@ -75,7 +75,7 @@ workspace/sessions/<session_id>/
 
 1. `POST /api/session/create`
 2. Upload code + ICDs (+ optional repo ZIP)
-3. `GET /api/process/{id}?sandbox_retries=…` (SSE)
+3. `GET /api/process/{id}` (SSE)
 4. Optional conversation + `GET /api/regenerate/{id}`
 5. `GET /api/download/{id}` and/or `/api/download-repo/{id}`
 
