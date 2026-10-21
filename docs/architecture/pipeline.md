@@ -17,7 +17,7 @@ The service map is in [runtime.md](runtime.md). This page is the work that happe
 The top row is the process stream, left to right:
 
 1. **Upload** stores the code and both ICDs. It happens before the stream starts.
-2. **Analysis** writes the change spec. If the Target ICD names more than one variant of the same peripheral, the stream stops here until the UI choice is posted. One variant does not stop. The picture above does not draw that pause.
+2. **Analysis** writes the change spec. If the Target ICD names more than one variant of the same peripheral, the stream stops here until the UI choice is posted. One variant does not stop. Two housings of one part number are one variant. The picture above does not draw that pause.
 3. **Transform** rewrites each source file. When a variant was chosen, this step and the ones after it apply that variant only.
 4. **Header doc** adds ICD comments to the generated headers. This step does not loop.
 5. **Verify** runs structural checks.

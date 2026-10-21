@@ -114,41 +114,48 @@ def test_choice_pauses_then_continues_with_the_selected_variant():
     )
 
 
-def test_named_configurations_pause_even_if_the_model_says_none():
-    """The IMU15 summary names two housings. A change spec that calls that
-    one interface must not hide the choice."""
+def test_one_part_in_two_housings_does_not_pause():
+    """IMU15 names a Pod and an AV housing for one message. That is one
+    variant. Two part numbers of one peripheral still pause."""
     session = Path(tempfile.mkdtemp(prefix="icd_variant_housings_"))
     summary = (
         "# Technical Summary: Interface Control Document for IMU15\n"
-        "The IMU15 is a digital inertial measurement unit. "
-        "It is available in two housing configurations: "
-        "Standard Pod and Anti-Vibration (AV) Mounted Housing.\n"
+        'The IMU15 is a 3-axis inertial measurement unit available in '
+        '"Pod" and "AV Mounted Housing" configurations.\n'
+        "Housing: Customer-specific; Anti-Vibration (AV) mounted housing available.\n"
         "Byte Format: 1 start bit, 8 data bits, 2 stop bits.\n"
     )
-    spec = (
-        "*   **Target (IMU15):** Single logical variation. "
-        "Mechanical housing differences (Standard/AV) do not affect "
-        "electrical/data interface.\n"
-    )
+    spec = "*   **Target (IMU15):** One uniform message.\n"
 
     def detect(_icd, _change, _summary):
-        return []
+        return [{
+            "peripheral": "IMU15",
+            "variants": ["Pod", "AV Mounted Housing"],
+        }]
 
     groups = appmod._extract_variant_groups_from_text(summary)
+    _check("summary_is_not_a_choice", groups == [], repr(groups))
     _check(
-        "summary_names_housings",
-        groups and groups[0]["peripheral"] == "IMU15"
-        and groups[0]["variants"] == [
-            "Standard Pod",
-            "Anti-Vibration (AV) Mounted Housing",
-        ],
-        repr(groups),
+        "model_housings_are_dropped",
+        appmod._normalize_variant_groups({
+            "groups": [{
+                "peripheral": "IMU15",
+                "variants": ["Pod", "AV Mounted Housing"],
+            }],
+        }) == [],
     )
     _check(
-        "stop_bits_are_not_variants",
-        "2 stop bits" not in json.dumps(groups),
-        repr(groups),
+        "same_part_with_housing_suffix_is_dropped",
+        appmod._is_housing_only_group([
+            "IMU15 Pod",
+            "IMU15 AV Mounted Housing",
+        ]),
     )
+    spec_out, event = appmod._resolve_variant_choice(
+        session, "target body without a list", spec, summary, detect_groups=detect,
+    )
+    _check("no_choice_event", event is None, repr(event))
+    _check("spec_untouched_for_one_variant", "SELECTED" not in spec_out, spec_out)
     bullets = (
         "Interface Control Document for IMU-FI\n"
         "requirements for the following Inertial Measurement Unit (IMU):\n"
@@ -160,18 +167,6 @@ def test_named_configurations_pause_even_if_the_model_says_none():
         "bullet_part_numbers",
         bullet_groups and bullet_groups[0]["variants"] == ["IMU-FI-200C", "IMU-FI-200T"],
         repr(bullet_groups),
-    )
-    _, event = appmod._resolve_variant_choice(
-        session, "target body without a list", spec, summary, detect_groups=detect,
-    )
-    _check("choice_event", event is not None and event["type"] == "variant_choice_required")
-    _check(
-        "choice_is_the_housings",
-        event and event["groups"][0]["variants"] == [
-            "Standard Pod",
-            "Anti-Vibration (AV) Mounted Housing",
-        ],
-        repr(event),
     )
 
 
@@ -203,12 +198,12 @@ def test_same_variant_list_is_one_question():
         repr(groups),
     )
     distinct = appmod._merge_variant_groups(
-        [{"peripheral": "IMU15", "variants": ["Standard Pod", "AV Mount"]}],
+        [{"peripheral": "IMU-FI", "variants": ["IMU-FI-200C", "IMU-FI-200T"]}],
         [{"peripheral": "GPS", "variants": ["GPS-1", "GPS-2"]}],
     )
     _check(
         "different_lists_stay_separate",
-        [g["peripheral"] for g in distinct] == ["IMU15", "GPS"],
+        [g["peripheral"] for g in distinct] == ["IMU-FI", "GPS"],
         repr(distinct),
     )
 
@@ -418,7 +413,7 @@ def main() -> int:
     print("Running test_variant_choice")
     test_normalize_keeps_only_multi_variant_peripherals()
     test_choice_pauses_then_continues_with_the_selected_variant()
-    test_named_configurations_pause_even_if_the_model_says_none()
+    test_one_part_in_two_housings_does_not_pause()
     test_same_variant_list_is_one_question()
     test_single_variant_does_not_pause()
     test_variant_choice_endpoint()

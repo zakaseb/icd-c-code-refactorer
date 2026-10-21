@@ -21,7 +21,7 @@ Location: `api/static/`.
 2. User selects `.c`/`.h`, Source ICD, Target ICD, optional repo ZIP → matching `/api/upload/...` routes.
 3. **Transform Code** opens an EventSource on `/api/process/{session_id}`. The page does not send a sandbox retry budget.
 4. UI handles SSE stages: `analysis`, `transform`, `header_doc`, `verification`, `compile`, `sandbox_build` (and `regeneration` on re-run). After the last script is transformed, `header_doc` is its own step, then verification, compile, and sandbox. A `gitnexus` stage label may appear in the UI even though that report is not currently invoked from the live `process` stream.
-5. If analysis emits `variant_choice_required`, the stream closes and `#variant-choice` lists one radio group per peripheral. **Continue with this variant** posts `/api/variant-choice/{session_id}` and opens the process stream again. A Target ICD with one variant skips this step.
+5. If analysis emits `variant_choice_required`, the stream closes and `#variant-choice` lists one radio group per peripheral. **Continue with this variant** posts `/api/variant-choice/{session_id}` and opens the process stream again. A Target ICD with one variant skips this step. Two housings of one part number are one variant.
 6. User can pause/resume, preview files, download artefacts, send conversation feedback, then regenerate.
 
 ## Streaming robustness

@@ -1159,12 +1159,18 @@ VARIANT_CHOICE_MARKER = "SELECTED PERIPHERAL VARIANT"
 
 _TARGET_VARIANT_DETECT_SYSTEM = (
     "You detect whether one Target ICD specifies two or more variants of the "
-    "SAME peripheral. A variant is a distinct part number, protocol, mode, "
-    "or housing configuration of one device family. A shared electrical "
-    "message does not make two named configurations one variant. Different "
-    "peripherals are not variants of each other. A document revision is not "
-    "a variant. Reply with JSON only, no markdown."
+    "SAME peripheral. A variant is a distinct part number, protocol, or "
+    "interface mode that changes the electrical or data interface. Mechanical "
+    "housings of one part number — a pod, a mount, an enclosure — are one "
+    "variant, even when the document names both. Different peripherals are "
+    "not variants of each other. A document revision is not a variant. "
+    "Reply with JSON only, no markdown."
 )
+_HOUSING_WORD_RE = re.compile(
+    r"(?i)^(?:pods?|housings?|mount(?:ed|ing)?|enclosures?|chassis|cases?|"
+    r"anti-?vibrations?|av|standards?|configurations?|mechanical|vibrations?)$"
+)
+_PART_TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*\d[A-Za-z0-9-]*\b")
 
 _VARIANT_ENUM_RE = re.compile(
     r"(?i)\b(?:two|three|four|2|3|4)\s+"
@@ -1203,9 +1209,10 @@ def _normalize_variant_groups(data: dict | None) -> list[dict]:
                 seen.append(text)
         if len(seen) >= 2:
             groups.append({"peripheral": peripheral, "variants": seen[:12]})
+    groups = _drop_housing_only_groups(groups)
     if not groups:
         names = _clean_variant_names(data.get("variants"))
-        if len(names) >= 2:
+        if len(names) >= 2 and not _is_housing_only_group(names):
             family = str(data.get("peripheral") or "Peripheral").strip() or "Peripheral"
             groups.append({"peripheral": family, "variants": names[:12]})
     return groups[:8]
@@ -1314,7 +1321,46 @@ def _merge_variant_groups(*sources: list[dict]) -> list[dict]:
             continue
         seen.add(signature)
         unique.append(group)
-    return unique[:8]
+    return _drop_housing_only_groups(unique)[:8]
+
+
+def _housing_residual_words(name: str) -> list[str]:
+    text = _PART_TOKEN_RE.sub(" ", name or "")
+    return re.findall(r"[A-Za-z][A-Za-z-]*", text)
+
+
+def _is_housing_only_group(names: list[str]) -> bool:
+    """True when every name is a housing of one part, not a second interface.
+
+    "Pod" and "AV Mounted Housing" describe one IMU15. "IMU-FI-200C" and
+    "IMU-FI-200T" are two part numbers and stay a choice.
+    """
+    if len(names) < 2:
+        return False
+    part_sets: list[tuple[str, ...]] = []
+    for name in names:
+        tokens = tuple(m.group(0).casefold() for m in _PART_TOKEN_RE.finditer(name))
+        residual = _housing_residual_words(name)
+        if tokens and not residual:
+            return False
+        if residual and not all(_HOUSING_WORD_RE.match(word) for word in residual):
+            return False
+        if not residual and not tokens:
+            return False
+        part_sets.append(tokens)
+    if all(not parts for parts in part_sets):
+        return True
+    return len(set(part_sets)) == 1 and bool(part_sets[0])
+
+
+def _drop_housing_only_groups(groups: list[dict]) -> list[dict]:
+    kept: list[dict] = []
+    for group in groups or []:
+        names = group.get("variants") or []
+        if _is_housing_only_group(names):
+            continue
+        kept.append(group)
+    return kept
 
 
 def _read_json_object(path: Path) -> dict | None:
@@ -1404,9 +1450,9 @@ def _detect_target_variant_groups(
         summary = summary[:20000] + "\n[... target summary truncated ...]\n"
     prompt = (
         "Read the Target ICD and its summary. List each peripheral that has "
-        "two or more named variants: part numbers, protocols, modes, or "
-        "housing configurations. Use the names the ICD uses. Do not drop a "
-        "named configuration because it shares a message layout with another.\n"
+        "two or more part numbers, protocols, or interface modes. Use the "
+        "names the ICD uses. A pod, mount, or other housing of one part "
+        "number is not a variant. One message layout is one variant.\n"
         'Return {"groups":[{"peripheral":"family","variants":["name","name"]}]}.\n'
         'If the Target ICD names only one variant, return {"groups":[]}.\n\n'
         f"TARGET SUMMARY:\n{summary}\n\n"
