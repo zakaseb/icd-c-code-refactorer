@@ -1,7 +1,7 @@
-# Qwen3.8 GGUFs ship an MTP block at layer 64. llama.cpp b9102 treats that
-# block as an SSM layer and exits with "missing tensor blk.64.ssm_conv1d.weight".
-# b11580 (4413a192) skips those tensors unless --spec-type draft-mtp is set.
-# This service does not enable MTP, so generation stays a normal single pass.
+# Some GGUFs ship an MTP block that llama.cpp b9102 treats as an SSM layer
+# and exits with "missing tensor blk.64.ssm_conv1d.weight". b11580 (4413a192)
+# skips those tensors unless --spec-type draft-mtp is set. This service does
+# not enable MTP, so generation stays a normal single pass.
 FROM ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:c4348afb91499b10fad12f92626c7a8ca8b69d6475d10c793b810cb61237ce00
 
 ARG USER_ID=1000
@@ -52,14 +52,14 @@ RUN if getent group $GROUP_ID > /dev/null; then \
 
 RUN chown -R developer:developer /opt/venv
 
-ENV HF_CHAT_TEMPLATE='/app/Qwen3.8-27B.jinja'
-ADD --chown=developer:developer https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/chat_template.jinja $HF_CHAT_TEMPLATE
+ENV HF_CHAT_TEMPLATE='/app/Qwen3-Coder-Next-UD-Q4_K_XL.jinja'
+ADD --chown=developer:developer https://huggingface.co/unsloth/Qwen3-Coder-Next/raw/main/chat_template.jinja $HF_CHAT_TEMPLATE
 
 USER developer
 
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
-ENV HF_REPO_ID="unsloth/Qwen3.8-27B-GGUF"
-ENV HF_MODEL="Qwen3.8-27B-UD-Q4_K_XL.gguf"
+ENV HF_REPO_ID="unsloth/Qwen3-Coder-Next-GGUF"
+ENV HF_MODEL="Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
 
 ENV LLAMA_ARG_HOST=0.0.0.0
 ENV LLAMA_ARG_PORT=24000

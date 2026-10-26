@@ -13,7 +13,7 @@ tags: [configuration, env]
 | `OPENAI_BASE_URL` | `http://127.0.0.1:24000` | llama-server OpenAI-compatible API |
 | `LITELLM_BASE_URL` | `http://127.0.0.1:4000` | LiteLLM gateway |
 | `OPENAI_API_KEY` / `LLAMA_API_KEY` | local stub key | Auth for local servers |
-| `HF_MODEL` / `HF_REPO_ID` | `Qwen3.8-27B-UD-Q4_K_XL.gguf` from `unsloth/Qwen3.8-27B-GGUF` | Model identity for download |
+| `HF_MODEL` / `HF_REPO_ID` | `Qwen3-Coder-Next-UD-Q4_K_XL.gguf` from `unsloth/Qwen3-Coder-Next-GGUF` | Model identity for download |
 | `LLAMA_ARG_CTX_SIZE` | Dockerfile large / scripts often `32768` | Context window |
 | `LLAMA_ARG_N_GPU_LAYERS` | `auto` | GPU offload depth (`0` = CPU) |
 | `LLAMA_ARG_*` | various | Host, port, threads, flash attn, split mode |
@@ -22,7 +22,7 @@ tags: [configuration, env]
 | `LLM_MIN_OUTPUT_TOKENS` | `768` | Minimum generation budget |
 | `SSE_UI_TOKEN_BATCH_*` | batched | Browser token batching |
 
-Chat requests send `chat_template_kwargs.enable_thinking=false`. Qwen3.8's template would otherwise spend the generation budget on reasoning. The image loads that model's chat template from `Qwen/Qwen3.8-27B`.
+The image loads the Qwen3-Coder-Next chat template from `unsloth/Qwen3-Coder-Next`.
 
 ## Sandbox backends
 

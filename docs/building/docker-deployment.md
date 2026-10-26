@@ -14,7 +14,7 @@ tags: [docker, deployment, llm]
 # → http://localhost:8081
 ```
 
-Image tag: `icd-c-code-refactorer:llama.cpp`. The base is pinned to llama.cpp **b11580** (`ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:c4348afb91499b10fad12f92626c7a8ca8b69d6475d10c793b810cb61237ce00`). Qwen3.8's GGUF includes an MTP block at layer 64. Older llama.cpp (the previous image was b9102) looks for `blk.64.ssm_conv1d.weight` and exits before the server is ready. b11580 ignores that block unless speculative MTP is turned on. This service does not turn it on.
+Image tag: `icd-c-code-refactorer:llama.cpp`. The base is pinned to llama.cpp **b11580** (`ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:c4348afb91499b10fad12f92626c7a8ca8b69d6475d10c793b810cb61237ce00`). Older llama.cpp (b9102) treated some GGUF MTP tensors as SSM layers and exited before the server was ready. b11580 ignores those tensors unless speculative MTP is turned on. This service does not turn it on.
 
 ## Image build notes (PEP 668 + host UID)
 
@@ -60,15 +60,15 @@ On first boot, `entrypoint.sh` runs `/opt/venv/bin/python hf_download.py` (copy 
 
 | Env | Role |
 |-----|------|
-| `HF_REPO_ID` | Hugging Face repo (default `unsloth/Qwen3.8-27B-GGUF`) |
-| `HF_MODEL` | Exact GGUF filename (default `Qwen3.8-27B-UD-Q4_K_XL.gguf`, about 17.6 GB) |
+| `HF_REPO_ID` | Hugging Face repo (default `unsloth/Qwen3-Coder-Next-GGUF`) |
+| `HF_MODEL` | Exact GGUF filename (default `Qwen3-Coder-Next-UD-Q4_K_XL.gguf`, about 49.3 GB) |
 | `HOME` | Cache root → `$HOME/models/$HF_REPO_ID/` |
 
 `serve_web.sh` mounts host `models/` → `/home/developer/models`, so downloads persist across restarts. The script skips the network call when the file already exists (exact path or recursive glob), fails fast if `huggingface_hub` is missing (wrong Python / broken image), and errors if the download finishes without the expected filename.
 
 ## Hardware expectations
 
-- **Recommended:** NVIDIA GPU with ~24 GB VRAM for the bundled Qwen3.8-27B quant (~17.6 GB of weights). The Dockerfile context also needs KV-cache memory; `LLAMA_ARG_N_GPU_LAYERS=auto` spills layers when VRAM is tight.
+- **Recommended:** NVIDIA GPU with 48 GB+ VRAM for full offload of the bundled Qwen3-Coder-Next quant (~49.3 GB of weights). Smaller cards work with partial offload; `LLAMA_ARG_N_GPU_LAYERS=auto` spills layers when VRAM is tight.
 - Smaller GPUs work with partial offload (`LLAMA_ARG_N_GPU_LAYERS`); CPU-only is possible but slow.
 - Context size and sampling are controlled via `LLAMA_ARG_*` / `LLAMA_SAMPLING_*` (serve scripts often use a smaller ctx than the Dockerfile maximum).
 

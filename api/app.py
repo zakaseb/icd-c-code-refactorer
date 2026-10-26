@@ -119,13 +119,10 @@ LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:24000")
 LLM_BASE_URL_LITELLM = os.environ.get("LITELLM_BASE_URL", "http://127.0.0.1:4000")
 LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "sk-1234-miaw")
 HF_MODEL = os.environ.get(
-    "HF_MODEL", "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    "HF_MODEL", "Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
 )
 MODEL_NAME = HF_MODEL.replace(".gguf", "") if HF_MODEL.endswith(".gguf") else HF_MODEL
 MODEL_NAME_LITELLM = f"openai/{HF_MODEL}"
-# Qwen3.8's chat template reasons by default. This pipeline expects the
-# answer in the message content, so thinking stays off.
-LLM_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 HTTPX_STREAM_TIMEOUT = httpx.Timeout(timeout=600.0, connect=60.0)
 
@@ -1835,7 +1832,6 @@ def _call_llm_stream(
             "max_tokens": eff_max_tokens,
             "temperature": 0.2,
             "stream": True,
-            "chat_template_kwargs": dict(LLM_CHAT_TEMPLATE_KWARGS),
         }
         try:
             with httpx.Client(timeout=HTTPX_STREAM_TIMEOUT) as client:

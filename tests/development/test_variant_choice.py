@@ -377,16 +377,11 @@ def test_process_stream_stops_before_transform():
     )
 
 
-def test_chat_request_disables_thinking_and_names_qwen38():
+def test_chat_request_names_qwen3_coder_next():
     _check(
         "default_model",
-        appmod.HF_MODEL == "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        appmod.HF_MODEL == "Qwen3-Coder-Next-UD-Q4_K_XL.gguf",
         appmod.HF_MODEL,
-    )
-    _check(
-        "thinking_off",
-        appmod.LLM_CHAT_TEMPLATE_KWARGS.get("enable_thinking") is False,
-        repr(appmod.LLM_CHAT_TEMPLATE_KWARGS),
     )
     original = appmod.httpx.Client
     appmod.httpx.Client = _FakeClient
@@ -398,13 +393,13 @@ def test_chat_request_disables_thinking_and_names_qwen38():
     _check("stream_yields", chunks == ["ok"], repr(chunks))
     sent = _FakeClient.seen[0] if _FakeClient.seen else {}
     _check(
-        "request_kwargs",
-        sent.get("chat_template_kwargs") == {"enable_thinking": False},
+        "no_thinking_kwargs",
+        "chat_template_kwargs" not in sent,
         repr(sent.get("chat_template_kwargs")),
     )
     _check(
         "request_model",
-        sent.get("model") == "Qwen3.8-27B-UD-Q4_K_XL",
+        sent.get("model") == "Qwen3-Coder-Next-UD-Q4_K_XL",
         repr(sent.get("model")),
     )
 
@@ -418,7 +413,7 @@ def main() -> int:
     test_single_variant_does_not_pause()
     test_variant_choice_endpoint()
     test_process_stream_stops_before_transform()
-    test_chat_request_disables_thinking_and_names_qwen38()
+    test_chat_request_names_qwen3_coder_next()
     print(f"{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

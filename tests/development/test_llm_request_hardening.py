@@ -273,13 +273,13 @@ def test_iteration_caps_are_120():
 
 
 # ---------------------------------------------------------------------------
-# Test 6: local Qwen3.8 27B is the active default
+# Test 6: 80B coder-specialised model is the active default
 # ---------------------------------------------------------------------------
 
-def test_default_model_is_qwen38_27b():
+def test_default_model_is_qwen3_coder_next_80b():
     _check(
-        "default_hf_model_qwen38_27b",
-        appmod.HF_MODEL == "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        "default_hf_model_qwen3_coder_next",
+        "Qwen3-Coder-Next" in appmod.HF_MODEL,
         f"got {appmod.HF_MODEL!r}",
     )
 
@@ -299,7 +299,7 @@ def main() -> int:
         test_call_llm_stream_surfaces_400_body,
         test_call_llm_stream_retries_on_context_overflow,
         test_iteration_caps_are_120,
-        test_default_model_is_qwen38_27b,
+        test_default_model_is_qwen3_coder_next_80b,
     ]
 
     for t in tests:
